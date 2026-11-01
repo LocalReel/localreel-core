@@ -1,3 +1,5 @@
+use std::env;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -76,6 +78,29 @@ impl MediaOps {
         }
     }
 
+    /// Build with ffmpeg/ffprobe discovery.
+    ///
+    /// Explicit config/PATH wins; otherwise look next to the executable, in
+    /// `ffmpeg/bin`, `tools/ffmpeg/bin`, and `LOCALREEL_FFMPEG_DIR`. This keeps
+    /// a portable package working when ffmpeg is shipped beside `localreel.exe`
+    /// without requiring PATH changes.
+    pub fn discover(
+        ffmpeg: PathBuf,
+        ffprobe: PathBuf,
+        probe_timeout: Duration,
+        thumbnail_timeout: Duration,
+        transcode_timeout: Duration,
+    ) -> Self {
+        let (ffmpeg, ffprobe) = discover_binaries(&ffmpeg, &ffprobe);
+        Self::new(
+            ffmpeg,
+            ffprobe,
+            probe_timeout,
+            thumbnail_timeout,
+            transcode_timeout,
+        )
+    }
+
     pub fn ffmpeg_path(&self) -> &Path {
         &self.ffmpeg
     }
@@ -89,7 +114,7 @@ impl MediaOps {
     }
 
     pub fn probe(&self, input: &Path, cancel: &AtomicBool) -> Result<ProbeResult> {
-        let mut command = Command::new(&self.ffprobe);
+        let mut command = binary_command(&self.ffprobe);
         command.args([
             "-v",
             "quiet",
@@ -121,7 +146,7 @@ impl MediaOps {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut command = Command::new(&self.ffmpeg);
+        let mut command = binary_command(&self.ffmpeg);
         command
             .args(["-y", "-v", "error", "-ss"])
             .arg(format!("{at_secs:.3}"))
@@ -163,7 +188,7 @@ impl MediaOps {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut command = Command::new(&self.ffmpeg);
+        let mut command = binary_command(&self.ffmpeg);
         command
             .args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"])
             .arg(input)
@@ -404,8 +429,120 @@ fn terminate(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn command_available(binary: &Path) -> bool {
+fn discover_binaries(configured_ffmpeg: &Path, configured_ffprobe: &Path) -> (PathBuf, PathBuf) {
+    let explicit = |path: &Path| {
+        path.parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    };
+    if explicit(configured_ffmpeg)
+        && explicit(configured_ffprobe)
+        && command_available(configured_ffmpeg)
+        && command_available(configured_ffprobe)
+    {
+        return (
+            configured_ffmpeg.to_path_buf(),
+            configured_ffprobe.to_path_buf(),
+        );
+    }
+
+    let ffmpeg_names: &[&str] = if cfg!(windows) {
+        &["ffmpeg.exe", "ffmpeg.cmd", "ffmpeg.bat"]
+    } else {
+        &["ffmpeg"]
+    };
+    let ffprobe_names: &[&str] = if cfg!(windows) {
+        &["ffprobe.exe", "ffprobe.cmd", "ffprobe.bat"]
+    } else {
+        &["ffprobe"]
+    };
+    let push_names = |candidates: &mut Vec<PathBuf>, base: &Path| {
+        for name in ffmpeg_names {
+            candidates.push(base.join(name));
+        }
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(dir) = env::var_os("LOCALREEL_FFMPEG_DIR") {
+        let dir = PathBuf::from(dir);
+        push_names(&mut candidates, &dir);
+        push_names(&mut candidates, &dir.join("bin"));
+    }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            push_names(&mut candidates, parent);
+            for subdir in ["ffmpeg", "ffmpeg/bin", "tools/ffmpeg/bin", "bin"] {
+                push_names(&mut candidates, &parent.join(subdir));
+            }
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        push_names(&mut candidates, &cwd);
+        for subdir in ["ffmpeg", "ffmpeg/bin", "tools/ffmpeg/bin", "bin"] {
+            push_names(&mut candidates, &cwd.join(subdir));
+        }
+    }
+    for configured in [configured_ffmpeg, configured_ffprobe] {
+        if let Some(parent) = configured.parent() {
+            if !parent.as_os_str().is_empty() {
+                push_names(&mut candidates, parent);
+            }
+        }
+    }
+
+    for candidate in candidates {
+        if !command_available(&candidate) {
+            continue;
+        }
+        for probe_name in ffprobe_names {
+            let ffprobe = candidate.with_file_name(probe_name);
+            if command_available(&ffprobe) {
+                return (candidate, ffprobe);
+            }
+        }
+    }
+
+    // Bare configured names (the default) resolve through PATH last, after
+    // bundled/explicit directories.
+    if command_available(configured_ffmpeg) && command_available(configured_ffprobe) {
+        return (
+            configured_ffmpeg.to_path_buf(),
+            configured_ffprobe.to_path_buf(),
+        );
+    }
+
+    if command_available(configured_ffmpeg) {
+        for probe_name in ffprobe_names {
+            let ffprobe = configured_ffmpeg.with_file_name(probe_name);
+            if command_available(&ffprobe) {
+                return (configured_ffmpeg.to_path_buf(), ffprobe);
+            }
+        }
+    }
+
+    (
+        configured_ffmpeg.to_path_buf(),
+        configured_ffprobe.to_path_buf(),
+    )
+}
+
+fn binary_command(binary: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let extension = binary
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/C").arg(binary);
+            return command;
+        }
+    }
     Command::new(binary)
+}
+
+fn command_available(binary: &Path) -> bool {
+    binary_command(binary)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -440,6 +577,36 @@ mod tests {
         assert_eq!(result.video_codec.as_deref(), Some("h264"));
         assert_eq!(result.audio_codec.as_deref(), Some("aac"));
         assert_eq!(result.bitrate, Some(800_000));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_runs_a_fake_cmd_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake_ffprobe.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho {\"format\":{\"duration\":\"2.0\",\"bit_rate\":\"123\"},\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"width\":320,\"height\":240},{\"codec_type\":\"audio\",\"codec_name\":\"aac\"}]}\r\n",
+        )
+        .unwrap();
+        let input = dir.path().join("a.mp4");
+        std::fs::write(&input, b"not a real video").unwrap();
+
+        let ops = MediaOps::new(
+            script.clone(),
+            script,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(ops.available());
+        let probe = ops.probe(&input, &AtomicBool::new(false)).unwrap();
+        assert_eq!(probe.duration, Some(2.0));
+        assert_eq!(probe.width, Some(320));
+        assert_eq!(probe.height, Some(240));
+        assert_eq!(probe.video_codec.as_deref(), Some("h264"));
+        assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(probe.bitrate, Some(123));
     }
 
     #[test]

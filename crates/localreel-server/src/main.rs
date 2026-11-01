@@ -85,7 +85,7 @@ fn doctor() -> anyhow::Result<()> {
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
-    let media_ops = MediaOps::new(
+    let media_ops = MediaOps::discover(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
         config.media.probe_timeout,
@@ -103,9 +103,25 @@ fn doctor() -> anyhow::Result<()> {
     println!("  host:      {}:{}", config.host, config.port);
     println!("  data dir:  {}", config.data_dir.display());
     println!("  database:  {} (ok)", config.db_path.display());
-    println!("  ffmpeg:    {}", yes_no(media_ops.available()));
-    println!("  ffmpeg:    {}", config.media.ffmpeg.display());
-    println!("  ffprobe:   {}", config.media.ffprobe.display());
+    println!(
+        "  ffmpeg:    {} ({})",
+        media_ops.ffmpeg_path().display(),
+        yes_no(media_ops.available())
+    );
+    println!("  ffprobe:   {}", media_ops.ffprobe_path().display());
+    if !media_ops.available() {
+        println!(
+            "  hint:      put ffmpeg/ffprobe on PATH, next to localreel.exe, or set LOCALREEL_FFMPEG_DIR"
+        );
+    }
+    let web = if localreel_api::web::is_embedded() {
+        "embedded".to_string()
+    } else if let Some(dir) = config.resolved_web_dir() {
+        format!("disk ({})", dir.display())
+    } else {
+        "missing (API-only placeholder)".to_string()
+    };
+    println!("  web:       {web}");
     println!("  workers:   {}", config.jobs.workers);
     Ok(())
 }
@@ -171,7 +187,7 @@ async fn serve() -> anyhow::Result<()> {
     let events = EventBus::new(256);
     let jobs = JobQueue::new(db.clone(), events.clone());
     let media = MediaService::new(db.clone());
-    let media_ops = Arc::new(MediaOps::new(
+    let media_ops = Arc::new(MediaOps::discover(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
         config.media.probe_timeout,

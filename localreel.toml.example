@@ -20,6 +20,10 @@ lease_secs = 60
 max_attempts = 3
 
 [media]
+# Bare names resolve through PATH. For a portable package either point at
+# bundled binaries, or set LOCALREEL_FFMPEG_DIR to the directory containing
+# ffmpeg/ffprobe. Discovery also checks next to localreel.exe:
+#   ffmpeg/ffprobe / ffmpeg/bin / tools/ffmpeg/bin / bin
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 probe_timeout_secs = 30
