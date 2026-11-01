@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -27,6 +30,16 @@ enum Command {
     Migrate,
     /// Print configuration and environment checks.
     Doctor,
+    /// Discover media under one configured source (walk/fingerprint/upsert).
+    Scan { source_id: i64 },
+    /// Import a copy of a LocalReel v1 database.
+    Import {
+        /// Path to the legacy `localreel.db` (a copy, never the live file).
+        from: PathBuf,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -43,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => serve().await,
         Command::Migrate => migrate(),
         Command::Doctor => doctor(),
+        Command::Scan { source_id } => scan(source_id),
+        Command::Import { from, dry_run } => import(from, dry_run),
     }
 }
 
@@ -58,7 +73,7 @@ fn run_migrations(db: &Database) -> anyhow::Result<()> {
 }
 
 fn migrate() -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let (config, _) = Config::load_with_source()?;
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
@@ -66,7 +81,7 @@ fn migrate() -> anyhow::Result<()> {
 }
 
 fn doctor() -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let (config, source) = Config::load_with_source()?;
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
@@ -78,6 +93,13 @@ fn doctor() -> anyhow::Result<()> {
         config.media.transcode_timeout,
     );
     println!("LocalReel doctor");
+    println!(
+        "  config:    {}",
+        source
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "defaults + environment".to_string())
+    );
     println!("  host:      {}:{}", config.host, config.port);
     println!("  data dir:  {}", config.data_dir.display());
     println!("  database:  {} (ok)", config.db_path.display());
@@ -88,8 +110,60 @@ fn doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn scan(source_id: i64) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let service = MediaService::new(db.clone());
+    let source = service
+        .get_source(source_id)?
+        .ok_or_else(|| anyhow::anyhow!("source {source_id} was not found"))?;
+    let result = localreel_media::discover_source(&db, &source)?;
+    println!(
+        "scan source {} ({}) status={} discovered={} added={} updated={} unchanged={} missing={} failed={}",
+        source.id,
+        source.uri,
+        result.status,
+        result.discovered,
+        result.added,
+        result.updated,
+        result.unchanged,
+        result.missing,
+        result.failed
+    );
+    Ok(())
+}
+
+fn import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let report = localreel_media::import_legacy(&db, &from, dry_run)?;
+    println!(
+        "legacy import ({}): sources={} media={} states={} missing_files={}",
+        if dry_run { "dry-run" } else { "applied" },
+        report.sources,
+        report.media,
+        report.states,
+        report.missing_files
+    );
+    println!(
+        "  legacy scan data: runs={} issues={} jobs={} pending_states={}",
+        report.scan_runs, report.scan_issues, report.scan_jobs, report.pending_states
+    );
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+    Ok(())
+}
+
 async fn serve() -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let (config, source) = Config::load_with_source()?;
+    if let Some(path) = &source {
+        info!("loaded configuration from {}", path.display());
+    }
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
@@ -113,15 +187,19 @@ async fn serve() -> anyhow::Result<()> {
 
     // Kernel workers are generic. The media crate registers handlers in Phase 1/2.
     let registry = Arc::new(JobRegistry::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
     for index in 0..config.jobs.workers {
-        JobWorker::new(
-            jobs.clone(),
-            registry.clone(),
-            format!("worker-{index}"),
-            config.jobs.lease,
-            config.jobs.poll_interval,
-        )
-        .spawn();
+        workers.push(
+            JobWorker::new(
+                jobs.clone(),
+                registry.clone(),
+                format!("worker-{index}"),
+                config.jobs.lease,
+                config.jobs.poll_interval,
+            )
+            .spawn_with_shutdown(shutdown.clone()),
+        );
     }
 
     let listen_host = config.host.clone();
@@ -135,11 +213,19 @@ async fn serve() -> anyhow::Result<()> {
         version: localreel_kernel::VERSION.to_string(),
     });
 
+    let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal.store(true, Ordering::SeqCst);
         })
         .await?;
+
+    // Give workers a short window to finish/release the current job.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for worker in workers {
+        let _ = tokio::time::timeout_at(deadline, worker).await;
+    }
     Ok(())
 }
 

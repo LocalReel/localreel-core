@@ -1,16 +1,16 @@
 use std::env;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use serde::Deserialize;
 
 use crate::error::{KernelError, Result};
 
 /// Full server configuration.
 ///
-/// Defaults are safe for a local install: bind to loopback, keep data under
-/// `./data`, use the `ffmpeg`/`ffprobe` from `PATH`. Every value can be
-/// overridden with a `LOCALREEL_*` environment variable; a config file can be
-/// added later without changing call sites.
+/// Precedence: built-in defaults → optional `localreel.toml` → `LOCALREEL_*`
+/// environment variables. `LOCALREEL_CONFIG` can point at a different file.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -78,59 +78,150 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load defaults plus `LOCALREEL_*` environment overrides, then validate.
-    pub fn load() -> Result<Self> {
+    /// Load defaults + optional config file + environment overrides, validate,
+    /// and return the file that was used (if any).
+    pub fn load_with_source() -> Result<(Self, Option<PathBuf>)> {
         let mut config = Self::default();
+        let source_path = find_config_file()?;
 
+        if let Some(path) = &source_path {
+            let text = std::fs::read_to_string(path).map_err(|error| {
+                KernelError::Config(format!(
+                    "failed to read config file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let parsed: ConfigFile = toml::from_str(&text).map_err(|error| {
+                KernelError::Config(format!("invalid config file {}: {error}", path.display()))
+            })?;
+            config.apply_file(parsed)?;
+        }
+
+        config.apply_env()?;
+        config.validate()?;
+        Ok((config, source_path))
+    }
+
+    /// Convenience wrapper for callers that do not need the config origin.
+    pub fn load() -> Result<Self> {
+        Self::load_with_source().map(|(config, _)| config)
+    }
+
+    fn apply_file(&mut self, file: ConfigFile) -> Result<()> {
+        if let Some(value) = file.server.host {
+            self.host = value;
+        }
+        if let Some(value) = file.server.port {
+            self.port = value;
+        }
+        if let Some(value) = file.server.allow_remote {
+            self.allow_remote = value;
+        }
+        if let Some(value) = file.server.web_dir {
+            self.web_dir = Some(value);
+        }
+
+        if let Some(dir) = file.data.dir {
+            self.data_dir = dir;
+            self.db_path = self.data_dir.join("localreel.db");
+            self.media.thumbnail_dir = self.data_dir.join("thumbnails");
+            self.media.transcode_dir = self.data_dir.join("transcodes");
+        }
+        if let Some(db) = file.data.db {
+            self.db_path = db;
+        }
+
+        if let Some(value) = file.jobs.workers {
+            self.jobs.workers = value;
+        }
+        if let Some(value) = file.jobs.poll_interval_ms {
+            self.jobs.poll_interval = Duration::from_millis(value);
+        }
+        if let Some(value) = file.jobs.lease_secs {
+            self.jobs.lease = Duration::from_secs(value);
+        }
+        if let Some(value) = file.jobs.max_attempts {
+            self.jobs.max_attempts = value;
+        }
+
+        if let Some(value) = file.media.ffmpeg {
+            self.media.ffmpeg = value;
+        }
+        if let Some(value) = file.media.ffprobe {
+            self.media.ffprobe = value;
+        }
+        if let Some(value) = file.media.probe_timeout_secs {
+            self.media.probe_timeout = Duration::from_secs(value);
+        }
+        if let Some(value) = file.media.thumbnail_timeout_secs {
+            self.media.thumbnail_timeout = Duration::from_secs(value);
+        }
+        if let Some(value) = file.media.transcode_timeout_secs {
+            self.media.transcode_timeout = Duration::from_secs(value);
+        }
+        if let Some(value) = file.media.thumbnails_dir {
+            self.media.thumbnail_dir = value;
+        }
+        if let Some(value) = file.media.transcodes_dir {
+            self.media.transcode_dir = value;
+        }
+        if let Some(value) = file.media.cache_max_bytes {
+            self.media.cache_max_bytes = value;
+        }
+        if let Some(value) = file.media.cache_max_age_hours {
+            self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
+        }
+        Ok(())
+    }
+
+    fn apply_env(&mut self) -> Result<()> {
         if let Some(value) = env_string("LOCALREEL_HOST") {
-            config.host = value;
+            self.host = value;
         }
         if let Some(value) = env_u64("LOCALREEL_PORT")? {
-            config.port = u16::try_from(value)
+            self.port = u16::try_from(value)
                 .map_err(|_| KernelError::Config("LOCALREEL_PORT must be <= 65535".into()))?;
         }
         if let Some(value) = env_string("LOCALREEL_DATA_DIR") {
-            config.data_dir = PathBuf::from(value);
-            config.db_path = config.data_dir.join("localreel.db");
-            config.media.thumbnail_dir = config.data_dir.join("thumbnails");
-            config.media.transcode_dir = config.data_dir.join("transcodes");
+            self.data_dir = PathBuf::from(value);
+            self.db_path = self.data_dir.join("localreel.db");
+            self.media.thumbnail_dir = self.data_dir.join("thumbnails");
+            self.media.transcode_dir = self.data_dir.join("transcodes");
         }
         if let Some(value) = env_string("LOCALREEL_DB") {
-            config.db_path = PathBuf::from(value);
+            self.db_path = PathBuf::from(value);
         }
         if let Some(value) = env_string("LOCALREEL_WEB_DIR") {
-            config.web_dir = Some(PathBuf::from(value));
+            self.web_dir = Some(PathBuf::from(value));
         }
         if let Some(value) = env_bool("LOCALREEL_ALLOW_REMOTE")? {
-            config.allow_remote = value;
+            self.allow_remote = value;
         }
         if let Some(value) = env_u64("LOCALREEL_JOB_WORKERS")? {
-            config.jobs.workers = usize::try_from(value)
+            self.jobs.workers = usize::try_from(value)
                 .map_err(|_| KernelError::Config("LOCALREEL_JOB_WORKERS is too large".into()))?;
         }
         if let Some(value) = env_u64("LOCALREEL_JOB_LEASE_SECS")? {
-            config.jobs.lease = Duration::from_secs(value);
+            self.jobs.lease = Duration::from_secs(value);
         }
         if let Some(value) = env_u64("LOCALREEL_JOB_MAX_ATTEMPTS")? {
-            config.jobs.max_attempts = i64::try_from(value).map_err(|_| {
+            self.jobs.max_attempts = i64::try_from(value).map_err(|_| {
                 KernelError::Config("LOCALREEL_JOB_MAX_ATTEMPTS is too large".into())
             })?;
         }
         if let Some(value) = env_string("LOCALREEL_FFMPEG") {
-            config.media.ffmpeg = PathBuf::from(value);
+            self.media.ffmpeg = PathBuf::from(value);
         }
         if let Some(value) = env_string("LOCALREEL_FFPROBE") {
-            config.media.ffprobe = PathBuf::from(value);
+            self.media.ffprobe = PathBuf::from(value);
         }
         if let Some(value) = env_u64("LOCALREEL_TRANSCODE_CACHE_MAX_BYTES")? {
-            config.media.cache_max_bytes = value;
+            self.media.cache_max_bytes = value;
         }
         if let Some(value) = env_u64("LOCALREEL_TRANSCODE_CACHE_MAX_AGE_HOURS")? {
-            config.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
+            self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
         }
-
-        config.validate()?;
-        Ok(config)
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -183,6 +274,74 @@ impl Config {
 
     pub fn db_path_string(&self) -> String {
         self.db_path.to_string_lossy().into_owned()
+    }
+}
+
+/// On-disk config schema. Every field is optional so a partial file only
+/// overrides what it mentions.
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    server: ServerFile,
+    #[serde(default)]
+    data: DataFile,
+    #[serde(default)]
+    jobs: JobsFile,
+    #[serde(default)]
+    media: MediaFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServerFile {
+    host: Option<String>,
+    port: Option<u16>,
+    allow_remote: Option<bool>,
+    web_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DataFile {
+    dir: Option<PathBuf>,
+    db: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct JobsFile {
+    workers: Option<usize>,
+    poll_interval_ms: Option<u64>,
+    lease_secs: Option<u64>,
+    max_attempts: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MediaFile {
+    ffmpeg: Option<PathBuf>,
+    ffprobe: Option<PathBuf>,
+    probe_timeout_secs: Option<u64>,
+    thumbnail_timeout_secs: Option<u64>,
+    transcode_timeout_secs: Option<u64>,
+    thumbnails_dir: Option<PathBuf>,
+    transcodes_dir: Option<PathBuf>,
+    cache_max_bytes: Option<u64>,
+    cache_max_age_hours: Option<u64>,
+}
+
+fn find_config_file() -> Result<Option<PathBuf>> {
+    if let Some(raw) = env_string("LOCALREEL_CONFIG") {
+        let path = PathBuf::from(raw);
+        if !path.is_file() {
+            return Err(KernelError::Config(format!(
+                "LOCALREEL_CONFIG points at a missing file: {}",
+                path.display()
+            )));
+        }
+        return Ok(Some(path));
+    }
+    let default = Path::new("localreel.toml");
+    if default.is_file() {
+        Ok(Some(default.to_path_buf()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -262,5 +421,51 @@ mod tests {
         assert!(config.validate().is_err());
         config.allow_remote = true;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn config_file_overrides_defaults() {
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4100
+            allow_remote = false
+
+            [data]
+            dir = "D:/LocalReelData"
+
+            [jobs]
+            workers = 3
+            lease_secs = 90
+            max_attempts = 4
+
+            [media]
+            ffmpeg = "C:/tools/ffmpeg.exe"
+            probe_timeout_secs = 12
+            cache_max_age_hours = 48
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(parsed).unwrap();
+        assert_eq!(config.port, 4100);
+        assert_eq!(config.jobs.workers, 3);
+        assert_eq!(config.jobs.lease, Duration::from_secs(90));
+        assert_eq!(config.jobs.max_attempts, 4);
+        assert_eq!(config.media.probe_timeout, Duration::from_secs(12));
+        assert_eq!(config.media.cache_max_age, Duration::from_secs(48 * 3600));
+        assert_eq!(config.data_dir, PathBuf::from("D:/LocalReelData"));
+        assert_eq!(
+            config.media.thumbnail_dir,
+            PathBuf::from("D:/LocalReelData/thumbnails")
+        );
+        assert_eq!(config.media.ffmpeg, PathBuf::from("C:/tools/ffmpeg.exe"));
+    }
+
+    #[test]
+    fn invalid_config_file_is_rejected() {
+        let parsed: std::result::Result<ConfigFile, _> = toml::from_str("server = 3");
+        assert!(parsed.is_err());
     }
 }

@@ -21,6 +21,19 @@ impl MediaService {
         Self { db }
     }
 
+    pub fn get_source(&self, id: i64) -> Result<Option<Source>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, uri, kind, enabled, created_at, updated_at
+                     FROM sources WHERE id = ?1",
+                    [id],
+                    row_to_source,
+                )
+                .optional()?)
+        })
+    }
+
     pub fn list_sources(&self) -> Result<Vec<Source>> {
         self.db.with_read(|connection| {
             let mut statement = connection.prepare(

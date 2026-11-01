@@ -36,7 +36,17 @@ handlers or spawn `ffmpeg` directly.
 cargo run -p localreel-server -- serve
 cargo run -p localreel-server -- migrate
 cargo run -p localreel-server -- doctor
+
+# discover media under an already configured source (walk/fingerprint only)
+cargo run -p localreel-server -- scan --source-id 1
+
+# import a *copy* of a LocalReel v1 database (dry-run first)
+cargo run -p localreel-server -- import C:\backup\localreel.db --dry-run
+cargo run -p localreel-server -- import C:\backup\localreel.db
 ```
+
+Configuration is loaded from `localreel.toml` (or `LOCALREEL_CONFIG`) and then
+`LOCALREEL_*` environment variables; see `localreel.toml.example`.
 
 Default bind: `127.0.0.1:3001`. Data lives in `./data` unless
 `LOCALREEL_DATA_DIR` is set.

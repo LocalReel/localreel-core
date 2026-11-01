@@ -407,6 +407,48 @@ impl JobQueue {
         })
     }
 
+    /// Release a running job back to the queue (graceful shutdown).
+    ///
+    /// The attempt increment from `claim` is undone, so shutting down does not
+    /// consume the job's retry budget. Only the worker that owns the lease may
+    /// release it.
+    pub fn release(&self, id: &str, worker_id: &str) -> Result<bool> {
+        let now = now_secs();
+        let (released, kind) = self.db.with_write(|connection| {
+            let transaction = connection.transaction()?;
+            let record: Option<(String, i64)> = transaction
+                .query_row(
+                    "SELECT kind, attempts FROM sys_jobs
+                     WHERE id = ?1 AND status = 'running' AND lease_owner = ?2",
+                    params![id, worker_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((kind, attempts)) = record else {
+                transaction.commit()?;
+                return Ok((false, String::new()));
+            };
+            transaction.execute(
+                "UPDATE sys_jobs
+                 SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL,
+                     available_at = ?1, attempts = ?2, started_at = NULL
+                 WHERE id = ?3 AND status = 'running'",
+                params![now, (attempts - 1).max(0), id],
+            )?;
+            transaction.commit()?;
+            Ok((true, kind))
+        })?;
+
+        if released {
+            self.forget_cancel_flag(id);
+            self.events.publish(Event::JobQueued {
+                job_id: id.to_string(),
+                kind,
+            });
+        }
+        Ok(released)
+    }
+
     /// Renew a lease. Returns false when the worker no longer owns the job.
     pub fn renew_lease(&self, id: &str, worker_id: &str, lease_secs: i64) -> Result<bool> {
         let updated = self.db.with_write(|connection| {
@@ -637,17 +679,41 @@ impl JobWorker {
     }
 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run().await })
+        self.spawn_with_shutdown(Arc::new(AtomicBool::new(false)))
     }
 
-    async fn run(self) {
+    /// Spawn a worker that stops claiming once `shutdown` becomes true.
+    ///
+    /// A job claimed but not yet started is released back to the queue; a job
+    /// already executing is allowed to finish so its result is not lost. On
+    /// process exit the lease expiry path is the backstop.
+    pub fn spawn_with_shutdown(self, shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run(shutdown).await })
+    }
+
+    async fn run(self, shutdown: Arc<AtomicBool>) {
         loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
             match self
                 .queue
                 .claim(&self.worker_id, self.lease.as_secs() as i64)
             {
-                Ok(Some(job)) => self.execute(job).await,
-                Ok(None) => tokio::time::sleep(self.poll).await,
+                Ok(Some(job)) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        let _ = self.queue.release(&job.id, &self.worker_id);
+                        break;
+                    }
+                    self.execute(job).await;
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    tokio::time::sleep(self.poll).await;
+                }
                 Err(error) => {
                     error!(worker = %self.worker_id, "job claim failed: {error}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -802,6 +868,22 @@ mod tests {
         let second = queue.enqueue("probe", "{}", Some("media-1"), 3).unwrap();
         assert_eq!(first, second);
         assert_eq!(queue.list_recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn release_requeues_without_consuming_an_attempt() {
+        let (_dir, queue) = setup();
+        let id = queue.enqueue("test", "{}", None, 3).unwrap();
+        queue.claim("worker-1", 60).unwrap().unwrap();
+        assert!(queue.release(&id, "worker-1").unwrap());
+        let job = queue.get(&id).unwrap().unwrap();
+        assert_eq!(job.status, status::QUEUED);
+        assert_eq!(job.attempts, 0);
+        assert!(job.lease_owner.is_none());
+
+        let claimed = queue.claim("worker-2", 60).unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.attempts, 1);
     }
 
     #[test]

@@ -1,0 +1,31 @@
+# Example LocalReel configuration.
+#
+# Priority: built-in defaults < this file < LOCALREEL_* environment variables.
+# Point LOCALREEL_CONFIG at a different file to use it.
+
+[server]
+host = "127.0.0.1"
+port = 3001
+allow_remote = false
+# web_dir = "../localreel-web/dist"
+
+[data]
+dir = "data"
+# db = "data/localreel.db"
+
+[jobs]
+workers = 2
+poll_interval_ms = 250
+lease_secs = 60
+max_attempts = 3
+
+[media]
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+probe_timeout_secs = 30
+thumbnail_timeout_secs = 60
+transcode_timeout_secs = 1800
+cache_max_bytes = 21474836480
+cache_max_age_hours = 720
+# thumbnails_dir = "data/thumbnails"
+# transcodes_dir = "data/transcodes"
