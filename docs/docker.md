@@ -1,27 +1,27 @@
 # Docker
 
 The repository ships a multi-stage Dockerfile and Compose file. Status:
-**the production Dockerfile has not been built end-to-end in this environment**.
-The Windows Docker Desktop service needs administrator rights, so a native
-dockerd was started inside WSL2 instead:
+**verified end-to-end in WSL2 Ubuntu 24.04** (native dockerd, not Docker
+Desktop):
 
-- `dockerd` 29.1.3 works; base images (`node:22-bookworm-slim`,
-  `rust:1.83-bookworm`, `debian:bookworm-slim`) were pulled successfully through
-  the host proxy.
-- `docker build` (BuildKit) still fails resolving Docker Hub metadata because
-  the BuildKit resolver does not use the daemon proxy; this is an environment
-  network limitation, not a Dockerfile failure.
-- A **local runtime smoke image** (Debian + prebuilt Linux binary, no
-  multi-stage build) was built with the legacy builder and ran successfully:
-  health `ok`, embedded UI `200`, and the `/data` volume survived
-  `docker restart`.
-- The committed Dockerfile had a real bug: the stage name `web` collided with
-  the named build context `web`; it is now `web-build`. The
-  `# syntax=docker/dockerfile:1.7` frontend line was removed because it tried
-  to pull an extra frontend image.
+- `dockerd` 29.1.3, buildx 0.30.1, compose 2.40.3.
+- Base images pulled from Docker Hub via registry mirrors
+  (`docker.m.daocloud.io`, `docker.1ms.run`); plain Docker Hub metadata was
+  blocked on this network.
+- `docker build --build-context web=../localreel-web -t localreel:test .`
+  succeeded: Node web build, Rust release build, Debian runtime with ffmpeg.
+- `docker compose up -d --build` succeeded (image `localreel:dev`); container
+  health was `ok`, ffmpeg available.
+- Container media test with the real 12-file library mounted read-only:
+  12 media, 12 durations, 12 thumbnails, direct playback and
+  `Range: bytes=0-1023` → `206`.
+- `docker restart` preserved `/data`: media_count=12 and saved position=165.
+- Rust base is now **1.85** (a dependency uses edition 2024); the Dockerfile
+  stage is `web-build` to avoid colliding with the named `web` context, and the
+  extra `# syntax=` frontend dependency was removed.
 
-Do not treat Docker as release-verified until `docker compose up --build`
-succeeds on a machine with Docker Desktop/Engine and registry access.
+Docker Desktop on Windows was not used (service needs administrator rights);
+the evidence above is WSL2 dockerd + Linux containers.
 
 ## Build
 
@@ -90,8 +90,9 @@ docker compose down -v       # deletes data
 
 ## Known limitations
 
-- Image build not verified here; only `docker compose config` was run.
-- The runtime image includes Debian ffmpeg (larger image, codec set differs from
-  a custom ffmpeg build).
+- Production image build was verified in WSL2; Windows Docker Desktop itself
+  was not exercised.
+- The runtime image includes Debian ffmpeg 5.1 (larger image, codec set differs
+  from a custom ffmpeg build).
 - No GPU acceleration, HLS output or authentication.
 - Bind-mounted media must be readable by uid 10001.
