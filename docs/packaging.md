@@ -73,6 +73,7 @@ localreel.toml.example
 README.md
 README.txt
 install.ps1
+uninstall.ps1
 docs/packaging.md
 tools/fetch-ffmpeg.ps1
 tools/verify-ffmpeg.ps1

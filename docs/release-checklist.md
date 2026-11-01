@@ -62,6 +62,9 @@ cd localreel-core
 - [ ] Run `.\install.ps1 -NoShortcuts -InstallDir <temp>` from the extracted
       folder; confirm the binary/config/`install.json` land there and an upgrade
       over existing `data/`/`localreel.toml` preserves them.
+- [ ] Run `.\uninstall.ps1 -InstallDir <temp> -Force`; confirm program files and
+      shortcuts are removed while `data/`/`localreel.toml` remain; repeat with
+      `-RemoveData` in a scratch install.
 - [ ] Add/scan a small source; confirm thumbnail and playback.
 - [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
 - [ ] Check `/api/v1/health` and `/api/v1/admin/health`.

@@ -59,11 +59,25 @@ alone. `install.json` records the installed version, source and shortcuts.
 
 ## Uninstall
 
-1. Stop the server.
-2. Back up `data/` if you want to keep progress.
-3. Delete the install directory and the Start Menu/Desktop/Startup shortcuts.
+From the install directory (or the extracted package), run:
 
-There is no uninstaller yet.
+```powershell
+.\uninstall.ps1
+# keeps data/ and localreel.toml
+```
+
+The script removes shortcuts recorded in `install.json`, stops a server that is
+running from the same install directory only with `-StopServer`, and keeps
+`data/` plus `localreel.toml` by default. Options:
+
+```powershell
+.\uninstall.ps1 -InstallDir 'D:\Apps\LocalReel' -Force
+.\uninstall.ps1 -InstallDir 'D:\Apps\LocalReel' -RemoveData -Force
+.\uninstall.ps1 -InstallDir 'D:\Apps\LocalReel' -StopServer -Force
+```
+
+Without `-Force`, it asks for confirmation. `-RemoveData` deletes progress and
+config as well. Back up `data/` first if unsure.
 
 ## Verify
 

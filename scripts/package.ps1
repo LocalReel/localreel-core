@@ -84,6 +84,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage 'tools') | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'scripts\fetch-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\fetch-ffmpeg.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\verify-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\verify-ffmpeg.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\install.ps1') -Destination (Join-Path $stage 'install.ps1')
+Copy-Item -LiteralPath (Join-Path $root 'scripts\uninstall.ps1') -Destination (Join-Path $stage 'uninstall.ps1')
 
 if ($FfmpegDir) {
     $source = if (Test-Path (Join-Path $FfmpegDir 'ffmpeg.exe')) {
@@ -105,6 +106,7 @@ LocalReel $version ($arch)
 Quick start (Windows):
   1. Optional one-click install: .\install.ps1
      (copies to %LOCALAPPDATA%\LocalReel and creates a Start Menu shortcut)
+     Uninstall later with .\uninstall.ps1 (keeps data unless -RemoveData).
   2. Or run in place: copy localreel.toml.example to localreel.toml,
      edit [data]/[media], then .\localreel.exe doctor && .\localreel.exe serve.
   3. Optional: put ffmpeg.exe/ffprobe.exe in ffmpeg\bin, or run tools\fetch-ffmpeg.ps1.
