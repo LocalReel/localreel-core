@@ -10,6 +10,7 @@ pub mod legacy;
 pub mod migrations;
 pub mod model;
 pub mod playback;
+pub mod restore;
 pub mod scan;
 pub mod service;
 pub mod state_migration;
@@ -24,6 +25,7 @@ pub use model::{
     CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, MediaVariant,
     RemapReport, ScanIssue, ScanRun, Source,
 };
+pub use restore::{restore_backup, RestoreReport};
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
 pub use service::MediaService;
 pub use state_migration::{

@@ -79,16 +79,16 @@ Application backup (portable, versioned JSON) is the primary state backup:
 # without stopping the server
 .\localreel.exe backup-export .\backup.json
 
-# restore into a fresh data dir is a two-pass sequence:
-.\localreel.exe backup-import .\backup.json --dry-run
-.\localreel.exe backup-import .\backup.json   # adds sources; states are missing
-# then scan the sources (UI/API scan, or `scan <id>` for discovery only)
-.\localreel.exe backup-import .\backup.json   # applies states by uid, then URI
+# one-command restore into a fresh data dir:
+.\localreel.exe restore .\backup.json --dry-run
+.\localreel.exe restore .\backup.json
+# sources -> scan/probe/thumbnails -> state replay, in one command
 ```
 
 HTTP equivalents: `GET /api/v1/backup` and
-`POST /api/v1/backup?dry_run=true|false` (32 MiB limit). Admin -> Backup exposes
-the same flow.
+`POST /api/v1/backup?dry_run=true|false` (32 MiB limit) still import only.
+Admin -> Backup is the same two-pass flow: import, scan, import again. Use the
+CLI `restore` command for the automated path.
 
 The backup contains sources and per-media state (uid/path/flags/position). It
 does **not** contain media files, thumbnails or transcodes. After importing into
@@ -97,14 +97,14 @@ a new machine, scan the sources before importing state; state is matched by
 
 A verified restore drill on the real 12-file library (2026-11-01):
 
-- fresh DB: first import added 1 source, 12 states missing;
-- server scan added/probed 12 media + thumbnails;
-- second import applied 12 states (0 missing);
+- `restore` reported: 1 source, 12 discovered, 12 probed, 12 thumbnails,
+  12 states imported, 0 missing;
 - `/media?filter=continue` total=12, E08 position=306.44337;
-- direct playback and Range 206 worked after probe.
+- direct playback and Range 206 worked immediately (no second manual pass).
 
-Note: the CLI `scan` command only discovers rows; use the server/API scan when
-you need probe metadata and thumbnails before playback.
+The manual/importer-only path still works: import sources, scan via server/API,
+then import the backup again. Note: the CLI `scan` command only discovers rows;
+`restore` runs probe/thumbnails itself, while server/API scan enqueues jobs.
 
 Full DB backup: stop the server first, then copy `data/localreel.db` (and
 `-wal`/`-shm` if present). Restoring an old DB is a rollback of both schema and
@@ -145,7 +145,8 @@ There are no down migrations. Roll back by restoring the DB and the old binary.
 | `import <legacy.db> [--dry-run]` | Import a copy of a v1 database |
 | `state-import <legacy.db> [--source-id N] [--dry-run]` | Map v1 states by episode |
 | `backup-export <out.json>` | Export v2 source/state backup |
-| `backup-import <file> [--dry-run]` | Merge v2 backup |
+| `backup-import <file> [--dry-run]` | Merge v2 backup (sources/states only) |
+| `restore <file> [--dry-run]` | Import + scan/probe/thumbnail + replay states |
 
 ## Troubleshooting
 

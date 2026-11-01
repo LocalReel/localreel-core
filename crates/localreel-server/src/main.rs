@@ -13,7 +13,7 @@ use localreel_kernel::events::{Event, EventBus};
 use localreel_kernel::jobs::{JobQueue, JobRegistry, JobWorker};
 use localreel_kernel::media_ops::MediaOps;
 use localreel_kernel::migrations;
-use localreel_media::MediaService;
+use localreel_media::{read_backup, restore_backup, MediaService};
 
 #[derive(Debug, Parser)]
 #[command(name = "localreel", version, about = "Local-first media server")]
@@ -73,6 +73,14 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// One-command restore: sources, scan/probe/thumbnail, then state replay.
+    Restore {
+        /// Backup JSON file.
+        from: PathBuf,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         } => state_import(from, source_id, dry_run),
         Command::BackupExport { out } => backup_export(out),
         Command::BackupImport { from, dry_run } => backup_import(from, dry_run),
+        Command::Restore { from, dry_run } => restore(from, dry_run),
     }
 }
 
@@ -246,6 +255,44 @@ fn backup_import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
         report.warnings.len(),
     );
     for warning in report.warnings.iter().take(20) {
+        println!("  warning: {warning}");
+    }
+    Ok(())
+}
+
+fn restore(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let backup = read_backup(&from)?;
+    let media_ops = MediaOps::discover(
+        config.media.ffmpeg.clone(),
+        config.media.ffprobe.clone(),
+        config.media.probe_timeout,
+        config.media.thumbnail_timeout,
+        config.media.transcode_timeout,
+    );
+    let report = restore_backup(
+        &db,
+        &backup,
+        &media_ops,
+        &config.media.thumbnail_dir,
+        dry_run,
+    )?;
+    println!(
+        "restore ({}): sources={} added={} states={} discovered={} probed={} thumbnails={} imported={} missing={}",
+        if dry_run { "dry-run" } else { "write" },
+        report.sources,
+        report.sources_added,
+        report.states,
+        report.media_discovered,
+        report.probed,
+        report.thumbnails,
+        report.states_imported,
+        report.missing,
+    );
+    for warning in &report.warnings {
         println!("  warning: {warning}");
     }
     Ok(())
