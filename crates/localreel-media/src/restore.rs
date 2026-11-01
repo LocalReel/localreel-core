@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::Result;
@@ -25,6 +25,7 @@ pub struct RestoreReport {
     pub states_imported: usize,
     pub missing: usize,
     pub warnings: Vec<String>,
+    pub canceled: bool,
 }
 
 pub fn restore_backup(
@@ -33,6 +34,8 @@ pub fn restore_backup(
     media_ops: &MediaOps,
     thumbnail_dir: &Path,
     dry_run: bool,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32, &str),
 ) -> Result<RestoreReport> {
     backup.validate()?;
     let mut report = RestoreReport {
@@ -41,17 +44,30 @@ pub fn restore_backup(
         states: backup.states.len(),
         ..RestoreReport::default()
     };
+    if cancel.load(Ordering::Relaxed) {
+        report.canceled = true;
+        return Ok(report);
+    }
 
+    progress(0.01, "importing sources");
     let first = import_backup(db, backup, dry_run)?;
     report.sources_added = first.sources_added;
     report.warnings.extend(first.warnings);
     if dry_run {
         report.missing = first.missing;
+        progress(1.0, "dry run complete");
         return Ok(report);
     }
 
     let service = MediaService::new(db.clone());
-    for uri in &backup.sources {
+    let source_count = backup.sources.len().max(1);
+    for (source_index, uri) in backup.sources.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            report.canceled = true;
+            return Ok(report);
+        }
+        let source_progress = 0.05 + 0.8 * (source_index as f32 / source_count as f32);
+        progress(source_progress, "scanning sources");
         let Some(source) = service.list_sources()?.into_iter().find(|s| &s.uri == uri) else {
             report
                 .warnings
@@ -86,7 +102,19 @@ pub fn restore_backup(
                 continue;
             }
         };
-        for media_id in candidate_ids {
+        let candidate_count = candidate_ids.len().max(1);
+        for (candidate_index, media_id) in candidate_ids.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                report.canceled = true;
+                return Ok(report);
+            }
+            progress(
+                0.05 + 0.8
+                    * ((source_index as f32
+                        + (candidate_index + 1) as f32 / candidate_count as f32)
+                        / source_count as f32),
+                "probing media",
+            );
             let Some(media) = service.get_media(media_id)? else {
                 continue;
             };
@@ -104,7 +132,7 @@ pub fn restore_backup(
             }
 
             if media.duration.is_none() || media.video_codec.is_none() {
-                match media_ops.probe(&path, &AtomicBool::new(false)) {
+                match media_ops.probe(&path, cancel) {
                     Ok(probe) => {
                         if let Err(error) = service.update_probe(media.id, &probe) {
                             report
@@ -127,7 +155,7 @@ pub fn restore_backup(
                     .duration
                     .map(|duration| (duration * 0.1).clamp(1.0, 10.0))
                     .unwrap_or(3.0);
-                match media_ops.thumbnail(&path, &output, seek, 480, &AtomicBool::new(false)) {
+                match media_ops.thumbnail(&path, &output, seek, 480, cancel) {
                     Ok(()) => {
                         let size = std::fs::metadata(&output)
                             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
@@ -158,11 +186,21 @@ pub fn restore_backup(
                 }
             }
         }
+        progress(
+            0.05 + 0.8 * ((source_index + 1) as f32 / source_count as f32),
+            "scan complete",
+        );
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        report.canceled = true;
+        return Ok(report);
+    }
+    progress(0.9, "replaying states");
     let second = import_backup(db, backup, false)?;
     report.states_imported = second.imported;
     report.missing = second.missing;
     report.warnings.extend(second.warnings);
+    progress(1.0, "restore complete");
     Ok(report)
 }

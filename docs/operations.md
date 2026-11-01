@@ -93,7 +93,10 @@ HTTP equivalents:
   (same behavior as the CLI `restore`; 32 MiB body limit).
 
 Admin -> Backup now has both **Import** and **Restore**; Restore queues the job
-and progress appears under Recent jobs.
+and progress appears under Recent jobs. The job reports phases (`importing
+sources` -> `probing media` per item -> `replaying states`) and can be canceled
+with `POST /api/v1/jobs/{id}/cancel`. A canceled restore leaves whatever was
+already imported/probed in place; it does not roll back.
 
 The backup contains sources and per-media state (uid/path/flags/position). It
 does **not** contain media files, thumbnails or transcodes. After importing into

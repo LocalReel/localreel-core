@@ -368,15 +368,19 @@ impl JobHandler for RestoreBackupHandler {
 
     fn run(&self, context: &JobContext) -> Result<JobOutcome> {
         let payload: RestorePayload = context.payload()?;
-        context.report_progress(0.05, Some("importing backup"));
+        let cancel = context.cancel_flag();
+        let mut progress = |value: f32, message: &str| {
+            context.report_progress(f64::from(value), Some(message));
+        };
         let report = restore_backup(
             &self.0.db,
             &payload.backup,
             &self.0.media_ops,
             &self.0.thumbnail_dir,
             false,
+            &cancel,
+            &mut progress,
         )?;
-        context.report_progress(1.0, Some("restore complete"));
         JobOutcome::json(report)
     }
 }

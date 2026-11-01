@@ -273,12 +273,16 @@ fn restore(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
         config.media.thumbnail_timeout,
         config.media.transcode_timeout,
     );
+    let cancel = AtomicBool::new(false);
+    let mut progress = |_: f32, _: &str| {};
     let report = restore_backup(
         &db,
         &backup,
         &media_ops,
         &config.media.thumbnail_dir,
         dry_run,
+        &cancel,
+        &mut progress,
     )?;
     println!(
         "restore ({}): sources={} added={} states={} discovered={} probed={} thumbnails={} imported={} missing={}",
