@@ -1,0 +1,10 @@
+target/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

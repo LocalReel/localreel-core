@@ -1,0 +1,265 @@
+use localreel_kernel::db::Database;
+use localreel_kernel::error::{KernelError, Result};
+use localreel_kernel::storage::MediaUri;
+use localreel_kernel::time::now_secs;
+use rusqlite::{params, OptionalExtension, Row};
+
+use crate::model::{Media, MediaState, Source};
+
+/// First-party media service.
+///
+/// Phase 0 only covers sources and read/state access. Scan/probe/thumbnail/
+/// transcode handlers are added in Phase 1/2 and registered with the kernel
+/// [`localreel_kernel::jobs::JobRegistry`].
+#[derive(Clone)]
+pub struct MediaService {
+    db: Database,
+}
+
+impl MediaService {
+    pub fn new(db: Database) -> Self {
+        Self { db }
+    }
+
+    pub fn list_sources(&self) -> Result<Vec<Source>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, uri, kind, enabled, created_at, updated_at
+                 FROM sources ORDER BY id ASC",
+            )?;
+            let rows = statement.query_map([], row_to_source)?;
+            let mut sources = Vec::new();
+            for row in rows {
+                sources.push(row?);
+            }
+            Ok(sources)
+        })
+    }
+
+    /// Add a local directory or HLS endpoint. Local paths are canonicalized and
+    /// must exist; duplicates are returned as-is.
+    pub fn add_source(&self, raw_uri: &str) -> Result<Source> {
+        let parsed = MediaUri::parse(raw_uri)?;
+        let normalized = match parsed {
+            MediaUri::Local(path) => {
+                let canonical = path.canonicalize().map_err(|error| {
+                    KernelError::InvalidInput(format!(
+                        "source does not exist: {} ({error})",
+                        path.display()
+                    ))
+                })?;
+                if !canonical.is_dir() {
+                    return Err(KernelError::InvalidInput(format!(
+                        "source is not a directory: {}",
+                        canonical.display()
+                    )));
+                }
+                MediaUri::Local(canonical)
+            }
+            other => other,
+        };
+        let uri = normalized.to_uri();
+        let kind = match normalized {
+            MediaUri::Local(_) => "local",
+            MediaUri::Http(_) => "hls",
+            MediaUri::S3 { .. } => "s3",
+        };
+        let now = now_secs();
+
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO sources (uri, kind, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, 1, ?3, ?3)
+                 ON CONFLICT(uri) DO UPDATE SET
+                     kind = excluded.kind,
+                     updated_at = excluded.updated_at",
+                params![uri, kind, now],
+            )?;
+            let source = connection
+                .query_row(
+                    "SELECT id, uri, kind, enabled, created_at, updated_at
+                     FROM sources WHERE uri = ?1",
+                    [&uri],
+                    row_to_source,
+                )
+                .optional()?
+                .ok_or_else(|| KernelError::NotFound("source after insert".into()))?;
+            Ok(source)
+        })
+    }
+
+    pub fn list_media(&self, limit: i64, offset: i64) -> Result<Vec<Media>> {
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                        duration, width, height, file_size, modified_at, video_codec,
+                        audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                        updated_at
+                 FROM media
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = statement.query_map(params![limit, offset], row_to_media)?;
+            let mut media = Vec::new();
+            for row in rows {
+                media.push(row?);
+            }
+            Ok(media)
+        })
+    }
+
+    pub fn get_media(&self, id: i64) -> Result<Option<Media>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                            duration, width, height, file_size, modified_at, video_codec,
+                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                            updated_at
+                     FROM media WHERE id = ?1",
+                    [id],
+                    row_to_media,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn get_state(&self, media_id: i64) -> Result<MediaState> {
+        self.db.with_read(|connection| {
+            let state = connection
+                .query_row(
+                    "SELECT media_id, liked, favorite, position, duration, updated_at
+                     FROM media_state WHERE media_id = ?1",
+                    [media_id],
+                    |row| {
+                        Ok(MediaState {
+                            media_id: row.get(0)?,
+                            liked: row.get::<_, i64>(1)? != 0,
+                            favorite: row.get::<_, i64>(2)? != 0,
+                            position: row.get(3)?,
+                            duration: row.get(4)?,
+                            updated_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(state.unwrap_or(MediaState {
+                media_id,
+                liked: false,
+                favorite: false,
+                position: 0.0,
+                duration: 0.0,
+                updated_at: 0,
+            }))
+        })
+    }
+
+    /// Upsert the full state object. Callers merge partial patches before
+    /// calling this; doing the merge in one writer transaction avoids the
+    /// lost-update race in the previous implementation.
+    pub fn save_state(&self, state: &MediaState) -> Result<MediaState> {
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(media_id) DO UPDATE SET
+                     liked = excluded.liked,
+                     favorite = excluded.favorite,
+                     position = excluded.position,
+                     duration = excluded.duration,
+                     updated_at = excluded.updated_at",
+                params![
+                    state.media_id,
+                    state.liked as i64,
+                    state.favorite as i64,
+                    state.position,
+                    state.duration,
+                    now
+                ],
+            )?;
+            let mut saved = state.clone();
+            saved.updated_at = now;
+            Ok(saved)
+        })
+    }
+
+    pub fn media_count(&self) -> Result<i64> {
+        self.db.with_read(|connection| {
+            Ok(connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?)
+        })
+    }
+}
+
+fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {
+    Ok(Source {
+        id: row.get(0)?,
+        uri: row.get(1)?,
+        kind: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn row_to_media(row: &Row<'_>) -> rusqlite::Result<Media> {
+    Ok(Media {
+        id: row.get(0)?,
+        uid: row.get(1)?,
+        source_id: row.get(2)?,
+        uri: row.get(3)?,
+        canonical_path: row.get(4)?,
+        filename: row.get(5)?,
+        title: row.get(6)?,
+        duration: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        file_size: row.get(10)?,
+        modified_at: row.get(11)?,
+        video_codec: row.get(12)?,
+        audio_codec: row.get(13)?,
+        bitrate: row.get(14)?,
+        thumbnail_path: row.get(15)?,
+        missing_at: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use localreel_kernel::migrations;
+
+    fn setup() -> (tempfile::TempDir, MediaService) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("media.db");
+        let db = Database::open(db_path.to_str().unwrap(), 1).unwrap();
+        migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
+        migrations::apply(&db, "media", crate::migrations::list()).unwrap();
+        (dir, MediaService::new(db))
+    }
+
+    #[test]
+    fn adds_a_local_source_idempotently() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let second = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(service.list_sources().unwrap().len(), 1);
+        assert_eq!(first.kind, "local");
+    }
+
+    #[test]
+    fn state_defaults_to_zero() {
+        let (_dir, service) = setup();
+        let state = service.get_state(42).unwrap();
+        assert_eq!(state.media_id, 42);
+        assert!(!state.liked);
+        assert_eq!(state.position, 0.0);
+    }
+}

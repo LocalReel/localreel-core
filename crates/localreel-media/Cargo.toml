@@ -1,0 +1,17 @@
+[package]
+name = "localreel-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "First-party LocalReel media domain: sources, media, state, scan history, variants"
+publish = false
+
+[dependencies]
+localreel-kernel = { path = "../localreel-kernel" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
