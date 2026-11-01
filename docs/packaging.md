@@ -125,6 +125,12 @@ Compose configuration is validated. See [docker.md](docker.md).
 There is no pinned URL in the repository (vendors move/retire builds). Download a
 trusted Windows zip, get its SHA256, then run:
 
+Verified 2026-11-01 with gyan.dev `ffmpeg-release-essentials.zip`
+(ffmpeg 9.0.2, 114,768,076 bytes,
+SHA256 `60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba`).
+That URL/hash will change when the vendor rebuilds; always fetch the current
+`.sha256` beside the zip.
+
 ```powershell
 ./scripts/fetch-ffmpeg.ps1 `
   -Url 'https://example.invalid/ffmpeg-release-essentials.zip' `
