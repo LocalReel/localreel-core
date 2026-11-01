@@ -47,6 +47,9 @@ Phase 0/1: kernel skeleton is being built. The media domain, API and UI are
 ported in the next phases; see `docs/adr/` for the decisions that constrain
 them.
 
+The full delivery plan (milestones, work breakdown, estimates, risks, next
+sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
+
 ## License
 
 TBD by the repository owner.
