@@ -79,19 +79,32 @@ Application backup (portable, versioned JSON) is the primary state backup:
 # without stopping the server
 .\localreel.exe backup-export .\backup.json
 
-# restore: import sources first, scan, then import state
+# restore into a fresh data dir is a two-pass sequence:
 .\localreel.exe backup-import .\backup.json --dry-run
-.\localreel.exe backup-import .\backup.json
+.\localreel.exe backup-import .\backup.json   # adds sources; states are missing
+# then scan the sources (UI/API scan, or `scan <id>` for discovery only)
+.\localreel.exe backup-import .\backup.json   # applies states by uid, then URI
 ```
 
 HTTP equivalents: `GET /api/v1/backup` and
-`POST /api/v1/backup?dry_run=true|false` (32 MiB limit). Admin → Backup exposes
+`POST /api/v1/backup?dry_run=true|false` (32 MiB limit). Admin -> Backup exposes
 the same flow.
 
 The backup contains sources and per-media state (uid/path/flags/position). It
 does **not** contain media files, thumbnails or transcodes. After importing into
 a new machine, scan the sources before importing state; state is matched by
 `uid` first, then by URI. Progress is never lowered, flags are OR-ed.
+
+A verified restore drill on the real 12-file library (2026-11-01):
+
+- fresh DB: first import added 1 source, 12 states missing;
+- server scan added/probed 12 media + thumbnails;
+- second import applied 12 states (0 missing);
+- `/media?filter=continue` total=12, E08 position=306.44337;
+- direct playback and Range 206 worked after probe.
+
+Note: the CLI `scan` command only discovers rows; use the server/API scan when
+you need probe metadata and thumbnails before playback.
 
 Full DB backup: stop the server first, then copy `data/localreel.db` (and
 `-wal`/`-shm` if present). Restoring an old DB is a rollback of both schema and
