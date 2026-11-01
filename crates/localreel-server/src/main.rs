@@ -51,6 +51,19 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export a versioned backup of sources and per-media state.
+    BackupExport {
+        /// Output JSON file.
+        out: PathBuf,
+    },
+    /// Import a backup, merging flags and never lowering progress.
+    BackupImport {
+        /// Backup JSON file.
+        from: PathBuf,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -74,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
             source_id,
             dry_run,
         } => state_import(from, source_id, dry_run),
+        Command::BackupExport { out } => backup_export(out),
+        Command::BackupImport { from, dry_run } => backup_import(from, dry_run),
     }
 }
 
@@ -169,6 +184,55 @@ fn state_import(from: PathBuf, source_id: Option<i64>, dry_run: bool) -> anyhow:
             detail.before_position,
             detail.after_position,
         );
+    }
+    Ok(())
+}
+
+fn backup_export(out: PathBuf) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let backup = localreel_media::export_backup(&db)?;
+    let bytes = serde_json::to_vec_pretty(&backup)?;
+    if bytes.len() as u64 > localreel_media::MAX_BACKUP_BYTES {
+        anyhow::bail!(
+            "backup is too large: {} bytes (max {})",
+            bytes.len(),
+            localreel_media::MAX_BACKUP_BYTES
+        );
+    }
+    std::fs::write(&out, &bytes)?;
+    println!(
+        "backup exported: {} sources, {} states, {} bytes -> {}",
+        backup.sources.len(),
+        backup.states.len(),
+        bytes.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn backup_import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let backup = localreel_media::read_backup(&from)?;
+    let report = localreel_media::import_backup(&db, &backup, dry_run)?;
+    println!(
+        "backup import ({}): sources={} added={} states={} imported={} unchanged={} missing={} warnings={}",
+        if dry_run { "dry-run" } else { "write" },
+        report.sources,
+        report.sources_added,
+        report.states,
+        report.imported,
+        report.unchanged,
+        report.missing,
+        report.warnings.len(),
+    );
+    for warning in report.warnings.iter().take(20) {
+        println!("  warning: {warning}");
     }
     Ok(())
 }

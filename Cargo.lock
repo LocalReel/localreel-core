@@ -567,6 +567,7 @@ dependencies = [
  "localreel-api",
  "localreel-kernel",
  "localreel-media",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
