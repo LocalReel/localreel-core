@@ -10,7 +10,7 @@ use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
 use crate::playback::DEFAULT_TRANSCODE_PRESET;
-use crate::scan::discover_source;
+use crate::scan::discover_source_with_cancel;
 use crate::service::MediaService;
 
 /// Media-domain job handlers registered with the kernel worker.
@@ -76,7 +76,10 @@ impl JobHandler for ScanSourceHandler {
             .ok_or_else(|| KernelError::NotFound(format!("source {}", payload.source_id)))?;
 
         context.report_progress(0.05, Some("discovering"));
-        let discovery = discover_source(&self.0.db, &source)?;
+        let discovery = discover_source_with_cancel(&self.0.db, &source, &context.cancel_flag())?;
+        if discovery.status == "canceled" {
+            return JobOutcome::json(discovery);
+        }
         context.report_progress(0.6, Some("enqueueing metadata jobs"));
 
         for media_id in service.probe_candidate_ids(source.id)? {

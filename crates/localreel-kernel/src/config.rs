@@ -272,6 +272,26 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve the built web UI directory.
+    ///
+    /// An explicit `web_dir` (config/env) wins if it contains `index.html`.
+    /// Otherwise try paths relative to a `cargo run` from `localreel-core`.
+    /// Returns `None` when no UI has been built yet; the API still works.
+    pub fn resolved_web_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.web_dir {
+            if dir.join("index.html").is_file() {
+                return Some(dir.clone());
+            }
+        }
+        for candidate in ["../localreel-web/dist", "web/dist", "localreel-web/dist"] {
+            let path = PathBuf::from(candidate);
+            if path.join("index.html").is_file() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     pub fn db_path_string(&self) -> String {
         self.db_path.to_string_lossy().into_owned()
     }

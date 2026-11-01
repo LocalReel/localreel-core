@@ -23,7 +23,7 @@ use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
-use localreel_media::{Media, MediaFilter, MediaState, Source};
+use localreel_media::{Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source};
 
 use crate::error::ApiError;
 use crate::guard::loopback_guard;
@@ -34,9 +34,14 @@ const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
 pub fn router(state: Arc<AppState>) -> Router {
     let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
     let transcodes = ServeDir::new(state.config.media.transcode_dir.clone());
-    Router::new()
+    let web_dir = state.config.resolved_web_dir();
+
+    let mut router = Router::new()
         .route("/", get(index))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/scan-runs", get(list_scan_runs))
+        .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sources", get(list_sources).post(add_source))
         .route("/api/v1/sources/:id/scan", post(scan_source))
@@ -53,7 +58,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/jobs/:id", get(get_job))
         .route("/api/v1/jobs/:id/cancel", post(cancel_job))
         .nest_service("/thumbnails", thumbnails)
-        .nest_service("/transcodes", transcodes)
+        .nest_service("/transcodes", transcodes);
+
+    if let Some(web_dir) = web_dir {
+        router = router.nest_service("/assets", ServeDir::new(web_dir.join("assets")));
+    }
+
+    router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             loopback_guard,
@@ -61,8 +72,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(web_dir) = state.config.resolved_web_dir() {
+        match tokio::fs::read_to_string(web_dir.join("index.html")).await {
+            Ok(html) => return Html(html).into_response(),
+            Err(error) => tracing::warn!("failed to read web index: {error}"),
+        }
+    }
+    Html(INDEX_HTML).into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +103,41 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         media_count,
         uptime_seconds: (now_secs() - state.started_at).max(0),
     })
+}
+
+async fn admin_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let database = state.db.health_check().is_ok();
+    let media_count = state.media.media_count().unwrap_or(0);
+    let recent_jobs = state.jobs.list_recent(20)?;
+    Ok(Json(serde_json::json!({
+        "status": if database { "ok" } else { "degraded" },
+        "version": localreel_kernel::VERSION,
+        "database": database,
+        "ffmpeg": state.ffmpeg_available,
+        "media_count": media_count,
+        "data_dir": state.config.data_dir,
+        "thumbnail_dir": state.config.media.thumbnail_dir,
+        "transcode_dir": state.config.media.transcode_dir,
+        "jobs": recent_jobs,
+    })))
+}
+
+async fn list_scan_runs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<Vec<ScanRun>>, ApiError> {
+    Ok(Json(state.media.list_scan_runs(query.limit.unwrap_or(50))?))
+}
+
+async fn list_scan_issues(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<Vec<ScanIssue>>, ApiError> {
+    Ok(Json(
+        state.media.list_scan_issues(query.limit.unwrap_or(50))?,
+    ))
 }
 
 async fn events(

@@ -6,7 +6,7 @@ use localreel_kernel::time::now_secs;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row};
 
-use crate::model::{Media, MediaFilter, MediaState, Source};
+use crate::model::{Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source};
 
 /// First-party media service.
 ///
@@ -296,6 +296,62 @@ impl MediaService {
                 ids.push(row?);
             }
             Ok(ids)
+        })
+    }
+
+    pub fn list_scan_runs(&self, limit: i64) -> Result<Vec<ScanRun>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, source_id, source_uri, started_at, finished_at, status,
+                        discovered, added, updated, unchanged, removed, failed
+                 FROM scan_runs
+                 ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit.clamp(1, 200)], |row| {
+                Ok(ScanRun {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    source_uri: row.get(2)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    status: row.get(5)?,
+                    discovered: row.get(6)?,
+                    added: row.get(7)?,
+                    updated: row.get(8)?,
+                    unchanged: row.get(9)?,
+                    removed: row.get(10)?,
+                    failed: row.get(11)?,
+                })
+            })?;
+            let mut runs = Vec::new();
+            for row in rows {
+                runs.push(row?);
+            }
+            Ok(runs)
+        })
+    }
+
+    pub fn list_scan_issues(&self, limit: i64) -> Result<Vec<ScanIssue>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, run_id, source_id, path, message, created_at
+                 FROM scan_issues ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit.clamp(1, 200)], |row| {
+                Ok(ScanIssue {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    path: row.get(3)?,
+                    message: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?;
+            let mut issues = Vec::new();
+            for row in rows {
+                issues.push(row?);
+            }
+            Ok(issues)
         })
     }
 

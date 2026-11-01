@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
@@ -39,6 +40,17 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 /// Missing files are marked with `missing_at`; rows and user state are never
 /// deleted by a scan.
 pub fn discover_source(db: &Database, source: &Source) -> Result<ScanDiscovery> {
+    discover_source_with_cancel(db, source, &AtomicBool::new(false))
+}
+
+/// Same as [`discover_source`], but stops walking/upserting when `cancel`
+/// becomes true. A canceled run is recorded as such and does not mark missing
+/// rows (a partial walk would otherwise hide media).
+pub fn discover_source_with_cancel(
+    db: &Database,
+    source: &Source,
+    cancel: &AtomicBool,
+) -> Result<ScanDiscovery> {
     let parsed = MediaUri::parse(&source.uri)?;
     let root = match &parsed {
         MediaUri::Local(path) => path.clone(),
@@ -112,6 +124,26 @@ pub fn discover_source(db: &Database, source: &Source) -> Result<ScanDiscovery> 
     let mut traversal_incomplete = false;
 
     for entry in WalkDir::new(&root).follow_links(false) {
+        if cancel.load(Ordering::Relaxed) {
+            let counts = ScanCounts {
+                discovered: candidates.len(),
+                failed: issues.len(),
+                ..ScanCounts::default()
+            };
+            finish_run(db, run_id, "canceled", counts, &issues)?;
+            return Ok(ScanDiscovery {
+                run_id,
+                source_id: source.id,
+                status: "canceled".to_string(),
+                discovered: counts.discovered,
+                added: 0,
+                updated: 0,
+                unchanged: 0,
+                missing: 0,
+                failed: counts.failed,
+            });
+        }
+
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -156,6 +188,26 @@ pub fn discover_source(db: &Database, source: &Source) -> Result<ScanDiscovery> 
                 .unwrap_or_else(|| "unknown".to_string()),
             file_size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             modified_at,
+        });
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        let counts = ScanCounts {
+            discovered: candidates.len(),
+            failed: issues.len(),
+            ..ScanCounts::default()
+        };
+        finish_run(db, run_id, "canceled", counts, &issues)?;
+        return Ok(ScanDiscovery {
+            run_id,
+            source_id: source.id,
+            status: "canceled".to_string(),
+            discovered: counts.discovered,
+            added: 0,
+            updated: 0,
+            unchanged: 0,
+            missing: 0,
+            failed: counts.failed,
         });
     }
 
@@ -481,6 +533,34 @@ mod tests {
             .unwrap();
         assert!(missing_at.is_some());
         assert_eq!(favorite, 1);
+    }
+
+    #[test]
+    fn canceled_scan_is_recorded_without_upserting() {
+        let (dir, db, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.mp4"), b"a").unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let result = discover_source_with_cancel(&db, &source, &cancel).unwrap();
+        assert_eq!(result.status, "canceled");
+        assert_eq!(result.discovered, 0);
+        let media_count: i64 = db
+            .with_read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(media_count, 0);
+        let run_status: String = db
+            .with_read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT status FROM scan_runs ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(run_status, "canceled");
     }
 
     #[test]
