@@ -63,7 +63,7 @@ cd localreel-core
       metal and ffmpeg playback are still worth checking.
 - [ ] Optional Docker: `docker compose build`; start with a loopback-only
       port, scan `/media`, play one file, and verify `/data` persistence after
-      `docker compose restart` (not yet verified in this workspace).
+      `docker compose restart` (verified in WSL2 dockerd on 2026-11-01).
 - [ ] `.\localreel.exe --version` prints the expected version.
 - [ ] `.\localreel.exe doctor` shows `web: embedded`, DB ok, and the expected
       ffmpeg status.
@@ -79,7 +79,11 @@ cd localreel-core
       -InstallDir <temp>`), verify action/working directory, then uninstall it.
 - [ ] MSI: `.\scripts\build-msi.ps1`; silent install `/qn`, check exe +
       Start Menu shortcut + `--version`, then silent uninstall and confirm a
-      data marker survives. MSI is unsigned.
+      data marker survives.
+- [ ] Sign the exe and MSI with a CA-issued certificate
+      (`.\scripts\sign.ps1 -PfxPath ... -PfxPassword ...`); verify
+      `Get-AuthenticodeSignature` is `Valid`. See [signing.md](signing.md).
+      Self-signed is only for local tests.
 - [ ] Add/scan a small source; confirm thumbnail and playback.
 - [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
 - [ ] Check `/api/v1/health` and `/api/v1/admin/health`.
@@ -95,7 +99,7 @@ Include:
 - known limitations:
   - single-user, loopback only;
   - no HLS output, no plugins;
-  - no installer/signing (zip only);
+  - MSI is unsigned; no CA-issued code-signing certificate yet;
   - archived media hidden by default;
   - browser resume smoke runs against the mock UI in CI; the real-server
     variant remains a manual check;
