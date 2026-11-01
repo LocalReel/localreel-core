@@ -40,6 +40,17 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy legacy video_states onto current media, matched by episode number.
+    StateImport {
+        /// Path to the legacy `localreel.db` (a copy, never the live file).
+        from: PathBuf,
+        /// Restrict targets to one current source.
+        #[arg(long)]
+        source_id: Option<i64>,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +69,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor => doctor(),
         Command::Scan { source_id } => scan(source_id),
         Command::Import { from, dry_run } => import(from, dry_run),
+        Command::StateImport {
+            from,
+            source_id,
+            dry_run,
+        } => state_import(from, source_id, dry_run),
     }
 }
 
@@ -123,6 +139,37 @@ fn doctor() -> anyhow::Result<()> {
     };
     println!("  web:       {web}");
     println!("  workers:   {}", config.jobs.workers);
+    Ok(())
+}
+
+fn state_import(from: PathBuf, source_id: Option<i64>, dry_run: bool) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let report = localreel_media::migrate_legacy_state(&db, &from, source_id, dry_run)?;
+    println!(
+        "legacy state import ({}): legacy={} matched={} updated={} unchanged={} ambiguous={} unmatched={} conflicts={}",
+        if dry_run { "dry-run" } else { "write" },
+        report.legacy_states,
+        report.matched,
+        report.updated,
+        report.unchanged,
+        report.ambiguous,
+        report.unmatched,
+        report.conflicts,
+    );
+    for detail in report.details.iter().take(20) {
+        println!(
+            "  {} -> {} [{}] episode={:?} position={:.1}->{:.1}",
+            detail.legacy_filename,
+            detail.target_filename.as_deref().unwrap_or("<none>"),
+            detail.status,
+            detail.episode,
+            detail.before_position,
+            detail.after_position,
+        );
+    }
     Ok(())
 }
 

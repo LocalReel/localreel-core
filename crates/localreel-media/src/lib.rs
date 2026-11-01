@@ -11,6 +11,7 @@ pub mod model;
 pub mod playback;
 pub mod scan;
 pub mod service;
+pub mod state_migration;
 
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
@@ -20,3 +21,6 @@ pub use model::{
 };
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
 pub use service::MediaService;
+pub use state_migration::{
+    episode_key, migrate_legacy_state, StateMigrationDetail, StateMigrationReport,
+};
