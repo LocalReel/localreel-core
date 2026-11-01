@@ -12,3 +12,7 @@ Thumbs.db
 # bundled media tools (optional)
 .tools/
 
+
+# release packaging output
+dist/
+

@@ -57,6 +57,31 @@ If the UI was never built, the binary still runs and serves the API plus a
 placeholder page. `localreel doctor` prints `web: embedded`, `web: disk (...)`,
 or `web: missing`.
 
+## Build a portable Windows zip
+
+```powershell
+# optional: copy ffmpeg.exe/ffprobe.exe into the package
+./scripts/package.ps1 -BuildWeb -FfmpegDir '.tools/ffmpeg'
+```
+
+Default profile is `release`; output is
+`dist/localreel-<version>-x64.zip`, containing:
+
+```text
+localreel.exe
+localreel.toml.example
+README.md
+README.txt
+docs/packaging.md
+tools/fetch-ffmpeg.ps1
+tools/verify-ffmpeg.ps1
+ffmpeg/bin/...        # only with -FfmpegDir
+```
+
+The script refuses to run if `localreel-web/dist` is missing; `-BuildWeb`
+builds it first. Use `-Profile debug` for a faster local package, and
+`-SkipBuild` to package an existing binary.
+
 ## Downloading a Windows build
 
 There is no pinned URL in the repository (vendors move/retire builds). Download a
