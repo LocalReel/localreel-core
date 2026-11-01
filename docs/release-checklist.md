@@ -57,6 +57,9 @@ cd localreel-core
 ## 4. Verify the artifact on a clean directory
 
 - [ ] Extract the zip into a new directory.
+- [ ] Optional Linux: `./scripts/package-linux.sh --build-web`; extract the
+      tarball on a Linux host and run `./localreel --version` / `doctor`
+      (structural packaging is tested here, runtime is not yet).
 - [ ] `.\localreel.exe --version` prints the expected version.
 - [ ] `.\localreel.exe doctor` shows `web: embedded`, DB ok, and the expected
       ffmpeg status.

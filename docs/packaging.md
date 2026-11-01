@@ -89,6 +89,18 @@ For installation see [install.md](install.md); the full release process is in
 [release-checklist.md](release-checklist.md); day-to-day operation is covered
 in [operations.md](operations.md).
 
+## Linux tarball
+
+On Linux (secondary target, not yet real-machine-verified here):
+
+```bash
+./scripts/package-linux.sh --build-web
+# dist/localreel-<version>-x86_64.tar.gz + .sha256
+```
+
+The tarball contains `localreel`, `install.sh`, `uninstall.sh`, config example,
+README, docs and optional `ffmpeg/bin`. See [linux.md](linux.md).
+
 ## Downloading a Windows build
 
 There is no pinned URL in the repository (vendors move/retire builds). Download a
