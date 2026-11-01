@@ -127,7 +127,17 @@ pub fn read_backup(path: &Path) -> Result<Backup> {
         )));
     }
     let bytes = std::fs::read(path)?;
-    let backup: Backup = serde_json::from_slice(&bytes)
+    parse_backup(&bytes)
+}
+
+pub fn parse_backup(bytes: &[u8]) -> Result<Backup> {
+    if bytes.len() as u64 > MAX_BACKUP_BYTES {
+        return Err(KernelError::InvalidInput(format!(
+            "backup is too large: {} bytes (max {MAX_BACKUP_BYTES})",
+            bytes.len()
+        )));
+    }
+    let backup: Backup = serde_json::from_slice(bytes)
         .map_err(|error| KernelError::InvalidInput(format!("invalid backup JSON: {error}")))?;
     backup.validate()?;
     Ok(backup)

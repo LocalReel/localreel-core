@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
-    extract::{Path, Query, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -24,8 +24,8 @@ use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
 use localreel_media::{
-    CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, ScanIssue,
-    ScanRun, Source,
+    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter,
+    MediaState, ScanIssue, ScanRun, Source,
 };
 
 use crate::error::ApiError;
@@ -45,6 +45,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
+        .route("/api/v1/backup", get(download_backup).post(upload_backup))
         .route("/api/v1/scan-runs", get(list_scan_runs))
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
@@ -86,6 +87,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     }
 
     router
+        .layer(DefaultBodyLimit::max(
+            usize::try_from(localreel_media::MAX_BACKUP_BYTES).unwrap_or(32 * 1024 * 1024),
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             loopback_guard,
@@ -167,6 +171,39 @@ async fn admin_health(
         "transcode_dir": state.config.media.transcode_dir,
         "jobs": recent_jobs,
     })))
+}
+
+async fn download_backup(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let backup = localreel_media::export_backup(&state.db)?;
+    let body = serde_json::to_vec_pretty(&backup)
+        .map_err(|error| ApiError::internal(format!("failed to encode backup: {error}")))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"localreel-backup.json\"",
+        )
+        .body(Body::from(body))
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupImportQuery {
+    dry_run: Option<bool>,
+}
+
+async fn upload_backup(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BackupImportQuery>,
+    body: Bytes,
+) -> Result<Json<BackupImportReport>, ApiError> {
+    let backup = localreel_media::parse_backup(&body)?;
+    Ok(Json(localreel_media::import_backup(
+        &state.db,
+        &backup,
+        query.dry_run.unwrap_or(false),
+    )?))
 }
 
 async fn cache_stats(State(state): State<Arc<AppState>>) -> Result<Json<CacheStats>, ApiError> {
@@ -808,6 +845,42 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("\"status\":\"ok\""));
         assert!(text.contains("\"database\":true"));
+    }
+
+    #[tokio::test]
+    async fn backup_download_and_upload_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let response = app
+            .clone()
+            .oneshot(request("/api/v1/backup"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .is_some());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let backup: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(backup["version"], 2);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/backup")
+            .header("host", "127.0.0.1:3001")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["states"], 0);
     }
 
     #[tokio::test]

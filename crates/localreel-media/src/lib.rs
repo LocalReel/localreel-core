@@ -15,8 +15,8 @@ pub mod service;
 pub mod state_migration;
 
 pub use backup::{
-    export_backup, import_backup, read_backup, Backup, BackupImportReport, BackupState,
-    BACKUP_VERSION, MAX_BACKUP_BYTES,
+    export_backup, import_backup, parse_backup, read_backup, Backup, BackupImportReport,
+    BackupState, BACKUP_VERSION, MAX_BACKUP_BYTES,
 };
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
