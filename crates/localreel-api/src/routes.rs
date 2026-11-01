@@ -63,9 +63,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     if embedded {
         router = router
             .route("/", get(embedded_index))
+            .route("/admin", get(embedded_index))
             .route("/assets/*path", get(embedded_asset));
     } else {
-        router = router.route("/", get(index));
+        router = router.route("/", get(index)).route("/admin", get(index));
         if let Some(web_dir) = web_dir {
             router = router.nest_service("/assets", ServeDir::new(web_dir.join("assets")));
         }
@@ -719,6 +720,19 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("\"status\":\"ok\""));
         assert!(text.contains("\"database\":true"));
+    }
+
+    #[tokio::test]
+    async fn admin_deep_link_serves_the_web_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let response = app.oneshot(request("/admin")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("LocalReel"));
     }
 
     #[tokio::test]
