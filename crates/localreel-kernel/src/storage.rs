@@ -325,6 +325,19 @@ fn local_path_to_uri(path: &Path) -> String {
     format!("file://{raw}")
 }
 
+/// Normalize a local path for prefix comparisons (strip Windows `\\?\`).
+/// This does not canonicalize or touch the filesystem.
+pub fn normalize_local_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(strip_verbatim_prefix(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(windows)]
 fn strip_verbatim_prefix(path: &str) -> String {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {

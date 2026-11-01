@@ -22,7 +22,7 @@ pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
 pub use model::{
     CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, MediaVariant,
-    ScanIssue, ScanRun, Source,
+    RemapReport, ScanIssue, ScanRun, Source,
 };
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
 pub use service::MediaService;

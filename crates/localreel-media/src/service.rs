@@ -4,7 +4,7 @@ use std::path::Path;
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::media_ops::ProbeResult;
-use localreel_kernel::storage::MediaUri;
+use localreel_kernel::storage::{normalize_local_path, MediaUri};
 use localreel_kernel::time::now_secs;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row};
@@ -161,6 +161,134 @@ impl MediaService {
                 row_to_source,
             )?)
         })
+    }
+
+    /// Move a local source to a new directory without losing media ids/state.
+    ///
+    /// Only media whose old canonical path is under the old root and whose new
+    /// file exists are rewritten. Missing/out-of-root rows are reported and
+    /// left untouched. `dry_run` computes the same report without writing.
+    pub fn remap_source(
+        &self,
+        id: i64,
+        new_uri_raw: &str,
+        dry_run: bool,
+    ) -> Result<crate::model::RemapReport> {
+        let source = self
+            .get_source(id)?
+            .ok_or_else(|| KernelError::NotFound(format!("source {id}")))?;
+        let old_root = match MediaUri::parse(&source.uri)? {
+            MediaUri::Local(path) => normalize_local_path(&path),
+            _ => {
+                return Err(KernelError::InvalidInput(
+                    "only local sources can be remapped".into(),
+                ))
+            }
+        };
+        let new_root = match MediaUri::parse(new_uri_raw)? {
+            MediaUri::Local(path) => path,
+            _ => {
+                return Err(KernelError::InvalidInput(
+                    "new remap target must be a local directory".into(),
+                ))
+            }
+        };
+        let new_root = normalize_local_path(&new_root.canonicalize().map_err(|error| {
+            KernelError::InvalidInput(format!(
+                "new source does not exist: {} ({error})",
+                new_root.display()
+            ))
+        })?);
+        if !new_root.is_dir() {
+            return Err(KernelError::InvalidInput(format!(
+                "new source is not a directory: {}",
+                new_root.display()
+            )));
+        }
+        let new_uri = MediaUri::Local(new_root.clone()).to_uri();
+
+        let conflict: Option<i64> = self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id FROM sources WHERE uri = ?1 AND id <> ?2",
+                    params![new_uri, id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })?;
+        if conflict.is_some() {
+            return Err(KernelError::Conflict(format!(
+                "another source already uses {new_uri}"
+            )));
+        }
+
+        let media_rows: Vec<(i64, String)> = self.db.with_read(|connection| {
+            let mut statement =
+                connection.prepare("SELECT id, canonical_path FROM media WHERE source_id = ?1")?;
+            let rows = statement.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let mut media = Vec::new();
+            for row in rows {
+                media.push(row?);
+            }
+            Ok(media)
+        })?;
+
+        let mut updates = Vec::new();
+        let mut report = crate::model::RemapReport {
+            source_id: id,
+            old_uri: source.uri.clone(),
+            new_uri: new_uri.clone(),
+            dry_run,
+            media_total: media_rows.len() as i64,
+            ..crate::model::RemapReport::default()
+        };
+        for (media_id, canonical_path) in &media_rows {
+            let old_path = normalize_local_path(Path::new(canonical_path));
+            let Ok(relative) = old_path.strip_prefix(&old_root) else {
+                report.skipped += 1;
+                continue;
+            };
+            let new_path = new_root.join(relative);
+            if !new_path.is_file() {
+                report.missing += 1;
+                continue;
+            }
+            report.remapped += 1;
+            updates.push((
+                *media_id,
+                MediaUri::Local(new_path.clone()).to_uri(),
+                new_path.to_string_lossy().into_owned(),
+            ));
+        }
+
+        if report.missing > 0 {
+            report.warnings.push(format!(
+                "{} media files were not found under the new root; their URIs were left unchanged",
+                report.missing
+            ));
+        }
+
+        if !dry_run {
+            let now = now_secs();
+            self.db.with_write(|connection| {
+                let transaction = connection.transaction()?;
+                for (media_id, uri, canonical_path) in &updates {
+                    transaction.execute(
+                        "UPDATE media SET uri = ?1, canonical_path = ?2, updated_at = ?3
+                         WHERE id = ?4",
+                        params![uri, canonical_path, now, media_id],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE sources SET uri = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![new_uri, now, id],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })?;
+        }
+
+        Ok(report)
     }
 
     /// Delete a source after an explicit confirmation.
@@ -787,6 +915,8 @@ mod tests {
     use super::*;
     use localreel_kernel::migrations;
 
+    use crate::scan::discover_source;
+
     fn setup() -> (tempfile::TempDir, MediaService) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("media.db");
@@ -992,6 +1122,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(media_count, 0);
+    }
+
+    #[test]
+    fn remaps_source_root_preserving_media_and_state() {
+        let (dir, service) = setup();
+        let old_root = dir.path().join("old");
+        let new_root = dir.path().join("new");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(old_root.join("episode.mp4"), b"video").unwrap();
+        std::fs::copy(old_root.join("episode.mp4"), new_root.join("episode.mp4")).unwrap();
+
+        let source = service.add_source(old_root.to_str().unwrap()).unwrap();
+        let discovery = discover_source(&service.db, &source).unwrap();
+        assert_eq!(discovery.added, 1);
+        let media = service.list_media(10, 0).unwrap().pop().unwrap();
+        service
+            .save_state(&MediaState {
+                media_id: media.id,
+                liked: true,
+                favorite: true,
+                position: 42.0,
+                duration: 100.0,
+                updated_at: 0,
+            })
+            .unwrap();
+
+        let preview = service
+            .remap_source(source.id, new_root.to_str().unwrap(), true)
+            .unwrap();
+        assert_eq!(preview.remapped, 1, "preview={preview:?}");
+        assert_eq!(preview.missing, 0);
+        assert!(service
+            .get_media(media.id)
+            .unwrap()
+            .unwrap()
+            .uri
+            .contains("/old/"));
+
+        let report = service
+            .remap_source(source.id, new_root.to_str().unwrap(), false)
+            .unwrap();
+        assert_eq!(report.remapped, 1);
+        let media = service.get_media(media.id).unwrap().unwrap();
+        assert!(media.uri.contains("/new/"));
+        assert!(media.canonical_path.contains("new"));
+        let state = service.get_state(media.id).unwrap();
+        assert!(state.liked);
+        assert!(state.favorite);
+        assert_eq!(state.position, 42.0);
+
+        let empty_root = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        let missing = service
+            .remap_source(source.id, empty_root.to_str().unwrap(), true)
+            .unwrap();
+        assert_eq!(missing.missing, 1);
+        assert_eq!(missing.remapped, 0);
+    }
+
+    #[test]
+    fn remap_rejects_a_source_uri_owned_by_another_source() {
+        let (dir, service) = setup();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first = service.add_source(first.to_str().unwrap()).unwrap();
+        service.add_source(second.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            service.remap_source(first.id, second.to_str().unwrap(), true),
+            Err(KernelError::Conflict(_))
+        ));
     }
 
     #[test]

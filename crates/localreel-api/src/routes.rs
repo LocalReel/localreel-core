@@ -25,7 +25,7 @@ use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
 use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter,
-    MediaState, ScanIssue, ScanRun, Source,
+    MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
 
 use crate::error::ApiError;
@@ -55,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             patch(patch_source).delete(delete_source),
         )
         .route("/api/v1/sources/:id/scan", post(scan_source))
+        .route("/api/v1/sources/:id/remap", post(remap_source))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/search", get(search_media))
         .route("/api/v1/media/:id", get(get_media))
@@ -328,6 +329,25 @@ async fn delete_source(
         query.dry_run.unwrap_or(false),
         &state.config.media.thumbnail_dir,
         &state.config.media.transcode_dir,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct RemapSourceRequest {
+    uri: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn remap_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(payload): Json<RemapSourceRequest>,
+) -> Result<Json<RemapReport>, ApiError> {
+    Ok(Json(state.media.remap_source(
+        id,
+        &payload.uri,
+        payload.dry_run,
     )?))
 }
 

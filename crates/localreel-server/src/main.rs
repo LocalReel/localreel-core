@@ -32,6 +32,15 @@ enum Command {
     Doctor,
     /// Discover media under one configured source (walk/fingerprint/upsert).
     Scan { source_id: i64 },
+    /// Rewrite a local source root, preserving media ids/state.
+    RemapSource {
+        source_id: i64,
+        /// New local directory (or file:// URI).
+        uri: String,
+        /// Validate and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Import a copy of a LocalReel v1 database.
     Import {
         /// Path to the legacy `localreel.db` (a copy, never the live file).
@@ -81,6 +90,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => migrate(),
         Command::Doctor => doctor(),
         Command::Scan { source_id } => scan(source_id),
+        Command::RemapSource {
+            source_id,
+            uri,
+            dry_run,
+        } => remap_source(source_id, uri, dry_run),
         Command::Import { from, dry_run } => import(from, dry_run),
         Command::StateImport {
             from,
@@ -232,6 +246,27 @@ fn backup_import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
         report.warnings.len(),
     );
     for warning in report.warnings.iter().take(20) {
+        println!("  warning: {warning}");
+    }
+    Ok(())
+}
+
+fn remap_source(source_id: i64, uri: String, dry_run: bool) -> anyhow::Result<()> {
+    let (config, _) = Config::load_with_source()?;
+    config.ensure_dirs()?;
+    let db = open_database(&config)?;
+    run_migrations(&db)?;
+    let report = MediaService::new(db).remap_source(source_id, &uri, dry_run)?;
+    println!(
+        "remap source {} ({}): total={} remapped={} missing={} skipped={}",
+        report.source_id,
+        if dry_run { "dry-run" } else { "write" },
+        report.media_total,
+        report.remapped,
+        report.missing,
+        report.skipped,
+    );
+    for warning in &report.warnings {
         println!("  warning: {warning}");
     }
     Ok(())

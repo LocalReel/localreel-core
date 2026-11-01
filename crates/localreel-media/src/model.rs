@@ -125,6 +125,19 @@ pub struct CacheGcReport {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RemapReport {
+    pub source_id: i64,
+    pub old_uri: String,
+    pub new_uri: String,
+    pub dry_run: bool,
+    pub media_total: i64,
+    pub remapped: i64,
+    pub missing: i64,
+    pub skipped: i64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeleteSourceReport {
     pub source_id: i64,
     pub source_uri: String,
