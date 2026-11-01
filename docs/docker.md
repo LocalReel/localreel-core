@@ -2,7 +2,8 @@
 
 The repository ships a multi-stage Dockerfile and Compose file. Status:
 **configuration is validated, but the image has not been built in this
-environment** (the local Docker daemon is not running). Do not treat Docker as
+environment** (the local Docker daemon is not running, and starting the Docker
+Desktop service requires administrator rights). Do not treat Docker as
 release-verified until `docker compose up --build` succeeds on a machine with
 Docker Desktop/Engine.
 

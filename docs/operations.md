@@ -175,5 +175,8 @@ There are no down migrations. Roll back by restoring the DB and the old binary.
 - Default host is `127.0.0.1`; the API has a loopback Host/Origin guard.
 - Do not set `allow_remote`/`LOCALREEL_ALLOW_REMOTE=1` without an external
   authentication layer (v1 has no users/tokens).
+- The server sets `Content-Security-Policy` (`default-src 'self'`), `nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and a restrictive
+  `Permissions-Policy` on responses. The UI has no inline scripts/styles.
 - The server has filesystem access to configured sources; keep the data dir and
   config private.

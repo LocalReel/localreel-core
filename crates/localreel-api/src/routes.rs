@@ -29,7 +29,7 @@ use localreel_media::{
 };
 
 use crate::error::ApiError;
-use crate::guard::loopback_guard;
+use crate::guard::{loopback_guard, security_headers};
 use crate::state::AppState;
 
 const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
@@ -96,6 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             loopback_guard,
         ))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -891,6 +892,25 @@ mod tests {
             .header("host", "127.0.0.1:3001")
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let response = app.oneshot(request("/api/v1/health")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+        assert!(headers
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("default-src 'self'"));
+        assert!(headers.get("permissions-policy").is_some());
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{header, uri::Authority, StatusCode},
+    http::{header, uri::Authority, HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -46,6 +46,39 @@ pub async fn loopback_guard(
     }
 
     next.run(request).await
+}
+
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self'; style-src 'self'; img-src 'self' data:; \
+    media-src 'self' blob:; connect-src 'self'; font-src 'self'; \
+    object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+/// Add conservative browser security headers to every response. The UI has no
+/// inline scripts/styles and loads everything from the same origin.
+pub async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    response
 }
 
 fn is_loopback_authority(value: &str) -> bool {
