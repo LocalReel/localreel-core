@@ -23,7 +23,9 @@ use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
-use localreel_media::{Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source};
+use localreel_media::{
+    CacheGcReport, CacheStats, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
+};
 
 use crate::error::ApiError;
 use crate::guard::loopback_guard;
@@ -40,6 +42,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/cache", get(cache_stats))
+        .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/scan-runs", get(list_scan_runs))
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
@@ -159,6 +163,36 @@ async fn admin_health(
         "transcode_dir": state.config.media.transcode_dir,
         "jobs": recent_jobs,
     })))
+}
+
+async fn cache_stats(State(state): State<Arc<AppState>>) -> Result<Json<CacheStats>, ApiError> {
+    Ok(Json(state.media.cache_stats()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheGcRequest {
+    max_bytes: Option<u64>,
+    max_age_secs: Option<u64>,
+}
+
+async fn run_cache_gc(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CacheGcRequest>,
+) -> Result<Json<CacheGcReport>, ApiError> {
+    let max_bytes = payload
+        .max_bytes
+        .unwrap_or(state.config.media.cache_max_bytes);
+    let max_age_secs = payload
+        .max_age_secs
+        .unwrap_or(state.config.media.cache_max_age.as_secs());
+    let max_age_secs = i64::try_from(max_age_secs).unwrap_or(i64::MAX);
+    let report = state.media.gc_transcode_cache(
+        &state.config.media.transcode_dir,
+        max_bytes,
+        max_age_secs,
+        3600,
+    )?;
+    Ok(Json(report))
 }
 
 async fn list_scan_runs(
@@ -445,6 +479,15 @@ async fn prepare_playback(
     {
         let path = state.config.media.transcode_dir.join(&variant.path);
         if path.is_file() {
+            if let Err(error) = state
+                .media
+                .touch_variant(media.id, DEFAULT_TRANSCODE_PRESET)
+            {
+                tracing::warn!(
+                    media_id = media.id,
+                    "failed to touch transcode variant: {error}"
+                );
+            }
             return Ok(Json(PlaybackResponse {
                 mode: "ready",
                 url: Some(format!("/transcodes/{}", variant.path)),

@@ -105,3 +105,20 @@ pub struct MediaVariant {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub transcode_count: i64,
+    pub transcode_bytes: i64,
+    pub thumbnail_count: i64,
+    pub thumbnail_bytes: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheGcReport {
+    pub removed: i64,
+    pub freed_bytes: i64,
+    pub kept: i64,
+    pub remaining_bytes: i64,
+}

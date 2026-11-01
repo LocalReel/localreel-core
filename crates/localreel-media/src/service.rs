@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::path::Path;
+
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::media_ops::ProbeResult;
@@ -6,7 +9,9 @@ use localreel_kernel::time::now_secs;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row};
 
-use crate::model::{Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source};
+use crate::model::{
+    CacheGcReport, CacheStats, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
+};
 
 /// First-party media service.
 ///
@@ -300,6 +305,160 @@ impl MediaService {
         })
     }
 
+    pub fn touch_variant(&self, media_id: i64, preset: &str) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute(
+                "UPDATE media_variants SET last_used_at = ?1
+                 WHERE media_id = ?2 AND kind = 'transcode' AND preset = ?3",
+                params![now_secs(), media_id, preset],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn cache_stats(&self) -> Result<CacheStats> {
+        self.db.with_read(|connection| {
+            let mut stats = CacheStats::default();
+            let total: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM media_variants",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT kind, COUNT(*), COALESCE(SUM(size), 0)
+                 FROM media_variants GROUP BY kind",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (kind, count, bytes) = row?;
+                match kind.as_str() {
+                    "transcode" => {
+                        stats.transcode_count = count;
+                        stats.transcode_bytes = bytes;
+                    }
+                    "thumbnail" => {
+                        stats.thumbnail_count = count;
+                        stats.thumbnail_bytes = bytes;
+                    }
+                    _ => {}
+                }
+            }
+            stats.total_bytes = total;
+            Ok(stats)
+        })
+    }
+
+    /// Reclaim transcode variants by age and then by total size.
+    ///
+    /// Thumbnails are intentionally excluded. Files touched within
+    /// `protect_recent_secs` (active/recent playback) are never candidates.
+    /// Paths containing directories are skipped so a poisoned DB row cannot
+    /// delete outside the transcode directory.
+    pub fn gc_transcode_cache(
+        &self,
+        transcode_dir: &Path,
+        max_bytes: u64,
+        max_age_secs: i64,
+        protect_recent_secs: i64,
+    ) -> Result<CacheGcReport> {
+        let now = now_secs();
+        let variants = self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, media_id, kind, preset, path, size, created_at, last_used_at
+                 FROM media_variants
+                 WHERE kind = 'transcode'
+                 ORDER BY COALESCE(last_used_at, created_at) ASC, id ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(crate::model::MediaVariant {
+                    id: row.get(0)?,
+                    media_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    preset: row.get(3)?,
+                    path: row.get(4)?,
+                    size: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_used_at: row.get(7)?,
+                })
+            })?;
+            let mut variants = Vec::new();
+            for row in rows {
+                variants.push(row?);
+            }
+            Ok(variants)
+        })?;
+
+        let total: i64 = variants.iter().map(|variant| variant.size).sum();
+        let is_protected = |variant: &crate::model::MediaVariant| {
+            protect_recent_secs > 0
+                && variant.last_used_at.unwrap_or(variant.created_at) >= now - protect_recent_secs
+        };
+        let is_expired = |variant: &crate::model::MediaVariant| {
+            max_age_secs > 0
+                && variant.last_used_at.unwrap_or(variant.created_at) < now - max_age_secs
+        };
+
+        let mut remove_ids = HashSet::new();
+        let mut remaining = total;
+        for variant in &variants {
+            if !is_protected(variant) && is_expired(variant) {
+                remove_ids.insert(variant.id);
+                remaining -= variant.size;
+            }
+        }
+        if remaining.max(0) as u64 > max_bytes {
+            for variant in &variants {
+                if remaining.max(0) as u64 <= max_bytes {
+                    break;
+                }
+                if is_protected(variant) || remove_ids.contains(&variant.id) {
+                    continue;
+                }
+                remove_ids.insert(variant.id);
+                remaining -= variant.size;
+            }
+        }
+
+        let mut removed = 0i64;
+        let mut freed_bytes = 0i64;
+        for variant in &variants {
+            if !remove_ids.contains(&variant.id) {
+                continue;
+            }
+            if !is_safe_variant_name(&variant.path) {
+                continue;
+            }
+            let file = transcode_dir.join(&variant.path);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = %file.display(), "cache GC could not remove file: {error}");
+                    continue;
+                }
+            }
+            self.db.with_write(|connection| {
+                connection.execute("DELETE FROM media_variants WHERE id = ?1", [variant.id])?;
+                Ok(())
+            })?;
+            removed += 1;
+            freed_bytes += variant.size;
+        }
+
+        Ok(CacheGcReport {
+            removed,
+            freed_bytes,
+            kept: variants.len() as i64 - removed,
+            remaining_bytes: total - freed_bytes,
+        })
+    }
+
     /// Media rows that still need metadata or a thumbnail for a source.
     pub fn probe_candidate_ids(&self, source_id: i64) -> Result<Vec<i64>> {
         self.db.with_read(|connection| {
@@ -492,6 +651,11 @@ fn row_to_media(row: &Row<'_>) -> rusqlite::Result<Media> {
     })
 }
 
+fn is_safe_variant_name(name: &str) -> bool {
+    let path = Path::new(name);
+    path.components().count() == 1 && path.file_name().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +696,105 @@ mod tests {
 
         let enabled = service.set_source_enabled(source.id, true).unwrap();
         assert!(enabled.enabled);
+    }
+
+    fn insert_media(service: &MediaService, source_id: i64, uid: &str) -> i64 {
+        let now = now_secs();
+        service
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media (
+                         uid, source_id, uri, canonical_path, filename, file_size,
+                         modified_at, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?3, ?4, 0, 0, ?5, ?5)",
+                    params![
+                        uid,
+                        source_id,
+                        format!("file:///cache/{uid}.mp4"),
+                        format!("{uid}.mp4"),
+                        now
+                    ],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_stats_and_gc_respect_budget() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let media_id = insert_media(&service, source.id, "cache-a");
+
+        let transcode_dir = dir.path().join("transcodes");
+        std::fs::create_dir_all(&transcode_dir).unwrap();
+        for name in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(transcode_dir.join(name), vec![0u8; 100]).unwrap();
+            service
+                .record_variant(media_id, "transcode", "h264_aac", name, 100)
+                .unwrap();
+        }
+
+        let stats = service.cache_stats().unwrap();
+        assert_eq!(stats.transcode_count, 3);
+        assert_eq!(stats.transcode_bytes, 300);
+
+        let report = service
+            .gc_transcode_cache(&transcode_dir, 150, 86_400, 0)
+            .unwrap();
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.freed_bytes, 200);
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.remaining_bytes, 100);
+        assert_eq!(service.cache_stats().unwrap().transcode_count, 1);
+        assert_eq!(std::fs::read_dir(&transcode_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_gc_skips_recently_used_variants() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let media_id = insert_media(&service, source.id, "cache-b");
+        let transcode_dir = dir.path().join("transcodes");
+        std::fs::create_dir_all(&transcode_dir).unwrap();
+        for name in ["recent-a.mp4", "recent-b.mp4"] {
+            std::fs::write(transcode_dir.join(name), vec![0u8; 100]).unwrap();
+            service
+                .record_variant(media_id, "transcode", "h264_aac", name, 100)
+                .unwrap();
+        }
+
+        let report = service
+            .gc_transcode_cache(&transcode_dir, 100, 86_400, 3600)
+            .unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.kept, 2);
+        assert_eq!(service.cache_stats().unwrap().transcode_count, 2);
+    }
+
+    #[test]
+    fn cache_gc_refuses_path_traversal_rows() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let media_id = insert_media(&service, source.id, "cache-c");
+        let transcode_dir = dir.path().join("transcodes");
+        std::fs::create_dir_all(&transcode_dir).unwrap();
+        let outside = dir.path().join("outside.mp4");
+        std::fs::write(&outside, b"keep").unwrap();
+        service
+            .record_variant(media_id, "transcode", "h264_aac", "../outside.mp4", 4)
+            .unwrap();
+
+        let report = service.gc_transcode_cache(&transcode_dir, 0, 0, 0).unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(outside.is_file());
     }
 
     #[test]
