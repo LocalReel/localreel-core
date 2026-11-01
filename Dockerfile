@@ -1,11 +1,10 @@
-# syntax=docker/dockerfile:1.7
 #
 # Build from the core repository with the web repo as a named context:
 #   docker build --build-context web=../localreel-web -t localreel .
 #
 # BuildKit is required for named contexts (Docker Desktop/Engine 23+).
 
-FROM node:22-bookworm-slim AS web
+FROM node:22-bookworm-slim AS web-build
 WORKDIR /web
 COPY --from=web package.json package-lock.json tsconfig.json vite.config.ts index.html ./
 COPY --from=web src ./src
@@ -15,7 +14,7 @@ RUN npm run build
 FROM rust:1.83-bookworm AS builder
 WORKDIR /src
 COPY . .
-COPY --from=web /web/dist /localreel-web/dist
+COPY --from=web-build /web/dist /localreel-web/dist
 RUN cargo build --release --locked -p localreel-server
 
 FROM debian:bookworm-slim AS runtime

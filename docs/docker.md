@@ -1,11 +1,27 @@
 # Docker
 
 The repository ships a multi-stage Dockerfile and Compose file. Status:
-**configuration is validated, but the image has not been built in this
-environment** (the local Docker daemon is not running, and starting the Docker
-Desktop service requires administrator rights). Do not treat Docker as
-release-verified until `docker compose up --build` succeeds on a machine with
-Docker Desktop/Engine.
+**the production Dockerfile has not been built end-to-end in this environment**.
+The Windows Docker Desktop service needs administrator rights, so a native
+dockerd was started inside WSL2 instead:
+
+- `dockerd` 29.1.3 works; base images (`node:22-bookworm-slim`,
+  `rust:1.83-bookworm`, `debian:bookworm-slim`) were pulled successfully through
+  the host proxy.
+- `docker build` (BuildKit) still fails resolving Docker Hub metadata because
+  the BuildKit resolver does not use the daemon proxy; this is an environment
+  network limitation, not a Dockerfile failure.
+- A **local runtime smoke image** (Debian + prebuilt Linux binary, no
+  multi-stage build) was built with the legacy builder and ran successfully:
+  health `ok`, embedded UI `200`, and the `/data` volume survived
+  `docker restart`.
+- The committed Dockerfile had a real bug: the stage name `web` collided with
+  the named build context `web`; it is now `web-build`. The
+  `# syntax=docker/dockerfile:1.7` frontend line was removed because it tried
+  to pull an extra frontend image.
+
+Do not treat Docker as release-verified until `docker compose up --build`
+succeeds on a machine with Docker Desktop/Engine and registry access.
 
 ## Build
 
