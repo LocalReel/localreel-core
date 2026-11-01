@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::jobs::{JobContext, JobHandler, JobOutcome, JobRegistry};
-use localreel_kernel::media_ops::MediaOps;
+use localreel_kernel::media_ops::{MediaOps, TranscodePreset};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
+use crate::playback::DEFAULT_TRANSCODE_PRESET;
 use crate::scan::discover_source;
 use crate::service::MediaService;
 
@@ -26,7 +28,6 @@ struct Shared {
     db: Database,
     media_ops: Arc<MediaOps>,
     thumbnail_dir: PathBuf,
-    #[allow(dead_code)]
     transcode_dir: PathBuf,
 }
 
@@ -51,6 +52,7 @@ impl MediaJobs {
         registry.register(ScanSourceHandler(self.shared.clone()));
         registry.register(ProbeMediaHandler(self.shared.clone()));
         registry.register(ThumbnailHandler(self.shared.clone()));
+        registry.register(TranscodeHandler(self.shared.clone()));
     }
 }
 
@@ -208,4 +210,110 @@ impl JobHandler for ThumbnailHandler {
         context.report_progress(1.0, Some("thumbnail ready"));
         Ok(JobOutcome::empty())
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TranscodePayload {
+    media_id: i64,
+    #[serde(default)]
+    preset: Option<String>,
+}
+
+struct TranscodeHandler(Arc<Shared>);
+
+impl JobHandler for TranscodeHandler {
+    fn kind(&self) -> &'static str {
+        "transcode"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: TranscodePayload = context.payload()?;
+        let preset_name = payload
+            .preset
+            .unwrap_or_else(|| DEFAULT_TRANSCODE_PRESET.to_string());
+        if preset_name != DEFAULT_TRANSCODE_PRESET {
+            return Err(KernelError::InvalidInput(format!(
+                "unsupported transcode preset '{preset_name}'"
+            )));
+        }
+
+        let service = MediaService::new(self.0.db.clone());
+        let media = service
+            .get_media(payload.media_id)?
+            .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
+        let input = MediaUri::parse(&media.uri)?
+            .local_path()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                KernelError::InvalidInput(format!(
+                    "media {} is not local; remote transcoding is not supported",
+                    media.id
+                ))
+            })?;
+        if !input.is_file() {
+            return Err(KernelError::NotFound(format!(
+                "media file is missing: {}",
+                input.display()
+            )));
+        }
+
+        let filename = format!(
+            "transcode_{}_{}_{}_{}.mp4",
+            sanitize_component(&media.uid, 64),
+            sanitize_component(&preset_name, 32),
+            media.file_size,
+            media.modified_at
+        );
+        let output = self.0.transcode_dir.join(&filename);
+        let preset = TranscodePreset::default();
+        let mut last_progress = 0.0f64;
+        let mut last_report = Instant::now() - Duration::from_secs(2);
+
+        context.report_progress(0.0, Some("transcoding"));
+        self.0.media_ops.transcode(
+            &input,
+            &output,
+            &preset,
+            media.duration,
+            &context.cancel_flag(),
+            |progress| {
+                if progress - last_progress >= 0.02
+                    || last_report.elapsed() >= Duration::from_secs(1)
+                {
+                    context.report_progress(progress, Some("transcoding"));
+                    last_progress = progress;
+                    last_report = Instant::now();
+                }
+            },
+        )?;
+
+        let size = std::fs::metadata(&output)
+            .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        service.record_variant(media.id, "transcode", &preset_name, &filename, size)?;
+        context.report_progress(1.0, Some("transcode ready"));
+        JobOutcome::json(serde_json::json!({
+            "path": filename,
+            "preset": preset_name,
+            "size": size,
+        }))
+    }
+}
+
+fn sanitize_component(value: &str, max_len: usize) -> String {
+    let mut output = String::with_capacity(value.len().min(max_len));
+    for ch in value.chars() {
+        if output.len() >= max_len {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        output.push('_');
+    }
+    output
 }

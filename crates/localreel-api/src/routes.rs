@@ -22,7 +22,8 @@ use tower_http::services::ServeDir;
 use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
-use localreel_media::{Media, MediaState, Source};
+use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
+use localreel_media::{Media, MediaFilter, MediaState, Source};
 
 use crate::error::ApiError;
 use crate::guard::loopback_guard;
@@ -32,6 +33,7 @@ const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
+    let transcodes = ServeDir::new(state.config.media.transcode_dir.clone());
     Router::new()
         .route("/", get(index))
         .route("/api/v1/health", get(health))
@@ -39,8 +41,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sources", get(list_sources).post(add_source))
         .route("/api/v1/sources/:id/scan", post(scan_source))
         .route("/api/v1/media", get(list_media))
+        .route("/api/v1/search", get(search_media))
         .route("/api/v1/media/:id", get(get_media))
         .route("/api/v1/media/:id/state", get(get_state).put(put_state))
+        .route("/api/v1/media/:id/playback", post(prepare_playback))
         .route(
             "/api/v1/media/:id/stream",
             get(stream_media).head(head_media),
@@ -49,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/jobs/:id", get(get_job))
         .route("/api/v1/jobs/:id/cancel", post(cancel_job))
         .nest_service("/thumbnails", thumbnails)
+        .nest_service("/transcodes", transcodes)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             loopback_guard,
@@ -135,6 +140,8 @@ struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
     source_id: Option<i64>,
+    q: Option<String>,
+    filter: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,9 +157,12 @@ async fn list_media(
 ) -> Result<Json<MediaPage>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
-    let (items, total) = state
-        .media
-        .list_media_page(limit, offset, query.source_id)?;
+    let filter = MediaFilter::parse(query.filter.as_deref().unwrap_or("all"))
+        .ok_or_else(|| ApiError::bad_request("filter must be all, favorites or continue"))?;
+    let (items, total) =
+        state
+            .media
+            .list_media_page(limit, offset, query.source_id, query.q.as_deref(), filter)?;
     let next_cursor = if offset + (items.len() as i64) < total {
         Some(offset + items.len() as i64)
     } else {
@@ -163,6 +173,13 @@ async fn list_media(
         total,
         next_cursor,
     }))
+}
+
+async fn search_media(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<MediaPage>, ApiError> {
+    list_media(State(state), Query(query)).await
 }
 
 async fn get_media(
@@ -262,6 +279,101 @@ async fn cancel_job(
         )));
     }
     Ok(Json(serde_json::json!({ "canceled": true })))
+}
+
+#[derive(Debug, Serialize)]
+struct PlaybackResponse {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+async fn prepare_playback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let media = state
+        .media
+        .get_media(id)?
+        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    if media.missing_at.is_some() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(PlaybackResponse {
+                mode: "failed",
+                url: None,
+                job_id: None,
+                message: Some("media file is missing".into()),
+            }),
+        )
+            .into_response());
+    }
+
+    if is_hls(&media) {
+        return Ok(Json(PlaybackResponse {
+            mode: "direct",
+            url: Some(media.uri),
+            job_id: None,
+            message: None,
+        })
+        .into_response());
+    }
+
+    if direct_play_supported(&media) {
+        return Ok(Json(PlaybackResponse {
+            mode: "direct",
+            url: Some(format!("/api/v1/media/{}/stream", media.id)),
+            job_id: None,
+            message: None,
+        })
+        .into_response());
+    }
+
+    if let Some(variant) =
+        state
+            .media
+            .find_variant(media.id, "transcode", DEFAULT_TRANSCODE_PRESET)?
+    {
+        let path = state.config.media.transcode_dir.join(&variant.path);
+        if path.is_file() {
+            return Ok(Json(PlaybackResponse {
+                mode: "ready",
+                url: Some(format!("/transcodes/{}", variant.path)),
+                job_id: None,
+                message: None,
+            })
+            .into_response());
+        }
+    }
+
+    let payload = serde_json::json!({
+        "media_id": media.id,
+        "preset": DEFAULT_TRANSCODE_PRESET,
+    })
+    .to_string();
+    let job_id = state.jobs.enqueue(
+        "transcode",
+        &payload,
+        Some(&format!(
+            "transcode:{}:{DEFAULT_TRANSCODE_PRESET}",
+            media.id
+        )),
+        2,
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PlaybackResponse {
+            mode: "preparing",
+            url: None,
+            job_id: Some(job_id),
+            message: Some("transcode started".into()),
+        }),
+    )
+        .into_response())
 }
 
 async fn stream_media(

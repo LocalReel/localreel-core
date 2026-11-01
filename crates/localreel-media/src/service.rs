@@ -3,9 +3,10 @@ use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::media_ops::ProbeResult;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, OptionalExtension, Row};
 
-use crate::model::{Media, MediaState, Source};
+use crate::model::{Media, MediaFilter, MediaState, Source};
 
 /// First-party media service.
 ///
@@ -130,51 +131,68 @@ impl MediaService {
         limit: i64,
         offset: i64,
         source_id: Option<i64>,
+        query: Option<&str>,
+        filter: MediaFilter,
     ) -> Result<(Vec<Media>, i64)> {
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
         self.db.with_read(|connection| {
-            let (rows, total) = if let Some(source_id) = source_id {
-                let total: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM media WHERE source_id = ?1",
-                    [source_id],
-                    |row| row.get(0),
-                )?;
-                let mut statement = connection.prepare(
-                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
-                            duration, width, height, file_size, modified_at, video_codec,
-                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
-                            updated_at
-                     FROM media WHERE source_id = ?1
-                     ORDER BY created_at DESC, id DESC
-                     LIMIT ?2 OFFSET ?3",
-                )?;
-                let rows = statement.query_map(params![source_id, limit, offset], row_to_media)?;
-                let mut media = Vec::new();
-                for row in rows {
-                    media.push(row?);
-                }
-                (media, total)
+            let mut conditions = Vec::new();
+            let mut values: Vec<Value> = Vec::new();
+
+            if let Some(source_id) = source_id {
+                conditions.push("m.source_id = ?");
+                values.push(source_id.into());
+            }
+            if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+                let pattern = format!("%{query}%");
+                conditions.push("(m.title LIKE ? OR m.filename LIKE ? OR m.uri LIKE ?)");
+                values.push(pattern.clone().into());
+                values.push(pattern.clone().into());
+                values.push(pattern.into());
+            }
+            match filter {
+                MediaFilter::All => {}
+                MediaFilter::Favorites => conditions.push("s.favorite = 1"),
+                MediaFilter::Continue => conditions.push(
+                    "s.position > 0.0 AND s.duration > 0.0 AND s.position < s.duration - 5.0",
+                ),
+            }
+
+            let where_clause = if conditions.is_empty() {
+                String::new()
             } else {
-                let total: i64 =
-                    connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?;
-                let mut statement = connection.prepare(
-                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
-                            duration, width, height, file_size, modified_at, video_codec,
-                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
-                            updated_at
-                     FROM media
-                     ORDER BY created_at DESC, id DESC
-                     LIMIT ?1 OFFSET ?2",
-                )?;
-                let rows = statement.query_map(params![limit, offset], row_to_media)?;
-                let mut media = Vec::new();
-                for row in rows {
-                    media.push(row?);
-                }
-                (media, total)
+                format!("WHERE {}", conditions.join(" AND "))
             };
-            Ok((rows, total))
+            let from = "FROM media m LEFT JOIN media_state s ON s.media_id = m.id";
+            let count_sql = format!("SELECT COUNT(*) {from} {where_clause}");
+            let total: i64 =
+                connection.query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                    row.get(0)
+                })?;
+
+            let order = match filter {
+                MediaFilter::Continue | MediaFilter::Favorites => "s.updated_at DESC, m.id DESC",
+                MediaFilter::All => "m.created_at DESC, m.id DESC",
+            };
+            let list_sql = format!(
+                "SELECT m.id, m.uid, m.source_id, m.uri, m.canonical_path, m.filename,
+                        m.title, m.duration, m.width, m.height, m.file_size, m.modified_at,
+                        m.video_codec, m.audio_codec, m.bitrate, m.thumbnail_path,
+                        m.missing_at, m.created_at, m.updated_at
+                 {from} {where_clause}
+                 ORDER BY {order}
+                 LIMIT ? OFFSET ?"
+            );
+            values.push(limit.into());
+            values.push(offset.into());
+            let mut statement = connection.prepare(&list_sql)?;
+            let rows = statement.query_map(params_from_iter(values.iter()), row_to_media)?;
+            let mut media = Vec::new();
+            for row in rows {
+                media.push(row?);
+            }
+            Ok((media, total))
         })
     }
 
@@ -208,6 +226,37 @@ impl MediaService {
                 params![thumbnail_path, now_secs(), media_id],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn find_variant(
+        &self,
+        media_id: i64,
+        kind: &str,
+        preset: &str,
+    ) -> Result<Option<crate::model::MediaVariant>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, media_id, kind, preset, path, size, created_at, last_used_at
+                     FROM media_variants
+                     WHERE media_id = ?1 AND kind = ?2 AND preset = ?3
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![media_id, kind, preset],
+                    |row| {
+                        Ok(crate::model::MediaVariant {
+                            id: row.get(0)?,
+                            media_id: row.get(1)?,
+                            kind: row.get(2)?,
+                            preset: row.get(3)?,
+                            path: row.get(4)?,
+                            size: row.get(5)?,
+                            created_at: row.get(6)?,
+                            last_used_at: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?)
         })
     }
 

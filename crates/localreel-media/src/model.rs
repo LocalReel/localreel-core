@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Library view filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaFilter {
+    All,
+    Favorites,
+    Continue,
+}
+
+impl MediaFilter {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "all" => Some(Self::All),
+            "favorites" | "favorite" => Some(Self::Favorites),
+            "continue" | "continue_watching" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
 /// A configured media source (a local directory or an HLS endpoint).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
