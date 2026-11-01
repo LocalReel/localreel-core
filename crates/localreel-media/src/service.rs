@@ -103,6 +103,25 @@ impl MediaService {
         })
     }
 
+    pub fn set_source_enabled(&self, id: i64, enabled: bool) -> Result<Source> {
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            let changed = connection.execute(
+                "UPDATE sources SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                params![if enabled { 1 } else { 0 }, now, id],
+            )?;
+            if changed == 0 {
+                return Err(KernelError::NotFound(format!("source {id}")));
+            }
+            Ok(connection.query_row(
+                "SELECT id, uri, kind, enabled, created_at, updated_at
+                 FROM sources WHERE id = ?1",
+                [id],
+                row_to_source,
+            )?)
+        })
+    }
+
     pub fn list_media(&self, limit: i64, offset: i64) -> Result<Vec<Media>> {
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
@@ -497,6 +516,22 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(service.list_sources().unwrap().len(), 1);
         assert_eq!(first.kind, "local");
+    }
+
+    #[test]
+    fn toggles_source_enabled_immediately() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        assert!(source.enabled);
+
+        let disabled = service.set_source_enabled(source.id, false).unwrap();
+        assert!(!disabled.enabled);
+        assert!(!service.get_source(source.id).unwrap().unwrap().enabled);
+
+        let enabled = service.set_source_enabled(source.id, true).unwrap();
+        assert!(enabled.enabled);
     }
 
     #[test]

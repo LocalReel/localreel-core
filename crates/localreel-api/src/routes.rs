@@ -10,7 +10,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sources", get(list_sources).post(add_source))
+        .route("/api/v1/sources/:id", patch(patch_source))
         .route("/api/v1/sources/:id/scan", post(scan_source))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/search", get(search_media))
@@ -204,14 +205,30 @@ async fn add_source(
     Ok((StatusCode::CREATED, Json(source)).into_response())
 }
 
+#[derive(Debug, Deserialize)]
+struct PatchSourceRequest {
+    enabled: bool,
+}
+
+async fn patch_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(payload): Json<PatchSourceRequest>,
+) -> Result<Json<Source>, ApiError> {
+    Ok(Json(state.media.set_source_enabled(id, payload.enabled)?))
+}
+
 async fn scan_source(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    state
+    let source = state
         .media
         .get_source(id)?
         .ok_or_else(|| ApiError::not_found(format!("source {id} not found")))?;
+    if !source.enabled {
+        return Err(ApiError::bad_request(format!("source {id} is disabled")));
+    }
     let payload = serde_json::json!({ "source_id": id }).to_string();
     let job_id = state
         .jobs

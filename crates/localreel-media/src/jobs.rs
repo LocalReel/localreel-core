@@ -74,6 +74,12 @@ impl JobHandler for ScanSourceHandler {
         let source = service
             .get_source(payload.source_id)?
             .ok_or_else(|| KernelError::NotFound(format!("source {}", payload.source_id)))?;
+        if !source.enabled {
+            return Err(KernelError::InvalidInput(format!(
+                "source {} is disabled",
+                source.id
+            )));
+        }
 
         context.report_progress(0.05, Some("discovering"));
         let discovery = discover_source_with_cancel(&self.0.db, &source, &context.cancel_flag())?;

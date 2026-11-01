@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -94,26 +95,14 @@ pub trait Storage: Send + Sync {
 /// configured roots. This is the only place that enforces "which directories
 /// may be read"; the media layer must not bypass it.
 pub struct LocalStorage {
-    roots: Vec<PathBuf>,
+    roots: RwLock<Vec<PathBuf>>,
 }
 
 impl LocalStorage {
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
         let mut canonical_roots = Vec::new();
         for root in roots {
-            let canonical = root.canonicalize().map_err(|error| {
-                KernelError::Storage(format!(
-                    "cannot resolve storage root {}: {error}",
-                    root.display()
-                ))
-            })?;
-            if !canonical.is_dir() {
-                return Err(KernelError::Storage(format!(
-                    "storage root is not a directory: {}",
-                    canonical.display()
-                )));
-            }
-            canonical_roots.push(canonical);
+            canonical_roots.push(canonicalize_root(&root)?);
         }
         if canonical_roots.is_empty() {
             return Err(KernelError::Storage(
@@ -121,12 +110,48 @@ impl LocalStorage {
             ));
         }
         Ok(Self {
-            roots: canonical_roots,
+            roots: RwLock::new(canonical_roots),
         })
     }
 
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Add a root at runtime; effective for the next `stat`/`list`/`open_range`.
+    pub fn add_root(&self, root: &Path) -> Result<()> {
+        let canonical = canonicalize_root(root)?;
+        let mut roots = self
+            .roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !roots.iter().any(|existing| existing == &canonical) {
+            roots.push(canonical);
+        }
+        Ok(())
+    }
+
+    /// Remove a root at runtime. Removing the last root is rejected: an empty
+    /// storage would deny every read and hide the configuration mistake.
+    pub fn remove_root(&self, root: &Path) -> Result<bool> {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut roots = self
+            .roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = roots.len();
+        roots.retain(|existing| existing != &canonical);
+        let removed = roots.len() != before;
+        if roots.is_empty() {
+            roots.push(canonical);
+            return Err(KernelError::Storage(
+                "cannot remove the last storage root".into(),
+            ));
+        }
+        Ok(removed)
     }
 
     fn resolve(&self, uri: &MediaUri) -> Result<PathBuf> {
@@ -136,7 +161,11 @@ impl LocalStorage {
         let canonical = path.canonicalize().map_err(|error| {
             KernelError::Storage(format!("cannot resolve {}: {error}", path.display()))
         })?;
-        if !self.roots.iter().any(|root| canonical.starts_with(root)) {
+        let roots = self
+            .roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !roots.iter().any(|root| canonical.starts_with(root)) {
             return Err(KernelError::PermissionDenied(format!(
                 "path is outside configured storage roots: {}",
                 canonical.display()
@@ -144,6 +173,22 @@ impl LocalStorage {
         }
         Ok(canonical)
     }
+}
+
+fn canonicalize_root(root: &Path) -> Result<PathBuf> {
+    let canonical = root.canonicalize().map_err(|error| {
+        KernelError::Storage(format!(
+            "cannot resolve storage root {}: {error}",
+            root.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(KernelError::Storage(format!(
+            "storage root is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 impl Storage for LocalStorage {
@@ -163,13 +208,14 @@ impl Storage for LocalStorage {
 
     fn list(&self, uri: &MediaUri) -> Result<Vec<StorageEntry>> {
         let path = self.resolve(uri)?;
+        let roots = self.roots();
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
             let entry_path = entry.path();
             let metadata = entry.metadata()?;
             let canonical = entry_path.canonicalize().unwrap_or(entry_path);
-            if !self.roots.iter().any(|root| canonical.starts_with(root)) {
+            if !roots.iter().any(|root| canonical.starts_with(root)) {
                 continue;
             }
             entries.push(StorageEntry {
@@ -352,6 +398,57 @@ mod tests {
             Err(KernelError::PermissionDenied(_)) => {}
             other => panic!("expected permission denied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dynamic_roots_take_effect_and_cjk_paths_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("视频库");
+        let second = dir.path().join("第二个库");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = second.join("剧集 01.mp4");
+        std::fs::write(&file, b"abc").unwrap();
+
+        let storage = LocalStorage::new([first]).unwrap();
+        let uri = MediaUri::Local(file.clone());
+        assert!(matches!(
+            storage.stat(&uri),
+            Err(KernelError::PermissionDenied(_))
+        ));
+
+        storage.add_root(&second).unwrap();
+        assert_eq!(storage.stat(&uri).unwrap().size, 3);
+        assert!(storage.roots().contains(&second.canonicalize().unwrap()));
+
+        assert!(storage.remove_root(&second).unwrap());
+        assert!(matches!(
+            storage.stat(&uri),
+            Err(KernelError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn removing_the_last_root_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new([dir.path().to_path_buf()]).unwrap();
+        assert!(matches!(
+            storage.remove_root(dir.path()),
+            Err(KernelError::Storage(_))
+        ));
+        assert_eq!(storage.roots().len(), 1);
+    }
+
+    #[test]
+    fn add_root_rejects_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let storage = LocalStorage::new([dir.path().to_path_buf()]).unwrap();
+        assert!(matches!(
+            storage.add_root(&file),
+            Err(KernelError::Storage(_))
+        ));
     }
 
     #[test]
