@@ -122,3 +122,14 @@ pub struct CacheGcReport {
     pub kept: i64,
     pub remaining_bytes: i64,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeleteSourceReport {
+    pub source_id: i64,
+    pub source_uri: String,
+    pub dry_run: bool,
+    pub media_count: i64,
+    pub state_count: i64,
+    pub variant_count: i64,
+    pub deleted_files: i64,
+}

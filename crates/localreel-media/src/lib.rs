@@ -15,8 +15,8 @@ pub mod service;
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
 pub use model::{
-    CacheGcReport, CacheStats, Media, MediaFilter, MediaState, MediaVariant, ScanIssue, ScanRun,
-    Source,
+    CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, MediaVariant,
+    ScanIssue, ScanRun, Source,
 };
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
 pub use service::MediaService;

@@ -33,6 +33,10 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
@@ -42,6 +46,7 @@ impl From<KernelError> for ApiError {
     fn from(error: KernelError) -> Self {
         let status = match &error {
             KernelError::NotFound(_) => StatusCode::NOT_FOUND,
+            KernelError::Conflict(_) => StatusCode::CONFLICT,
             KernelError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             KernelError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             KernelError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,6 +59,7 @@ impl From<KernelError> for ApiError {
         };
         let code = match status {
             StatusCode::NOT_FOUND => "not_found",
+            StatusCode::CONFLICT => "conflict",
             StatusCode::BAD_REQUEST => "bad_request",
             StatusCode::FORBIDDEN => "forbidden",
             _ => "internal",

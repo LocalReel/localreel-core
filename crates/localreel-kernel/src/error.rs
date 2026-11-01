@@ -25,6 +25,9 @@ pub enum KernelError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("job error: {0}")]
     Job(String),
 

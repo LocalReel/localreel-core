@@ -127,6 +127,95 @@ impl MediaService {
         })
     }
 
+    /// Delete a source after an explicit confirmation.
+    ///
+    /// `delete_media=false` is the safe default: if the source still has media,
+    /// the call is refused with a conflict so the caller can show counts and
+    /// ask again. `dry_run=true` returns the same counts without changing
+    /// anything. When confirmed, media/state/variants cascade via the schema;
+    /// known thumbnail/transcode files are removed first, best-effort.
+    pub fn delete_source(
+        &self,
+        id: i64,
+        delete_media: bool,
+        dry_run: bool,
+        thumbnail_dir: &Path,
+        transcode_dir: &Path,
+    ) -> Result<crate::model::DeleteSourceReport> {
+        let source = self
+            .get_source(id)?
+            .ok_or_else(|| KernelError::NotFound(format!("source {id}")))?;
+        let (media_count, state_count, variants): (i64, i64, Vec<(String, String)>) =
+            self.db.with_read(|connection| {
+                let media_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM media WHERE source_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let state_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM media_state s
+                     JOIN media m ON m.id = s.media_id
+                     WHERE m.source_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let mut statement = connection.prepare(
+                    "SELECT v.kind, v.path FROM media_variants v
+                     JOIN media m ON m.id = v.media_id
+                     WHERE m.source_id = ?1",
+                )?;
+                let rows = statement.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let mut variants = Vec::new();
+                for row in rows {
+                    variants.push(row?);
+                }
+                Ok((media_count, state_count, variants))
+            })?;
+
+        let mut report = crate::model::DeleteSourceReport {
+            source_id: source.id,
+            source_uri: source.uri.clone(),
+            dry_run,
+            media_count,
+            state_count,
+            variant_count: variants.len() as i64,
+            deleted_files: 0,
+        };
+        if dry_run {
+            return Ok(report);
+        }
+        if media_count > 0 && !delete_media {
+            return Err(KernelError::Conflict(format!(
+                "source {id} has {media_count} media items and {state_count} states; \
+                 disable it, or repeat with delete_media=true to delete them"
+            )));
+        }
+
+        for (kind, path) in &variants {
+            if !is_safe_variant_name(path) {
+                continue;
+            }
+            let directory = match kind.as_str() {
+                "thumbnail" => thumbnail_dir,
+                "transcode" => transcode_dir,
+                _ => continue,
+            };
+            match std::fs::remove_file(directory.join(path)) {
+                Ok(()) => report.deleted_files += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = %path, "failed to delete source artifact: {error}");
+                }
+            }
+        }
+
+        self.db.with_write(|connection| {
+            connection.execute("DELETE FROM sources WHERE id = ?1", [id])?;
+            Ok(())
+        })?;
+        Ok(report)
+    }
+
     pub fn list_media(&self, limit: i64, offset: i64) -> Result<Vec<Media>> {
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
@@ -795,6 +884,57 @@ mod tests {
         let report = service.gc_transcode_cache(&transcode_dir, 0, 0, 0).unwrap();
         assert_eq!(report.removed, 0);
         assert!(outside.is_file());
+    }
+
+    #[test]
+    fn delete_source_requires_confirmation_and_cleans_artifacts() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let media_id = insert_media(&service, source.id, "delete-a");
+
+        let thumbnails = dir.path().join("thumbnails");
+        let transcodes = dir.path().join("transcodes");
+        std::fs::create_dir_all(&thumbnails).unwrap();
+        std::fs::create_dir_all(&transcodes).unwrap();
+        std::fs::write(thumbnails.join("thumb.jpg"), b"thumb").unwrap();
+        std::fs::write(transcodes.join("movie.mp4"), b"transcode").unwrap();
+        service
+            .record_variant(media_id, "thumbnail", "default", "thumb.jpg", 5)
+            .unwrap();
+        service
+            .record_variant(media_id, "transcode", "h264_aac", "movie.mp4", 9)
+            .unwrap();
+
+        let preview = service
+            .delete_source(source.id, false, true, &thumbnails, &transcodes)
+            .unwrap();
+        assert!(preview.dry_run);
+        assert_eq!(preview.media_count, 1);
+        assert_eq!(preview.variant_count, 2);
+        assert!(service.get_source(source.id).unwrap().is_some());
+
+        assert!(matches!(
+            service.delete_source(source.id, false, false, &thumbnails, &transcodes),
+            Err(KernelError::Conflict(_))
+        ));
+
+        let report = service
+            .delete_source(source.id, true, false, &thumbnails, &transcodes)
+            .unwrap();
+        assert_eq!(report.media_count, 1);
+        assert_eq!(report.deleted_files, 2);
+        assert!(service.get_source(source.id).unwrap().is_none());
+        assert!(!thumbnails.join("thumb.jpg").is_file());
+        assert!(!transcodes.join("movie.mp4").is_file());
+        let media_count: i64 = service
+            .db
+            .with_read(|connection| {
+                Ok(connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(media_count, 0);
     }
 
     #[test]

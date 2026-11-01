@@ -24,7 +24,8 @@ use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
 use localreel_media::{
-    CacheGcReport, CacheStats, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
+    CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, ScanIssue,
+    ScanRun, Source,
 };
 
 use crate::error::ApiError;
@@ -48,7 +49,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sources", get(list_sources).post(add_source))
-        .route("/api/v1/sources/:id", patch(patch_source))
+        .route(
+            "/api/v1/sources/:id",
+            patch(patch_source).delete(delete_source),
+        )
         .route("/api/v1/sources/:id/scan", post(scan_source))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/search", get(search_media))
@@ -250,6 +254,26 @@ async fn patch_source(
     Json(payload): Json<PatchSourceRequest>,
 ) -> Result<Json<Source>, ApiError> {
     Ok(Json(state.media.set_source_enabled(id, payload.enabled)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSourceQuery {
+    delete_media: Option<bool>,
+    dry_run: Option<bool>,
+}
+
+async fn delete_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<DeleteSourceQuery>,
+) -> Result<Json<DeleteSourceReport>, ApiError> {
+    Ok(Json(state.media.delete_source(
+        id,
+        query.delete_media.unwrap_or(false),
+        query.dry_run.unwrap_or(false),
+        &state.config.media.thumbnail_dir,
+        &state.config.media.transcode_dir,
+    )?))
 }
 
 async fn scan_source(
