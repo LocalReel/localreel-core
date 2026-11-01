@@ -34,10 +34,10 @@ const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
 pub fn router(state: Arc<AppState>) -> Router {
     let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
     let transcodes = ServeDir::new(state.config.media.transcode_dir.clone());
+    let embedded = crate::web::is_embedded();
     let web_dir = state.config.resolved_web_dir();
 
     let mut router = Router::new()
-        .route("/", get(index))
         .route("/api/v1/health", get(health))
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/scan-runs", get(list_scan_runs))
@@ -60,8 +60,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest_service("/thumbnails", thumbnails)
         .nest_service("/transcodes", transcodes);
 
-    if let Some(web_dir) = web_dir {
-        router = router.nest_service("/assets", ServeDir::new(web_dir.join("assets")));
+    if embedded {
+        router = router
+            .route("/", get(embedded_index))
+            .route("/assets/*path", get(embedded_asset));
+    } else {
+        router = router.route("/", get(index));
+        if let Some(web_dir) = web_dir {
+            router = router.nest_service("/assets", ServeDir::new(web_dir.join("assets")));
+        }
     }
 
     router
@@ -70,6 +77,30 @@ pub fn router(state: Arc<AppState>) -> Router {
             loopback_guard,
         ))
         .with_state(state)
+}
+
+async fn embedded_index() -> Response {
+    match crate::web::index() {
+        Some((bytes, mime)) => bytes_response(bytes, mime, "no-cache"),
+        None => Html(INDEX_HTML).into_response(),
+    }
+}
+
+async fn embedded_asset(Path(path): Path<String>) -> Response {
+    let asset = format!("assets/{path}");
+    match crate::web::get(&asset) {
+        Some((bytes, mime)) => bytes_response(bytes, mime, "public, max-age=31536000, immutable"),
+        None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    }
+}
+
+fn bytes_response(bytes: &'static [u8], mime: String, cache: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache)
+        .body(Body::from(bytes.to_vec()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
