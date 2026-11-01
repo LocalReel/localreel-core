@@ -60,6 +60,9 @@ cd localreel-core
 - [ ] Optional Linux: `./scripts/package-linux.sh --build-web`; extract the
       tarball on a Linux host and run `./localreel --version` / `doctor`
       (structural packaging is tested here, runtime is not yet).
+- [ ] Optional Docker: `docker compose build`; start with a loopback-only
+      port, scan `/media`, play one file, and verify `/data` persistence after
+      `docker compose restart` (not yet verified in this workspace).
 - [ ] `.\localreel.exe --version` prints the expected version.
 - [ ] `.\localreel.exe doctor` shows `web: embedded`, DB ok, and the expected
       ffmpeg status.

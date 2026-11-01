@@ -1,0 +1,26 @@
+services:
+  localreel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        web: ../localreel-web
+    image: localreel:dev
+    ports:
+      # Keep the publish loopback-only; the container itself binds 0.0.0.0.
+      - "127.0.0.1:3001:3001"
+    environment:
+      LOCALREEL_HOST: 0.0.0.0
+      LOCALREEL_ALLOW_REMOTE: "1"
+      LOCALREEL_PORT: "3001"
+      LOCALREEL_DATA_DIR: /data
+      # Optional: mount a config and point at it:
+      # LOCALREEL_CONFIG: /data/localreel.toml
+    volumes:
+      - localreel-data:/data
+      # Read-only media mount; add sources through the UI/API as /media/...
+      - ${LOCALREEL_MEDIA_DIR:-./media}:/media:ro
+    restart: unless-stopped
+
+volumes:
+  localreel-data:

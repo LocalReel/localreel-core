@@ -102,6 +102,12 @@ On Linux (secondary target, not yet real-machine-verified here):
 The tarball contains `localreel`, `install.sh`, `uninstall.sh`, config example,
 README, docs and optional `ffmpeg/bin`. See [linux.md](linux.md).
 
+## Docker
+
+`Dockerfile` + `docker-compose.yml` are included. The image is **not built or
+run in this repository's environment** (Docker daemon unavailable); only the
+Compose configuration is validated. See [docker.md](docker.md).
+
 ## Downloading a Windows build
 
 There is no pinned URL in the repository (vendors move/retire builds). Download a
