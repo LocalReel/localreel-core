@@ -26,8 +26,11 @@ This runs:
 - `cargo test --workspace`
 - Web `npm test` (resume helper unit tests)
 - Web `npm run build` (includes `tsc`)
+- `npm run test:browser` (headless Chrome + mock API + 1450s WebM fixture;
+  runs in CI, no core build/ffmpeg needed)
 
-Optional browser smoke (requires a running server and Chrome):
+Optional real-server browser smoke (requires a running LocalReel server and
+Chrome):
 
 ```powershell
 cd localreel-web
@@ -82,7 +85,8 @@ Include:
   - no HLS output, no plugins;
   - no installer/signing (zip only);
   - archived media hidden by default;
-  - browser resume smoke is manual, not CI;
+  - browser resume smoke runs against the mock UI in CI; the real-server
+    variant remains a manual check;
 - SHA256 of the zip.
 
 ## 6. Rollback
