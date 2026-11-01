@@ -53,13 +53,24 @@ Default bind: `127.0.0.1:3001`. Data lives in `./data` unless
 
 ## Status
 
-Phase 0/1: kernel skeleton is being built. The media domain, API and UI are
-ported in the next phases; see `docs/adr/` for the decisions that constrain
-them.
+Version 0.1.0: usable local-first server with the web UI, scans/metadata/
+thumbnails, direct playback, Reels resume, Admin, backup/restore, archive/remap,
+cache GC, Windows zip/MSI, Linux tarball and Docker. Windows is the primary
+target; Linux and Docker were verified under WSL2. Public v1.0 release is
+blocked by the license decision and code signing; see the readiness report.
 
 The full delivery plan (milestones, work breakdown, estimates, risks, next
 sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
 
+## Release
+
+- [0.1.0 release notes](docs/release/v0.1.0.md)
+- [v1.0 readiness / blockers](docs/release/v1.0-readiness.md)
+- [CHANGELOG.md](CHANGELOG.md)
+
 ## License
 
-TBD by the repository owner.
+TBD by the repository owner. The v2 plan's default is Apache-2.0, but no
+`LICENSE` file exists yet; see
+[docs/release/v1.0-readiness.md](docs/release/v1.0-readiness.md) for the
+release blocker.
