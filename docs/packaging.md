@@ -72,6 +72,7 @@ localreel.exe
 localreel.toml.example
 README.md
 README.txt
+install.ps1
 docs/packaging.md
 tools/fetch-ffmpeg.ps1
 tools/verify-ffmpeg.ps1
@@ -83,7 +84,7 @@ builds it first. Use `-Profile debug` for a faster local package, and
 `-SkipBuild` to package an existing binary.
 
 It also writes `localreel-<version>-x64.zip.sha256` and prints the SHA256.
-For the full release process see
+For installation see [install.md](install.md); the full release process is in
 [release-checklist.md](release-checklist.md); day-to-day operation is covered
 in [operations.md](operations.md).
 

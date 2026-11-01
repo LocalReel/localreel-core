@@ -83,6 +83,7 @@ Copy-Item -LiteralPath (Join-Path $root 'docs\packaging.md') -Destination (Join-
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'tools') | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'scripts\fetch-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\fetch-ffmpeg.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\verify-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\verify-ffmpeg.ps1')
+Copy-Item -LiteralPath (Join-Path $root 'scripts\install.ps1') -Destination (Join-Path $stage 'install.ps1')
 
 if ($FfmpegDir) {
     $source = if (Test-Path (Join-Path $FfmpegDir 'ffmpeg.exe')) {
@@ -102,11 +103,12 @@ $quickStart = @"
 LocalReel $version ($arch)
 
 Quick start (Windows):
-  1. Copy localreel.toml.example to localreel.toml and edit [data]/[media].
-  2. Optional: put ffmpeg.exe/ffprobe.exe in ffmpeg\bin, or run tools\fetch-ffmpeg.ps1.
-  3. .\localreel.exe doctor
-  4. .\localreel.exe serve
-  5. Open http://127.0.0.1:3001
+  1. Optional one-click install: .\install.ps1
+     (copies to %LOCALAPPDATA%\LocalReel and creates a Start Menu shortcut)
+  2. Or run in place: copy localreel.toml.example to localreel.toml,
+     edit [data]/[media], then .\localreel.exe doctor && .\localreel.exe serve.
+  3. Optional: put ffmpeg.exe/ffprobe.exe in ffmpeg\bin, or run tools\fetch-ffmpeg.ps1.
+  4. Open http://127.0.0.1:3001
 
 The web UI is embedded in localreel.exe; no separate dist directory is needed.
 "@

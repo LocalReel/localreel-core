@@ -59,6 +59,9 @@ cd localreel-core
       ffmpeg status.
 - [ ] Start `.\localreel.exe serve`, open `http://127.0.0.1:3001`, confirm the UI
       (not the API placeholder) loads.
+- [ ] Run `.\install.ps1 -NoShortcuts -InstallDir <temp>` from the extracted
+      folder; confirm the binary/config/`install.json` land there and an upgrade
+      over existing `data/`/`localreel.toml` preserves them.
 - [ ] Add/scan a small source; confirm thumbnail and playback.
 - [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
 - [ ] Check `/api/v1/health` and `/api/v1/admin/health`.
