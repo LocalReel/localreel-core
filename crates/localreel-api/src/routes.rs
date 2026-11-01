@@ -263,8 +263,18 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn list_sources(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Source>>, ApiError> {
-    Ok(Json(state.media.list_sources()?))
+#[derive(Debug, Deserialize)]
+struct ListSourcesQuery {
+    include_archived: Option<bool>,
+}
+
+async fn list_sources(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListSourcesQuery>,
+) -> Result<Json<Vec<Source>>, ApiError> {
+    Ok(Json(state.media.list_sources_with_archived(
+        query.include_archived.unwrap_or(false),
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +292,8 @@ async fn add_source(
 
 #[derive(Debug, Deserialize)]
 struct PatchSourceRequest {
-    enabled: bool,
+    enabled: Option<bool>,
+    archived: Option<bool>,
 }
 
 async fn patch_source(
@@ -290,7 +301,14 @@ async fn patch_source(
     Path(id): Path<i64>,
     Json(payload): Json<PatchSourceRequest>,
 ) -> Result<Json<Source>, ApiError> {
-    Ok(Json(state.media.set_source_enabled(id, payload.enabled)?))
+    let source = if let Some(archived) = payload.archived {
+        state.media.set_source_archived(id, archived)?
+    } else if let Some(enabled) = payload.enabled {
+        state.media.set_source_enabled(id, enabled)?
+    } else {
+        return Err(ApiError::bad_request("provide enabled or archived"));
+    };
+    Ok(Json(source))
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +339,9 @@ async fn scan_source(
         .media
         .get_source(id)?
         .ok_or_else(|| ApiError::not_found(format!("source {id} not found")))?;
+    if source.archived_at.is_some() {
+        return Err(ApiError::bad_request(format!("source {id} is archived")));
+    }
     if !source.enabled {
         return Err(ApiError::bad_request(format!("source {id} is disabled")));
     }
@@ -907,6 +928,80 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("LocalReel"));
+    }
+
+    #[tokio::test]
+    async fn archive_source_hides_it_and_blocks_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_state = state(dir.path());
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = app_state
+            .media
+            .add_source(source_dir.to_str().unwrap())
+            .unwrap();
+        let app = router(app_state);
+
+        let patch = |body: &'static str| {
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/sources/{}", source.id))
+                .header("host", "127.0.0.1:3001")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(patch(r#"{"archived":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let source_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(source_json["archived_at"].is_number());
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/v1/sources"))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let active: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/v1/sources?include_archived=true"))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let all: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/sources/{}/scan", source.id))
+                    .header("host", "127.0.0.1:3001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app.oneshot(patch(r#"{"archived":false}"#)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

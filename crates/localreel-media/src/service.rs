@@ -32,7 +32,7 @@ impl MediaService {
         self.db.with_read(|connection| {
             Ok(connection
                 .query_row(
-                    "SELECT id, uri, kind, enabled, created_at, updated_at
+                    "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
                      FROM sources WHERE id = ?1",
                     [id],
                     row_to_source,
@@ -42,11 +42,19 @@ impl MediaService {
     }
 
     pub fn list_sources(&self) -> Result<Vec<Source>> {
+        self.list_sources_with_archived(false)
+    }
+
+    pub fn list_sources_with_archived(&self, include_archived: bool) -> Result<Vec<Source>> {
         self.db.with_read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, uri, kind, enabled, created_at, updated_at
-                 FROM sources ORDER BY id ASC",
-            )?;
+            let sql = if include_archived {
+                "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
+                 FROM sources ORDER BY id ASC"
+            } else {
+                "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
+                 FROM sources WHERE archived_at IS NULL ORDER BY id ASC"
+            };
+            let mut statement = connection.prepare(sql)?;
             let rows = statement.query_map([], row_to_source)?;
             let mut sources = Vec::new();
             for row in rows {
@@ -88,16 +96,18 @@ impl MediaService {
 
         self.db.with_write(|connection| {
             connection.execute(
-                "INSERT INTO sources (uri, kind, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, 1, ?3, ?3)
+                "INSERT INTO sources (uri, kind, enabled, created_at, updated_at, archived_at)
+                 VALUES (?1, ?2, 1, ?3, ?3, NULL)
                  ON CONFLICT(uri) DO UPDATE SET
                      kind = excluded.kind,
+                     enabled = 1,
+                     archived_at = NULL,
                      updated_at = excluded.updated_at",
                 params![uri, kind, now],
             )?;
             let source = connection
                 .query_row(
-                    "SELECT id, uri, kind, enabled, created_at, updated_at
+                    "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
                      FROM sources WHERE uri = ?1",
                     [&uri],
                     row_to_source,
@@ -119,7 +129,33 @@ impl MediaService {
                 return Err(KernelError::NotFound(format!("source {id}")));
             }
             Ok(connection.query_row(
-                "SELECT id, uri, kind, enabled, created_at, updated_at
+                "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
+                 FROM sources WHERE id = ?1",
+                [id],
+                row_to_source,
+            )?)
+        })
+    }
+
+    pub fn set_source_archived(&self, id: i64, archived: bool) -> Result<Source> {
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            let changed = connection.execute(
+                "UPDATE sources
+                 SET archived_at = ?1, enabled = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![
+                    if archived { Some(now) } else { None },
+                    if archived { 0 } else { 1 },
+                    now,
+                    id
+                ],
+            )?;
+            if changed == 0 {
+                return Err(KernelError::NotFound(format!("source {id}")));
+            }
+            Ok(connection.query_row(
+                "SELECT id, uri, kind, enabled, created_at, updated_at, archived_at
                  FROM sources WHERE id = ?1",
                 [id],
                 row_to_source,
@@ -176,6 +212,7 @@ impl MediaService {
             source_id: source.id,
             source_uri: source.uri.clone(),
             dry_run,
+            archived: media_count > 0 && !delete_media,
             media_count,
             state_count,
             variant_count: variants.len() as i64,
@@ -185,10 +222,9 @@ impl MediaService {
             return Ok(report);
         }
         if media_count > 0 && !delete_media {
-            return Err(KernelError::Conflict(format!(
-                "source {id} has {media_count} media items and {state_count} states; \
-                 disable it, or repeat with delete_media=true to delete them"
-            )));
+            self.set_source_archived(id, true)?;
+            report.archived = true;
+            return Ok(report);
         }
 
         for (kind, path) in &variants {
@@ -713,6 +749,7 @@ fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {
         enabled: row.get::<_, i64>(3)? != 0,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        archived_at: row.get(6)?,
     })
 }
 
@@ -911,14 +948,34 @@ mod tests {
             .delete_source(source.id, false, true, &thumbnails, &transcodes)
             .unwrap();
         assert!(preview.dry_run);
+        assert!(preview.archived);
         assert_eq!(preview.media_count, 1);
         assert_eq!(preview.variant_count, 2);
         assert!(service.get_source(source.id).unwrap().is_some());
 
-        assert!(matches!(
-            service.delete_source(source.id, false, false, &thumbnails, &transcodes),
-            Err(KernelError::Conflict(_))
-        ));
+        let archived = service
+            .delete_source(source.id, false, false, &thumbnails, &transcodes)
+            .unwrap();
+        assert!(archived.archived);
+        assert!(service
+            .get_source(source.id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+        assert!(service.list_sources().unwrap().is_empty());
+        assert_eq!(service.list_sources_with_archived(true).unwrap().len(), 1);
+        let media_count: i64 = service
+            .db
+            .with_read(|connection| {
+                Ok(connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(media_count, 1);
+
+        let restored = service.set_source_archived(source.id, false).unwrap();
+        assert!(restored.archived_at.is_none());
+        assert!(restored.enabled);
 
         let report = service
             .delete_source(source.id, true, false, &thumbnails, &transcodes)

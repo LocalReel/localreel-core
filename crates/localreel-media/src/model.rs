@@ -28,6 +28,7 @@ pub struct Source {
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    pub archived_at: Option<i64>,
 }
 
 /// One indexed media item.
@@ -128,6 +129,7 @@ pub struct DeleteSourceReport {
     pub source_id: i64,
     pub source_uri: String,
     pub dry_run: bool,
+    pub archived: bool,
     pub media_count: i64,
     pub state_count: i64,
     pub variant_count: i64,

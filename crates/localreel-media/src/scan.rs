@@ -573,6 +573,7 @@ mod tests {
             enabled: true,
             created_at: 0,
             updated_at: 0,
+            archived_at: None,
         };
         assert!(discover_source(&db, &source).is_err());
         let _ = dir;

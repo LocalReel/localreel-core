@@ -75,6 +75,12 @@ impl JobHandler for ScanSourceHandler {
         let source = service
             .get_source(payload.source_id)?
             .ok_or_else(|| KernelError::NotFound(format!("source {}", payload.source_id)))?;
+        if source.archived_at.is_some() {
+            return Err(KernelError::InvalidInput(format!(
+                "source {} is archived",
+                source.id
+            )));
+        }
         if !source.enabled {
             return Err(KernelError::InvalidInput(format!(
                 "source {} is disabled",
