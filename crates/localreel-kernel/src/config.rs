@@ -31,6 +31,9 @@ pub struct JobsConfig {
     pub poll_interval: Duration,
     pub lease: Duration,
     pub max_attempts: i64,
+    /// How often the server enqueues a `cache_gc` job. `Duration::ZERO` disables
+    /// the periodic trigger (manual Admin GC still works).
+    pub cache_gc_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,7 @@ impl Default for Config {
                 poll_interval: Duration::from_millis(250),
                 lease: Duration::from_secs(60),
                 max_attempts: 3,
+                cache_gc_interval: Duration::from_secs(24 * 60 * 60),
             },
             media: MediaConfig {
                 ffmpeg: PathBuf::from("ffmpeg"),
@@ -143,6 +147,9 @@ impl Config {
         if let Some(value) = file.jobs.max_attempts {
             self.jobs.max_attempts = value;
         }
+        if let Some(value) = file.jobs.cache_gc_interval_secs {
+            self.jobs.cache_gc_interval = Duration::from_secs(value);
+        }
 
         if let Some(value) = file.media.ffmpeg {
             self.media.ffmpeg = value;
@@ -208,6 +215,9 @@ impl Config {
             self.jobs.max_attempts = i64::try_from(value).map_err(|_| {
                 KernelError::Config("LOCALREEL_JOB_MAX_ATTEMPTS is too large".into())
             })?;
+        }
+        if let Some(value) = env_u64("LOCALREEL_CACHE_GC_INTERVAL_SECS")? {
+            self.jobs.cache_gc_interval = Duration::from_secs(value);
         }
         if let Some(value) = env_string("LOCALREEL_FFMPEG") {
             self.media.ffmpeg = PathBuf::from(value);
@@ -331,6 +341,7 @@ struct JobsFile {
     poll_interval_ms: Option<u64>,
     lease_secs: Option<u64>,
     max_attempts: Option<i64>,
+    cache_gc_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

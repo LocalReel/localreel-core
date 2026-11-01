@@ -18,6 +18,8 @@ workers = 2
 poll_interval_ms = 250
 lease_secs = 60
 max_attempts = 3
+# Enqueue a cache_gc job on startup and every N seconds; 0 disables.
+cache_gc_interval_secs = 86400
 
 [media]
 # Bare names resolve through PATH. For a portable package either point at

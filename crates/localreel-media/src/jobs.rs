@@ -53,6 +53,7 @@ impl MediaJobs {
         registry.register(ProbeMediaHandler(self.shared.clone()));
         registry.register(ThumbnailHandler(self.shared.clone()));
         registry.register(TranscodeHandler(self.shared.clone()));
+        registry.register(CacheGcHandler(self.shared.clone()));
     }
 }
 
@@ -306,6 +307,41 @@ impl JobHandler for TranscodeHandler {
             "preset": preset_name,
             "size": size,
         }))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheGcPayload {
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    max_age_secs: Option<i64>,
+    #[serde(default)]
+    protect_recent_secs: Option<i64>,
+}
+
+struct CacheGcHandler(Arc<Shared>);
+
+impl JobHandler for CacheGcHandler {
+    fn kind(&self) -> &'static str {
+        "cache_gc"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: CacheGcPayload = context.payload()?;
+        let max_bytes = payload.max_bytes.unwrap_or(20 * 1024 * 1024 * 1024);
+        let max_age_secs = payload.max_age_secs.unwrap_or(30 * 24 * 60 * 60);
+        let protect_recent_secs = payload.protect_recent_secs.unwrap_or(3600);
+
+        context.report_progress(0.1, Some("scanning transcode cache"));
+        let report = MediaService::new(self.0.db.clone()).gc_transcode_cache(
+            &self.0.transcode_dir,
+            max_bytes,
+            max_age_secs,
+            protect_recent_secs,
+        )?;
+        context.report_progress(1.0, Some("cache GC complete"));
+        JobOutcome::json(report)
     }
 }
 

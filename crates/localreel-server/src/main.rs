@@ -337,6 +337,39 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
 
+    let cache_gc_interval = config.jobs.cache_gc_interval;
+    if !cache_gc_interval.is_zero() {
+        let payload = serde_json::json!({
+            "max_bytes": config.media.cache_max_bytes,
+            "max_age_secs": config.media.cache_max_age.as_secs(),
+            "protect_recent_secs": 3600,
+        })
+        .to_string();
+        if let Err(error) = jobs.enqueue("cache_gc", &payload, Some("cache_gc:periodic"), 1) {
+            tracing::warn!("failed to enqueue initial cache_gc: {error}");
+        }
+        let gc_jobs = jobs.clone();
+        let gc_payload = payload;
+        let gc_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(cache_gc_interval).await;
+                if gc_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Err(error) =
+                    gc_jobs.enqueue("cache_gc", &gc_payload, Some("cache_gc:periodic"), 1)
+                {
+                    tracing::warn!("failed to enqueue periodic cache_gc: {error}");
+                }
+            }
+        });
+        info!(
+            interval_secs = cache_gc_interval.as_secs(),
+            "periodic cache GC enabled"
+        );
+    }
+
     let listen_host = config.host.clone();
     let listen_port = config.port;
     let state = AppState::new(config, db, events.clone(), jobs, media, ffmpeg_available);
