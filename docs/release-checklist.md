@@ -58,8 +58,9 @@ cd localreel-core
 
 - [ ] Extract the zip into a new directory.
 - [ ] Optional Linux: `./scripts/package-linux.sh --build-web`; extract the
-      tarball on a Linux host and run `./localreel --version` / `doctor`
-      (structural packaging is tested here, runtime is not yet).
+      tarball on a Linux host and run `./localreel --version` / `doctor`.
+      WSL2 Ubuntu build/runtime is verified here (health + embedded UI); bare
+      metal and ffmpeg playback are still worth checking.
 - [ ] Optional Docker: `docker compose build`; start with a loopback-only
       port, scan `/media`, play one file, and verify `/data` persistence after
       `docker compose restart` (not yet verified in this workspace).

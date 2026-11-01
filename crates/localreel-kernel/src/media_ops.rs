@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(windows)]
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};

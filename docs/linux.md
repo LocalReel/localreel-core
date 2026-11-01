@@ -1,10 +1,20 @@
 # Linux packaging and install
 
 Linux is a secondary target: the code is portable and CI runs `cargo test` on
-Ubuntu, but the Windows zip remains the primary distribution. These scripts have
-been syntax-checked and structurally tested (package layout + install/uninstall
-lifecycle); they have **not** yet been run on a real Linux desktop in this
-repository.
+Ubuntu, but the Windows zip remains the primary distribution.
+
+Verified in this workspace (WSL2, Ubuntu 24.04, x86_64, 2026-11-01):
+
+- Linux release build (`cargo build --release`) and `cargo clippy -D warnings`
+  pass; one Windows-only `OsStr` import warning was fixed.
+- `localreel --version` / `doctor`: `web: embedded`; ffmpeg absent in this WSL
+  image, so scan/probe/playback were not exercised.
+- packaged release served `/api/v1/health` (`ok`) and `/` (`200`, embedded UI).
+- tarball (3.3 MB) + `install.sh` / `uninstall.sh` lifecycle passed, including
+  preserving `data/` and `localreel.toml`.
+
+This is not a bare-metal desktop test; GPU/desktop integration and media decode
+on Linux are still unverified.
 
 ## Build a tarball
 
