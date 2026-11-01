@@ -383,6 +383,7 @@ struct ListQuery {
     source_id: Option<i64>,
     q: Option<String>,
     filter: Option<String>,
+    include_archived: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -400,10 +401,14 @@ async fn list_media(
     let offset = query.offset.unwrap_or(0).max(0);
     let filter = MediaFilter::parse(query.filter.as_deref().unwrap_or("all"))
         .ok_or_else(|| ApiError::bad_request("filter must be all, favorites or continue"))?;
-    let (items, total) =
-        state
-            .media
-            .list_media_page(limit, offset, query.source_id, query.q.as_deref(), filter)?;
+    let (items, total) = state.media.list_media_page(
+        limit,
+        offset,
+        query.source_id,
+        query.q.as_deref(),
+        filter,
+        query.include_archived.unwrap_or(false),
+    )?;
     let next_cursor = if offset + (items.len() as i64) < total {
         Some(offset + items.len() as i64)
     } else {

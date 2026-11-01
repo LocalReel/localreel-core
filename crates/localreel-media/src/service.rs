@@ -410,6 +410,7 @@ impl MediaService {
         source_id: Option<i64>,
         query: Option<&str>,
         filter: MediaFilter,
+        include_archived_sources: bool,
     ) -> Result<(Vec<Media>, i64)> {
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
@@ -420,6 +421,10 @@ impl MediaService {
             if let Some(source_id) = source_id {
                 conditions.push("m.source_id = ?");
                 values.push(source_id.into());
+            }
+            if !include_archived_sources {
+                conditions
+                    .push("m.source_id IN (SELECT id FROM sources WHERE archived_at IS NULL)");
             }
             if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
                 let pattern = format!("%{query}%");
@@ -1195,6 +1200,35 @@ mod tests {
             service.remap_source(first.id, second.to_str().unwrap(), true),
             Err(KernelError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn archived_sources_are_hidden_from_the_media_page() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.mp4"), b"x").unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        discover_source(&service.db, &source).unwrap();
+        assert_eq!(
+            service
+                .list_media_page(10, 0, None, None, MediaFilter::All, false)
+                .unwrap()
+                .1,
+            1
+        );
+
+        service.set_source_archived(source.id, true).unwrap();
+        let (items, total) = service
+            .list_media_page(10, 0, None, None, MediaFilter::All, false)
+            .unwrap();
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
+        let (items, total) = service
+            .list_media_page(10, 0, None, None, MediaFilter::All, true)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 1);
     }
 
     #[test]
