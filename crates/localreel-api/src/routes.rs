@@ -1,19 +1,26 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
+use tokio_util::io::ReaderStream;
+use tower_http::services::ServeDir;
 
+use localreel_kernel::jobs::JobRecord;
+use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::{Media, MediaState, Source};
 
@@ -21,15 +28,27 @@ use crate::error::ApiError;
 use crate::guard::loopback_guard;
 use crate::state::AppState;
 
+const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
+
 pub fn router(state: Arc<AppState>) -> Router {
+    let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
     Router::new()
         .route("/", get(index))
         .route("/api/v1/health", get(health))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sources", get(list_sources).post(add_source))
+        .route("/api/v1/sources/:id/scan", post(scan_source))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/media/:id", get(get_media))
         .route("/api/v1/media/:id/state", get(get_state).put(put_state))
+        .route(
+            "/api/v1/media/:id/stream",
+            get(stream_media).head(head_media),
+        )
+        .route("/api/v1/jobs", get(list_jobs))
+        .route("/api/v1/jobs/:id", get(get_job))
+        .route("/api/v1/jobs/:id/cancel", post(cancel_job))
+        .nest_service("/thumbnails", thumbnails)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             loopback_guard,
@@ -92,20 +111,58 @@ async fn add_source(
     Ok((StatusCode::CREATED, Json(source)).into_response())
 }
 
+async fn scan_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    state
+        .media
+        .get_source(id)?
+        .ok_or_else(|| ApiError::not_found(format!("source {id} not found")))?;
+    let payload = serde_json::json!({ "source_id": id }).to_string();
+    let job_id = state
+        .jobs
+        .enqueue("scan_source", &payload, Some(&format!("scan:{id}")), 1)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
+    )
+        .into_response())
+}
+
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+    source_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaPage {
+    items: Vec<Media>,
+    total: i64,
+    next_cursor: Option<i64>,
 }
 
 async fn list_media(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Vec<Media>>, ApiError> {
-    let media = state
+) -> Result<Json<MediaPage>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (items, total) = state
         .media
-        .list_media(query.limit.unwrap_or(50), query.offset.unwrap_or(0))?;
-    Ok(Json(media))
+        .list_media_page(limit, offset, query.source_id)?;
+    let next_cursor = if offset + (items.len() as i64) < total {
+        Some(offset + items.len() as i64)
+    } else {
+        None
+    };
+    Ok(Json(MediaPage {
+        items,
+        total,
+        next_cursor,
+    }))
 }
 
 async fn get_media(
@@ -166,6 +223,233 @@ async fn put_state(
         return Err(ApiError::bad_request("position exceeds duration"));
     }
     Ok(Json(state.media.save_state(&current)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct JobListQuery {
+    limit: Option<i64>,
+}
+
+async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<Vec<JobRecord>>, ApiError> {
+    Ok(Json(
+        state
+            .jobs
+            .list_recent(query.limit.unwrap_or(50).clamp(1, 200))?,
+    ))
+}
+
+async fn get_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<JobRecord>, ApiError> {
+    state
+        .jobs
+        .get(&id)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("job {id} not found")))
+}
+
+async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.jobs.cancel(&id)? {
+        return Err(ApiError::not_found(format!(
+            "job {id} not found or not cancelable"
+        )));
+    }
+    Ok(Json(serde_json::json!({ "canceled": true })))
+}
+
+async fn stream_media(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    serve_media(state, id, headers, false).await
+}
+
+async fn head_media(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    serve_media(state, id, headers, true).await
+}
+
+struct ResolvedMedia {
+    path: PathBuf,
+    size: u64,
+    etag: String,
+    mime: String,
+}
+
+async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiError> {
+    let media = state
+        .media
+        .get_media(id)?
+        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    let path = MediaUri::parse(&media.uri)?
+        .local_path()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                "remote media streaming is not supported in v1",
+            )
+        })?;
+    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found("media file is missing")
+        } else {
+            ApiError::internal(format!("failed to stat media: {error}"))
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request("media path is not a file"));
+    }
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), mtime);
+    let mime = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .to_string();
+    Ok(ResolvedMedia {
+        path,
+        size: metadata.len(),
+        etag,
+        mime,
+    })
+}
+
+async fn serve_media(
+    state: Arc<AppState>,
+    id: i64,
+    headers: HeaderMap,
+    head_only: bool,
+) -> Result<Response, ApiError> {
+    let media = resolve_media(&state, id).await?;
+
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| if_none_match_matches(value, &media.etag))
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &media.etag)
+            .body(Body::empty())
+            .map_err(|error| ApiError::internal(error.to_string()));
+    }
+
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let range = range_header.and_then(|value| parse_range(value, media.size));
+    if range_header.is_some() && range.is_none() {
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", media.size))
+            .header(header::ETAG, &media.etag)
+            .body(Body::empty())
+            .map_err(|error| ApiError::internal(error.to_string()));
+    }
+
+    if media.size == 0 {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &media.mime)
+            .header(header::CONTENT_LENGTH, "0")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ETAG, &media.etag)
+            .body(Body::empty())
+            .map_err(|error| ApiError::internal(error.to_string()));
+    }
+
+    let (start, end, status) = match range {
+        Some((start, end)) => (start, end, StatusCode::PARTIAL_CONTENT),
+        None => (0, media.size - 1, StatusCode::OK),
+    };
+    let length = end - start + 1;
+
+    let body = if head_only {
+        Body::empty()
+    } else {
+        let mut file = tokio::fs::File::open(&media.path)
+            .await
+            .map_err(|error| ApiError::internal(format!("failed to open media: {error}")))?;
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|error| ApiError::internal(format!("failed to seek media: {error}")))?;
+        Body::from_stream(ReaderStream::new(file.take(length)))
+    };
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, &media.mime)
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, &media.etag)
+        .header(header::CACHE_CONTROL, "private, max-age=3600");
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", media.size),
+        );
+    }
+    builder
+        .body(body)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn if_none_match_matches(value: &str, etag: &str) -> bool {
+    let target = etag.trim_start_matches("W/");
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/") == target
+    })
+}
+
+fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
+    let bytes = value.strip_prefix("bytes=")?;
+    if bytes.contains(',') {
+        return None;
+    }
+    let (start, end) = bytes.split_once('-')?;
+    if start.is_empty() {
+        let suffix: u64 = end.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let length = suffix.min(size).min(MAX_RANGE_CHUNK);
+        return Some((size - length, size - 1));
+    }
+
+    let start: u64 = start.parse().ok()?;
+    if start >= size {
+        return None;
+    }
+    let requested_end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+    if start > requested_end {
+        return None;
+    }
+    let end = requested_end.min(start.saturating_add(MAX_RANGE_CHUNK - 1));
+    Some((start, end))
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -253,5 +537,25 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn range_parser_caps_chunks_and_rejects_invalid() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_range("bytes=990-", 1000), Some((990, 999)));
+        assert_eq!(parse_range("bytes=-10", 1000), Some((990, 999)));
+        assert_eq!(parse_range("bytes=0-99999999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=1000-", 1000), None);
+        assert_eq!(parse_range("bytes=0-1,4-5", 1000), None);
+        assert_eq!(parse_range("bytes=0-0", 0), None);
+    }
+
+    #[test]
+    fn weak_etag_comparison_supports_lists_and_wildcard() {
+        let etag = r#"W/"10-20""#;
+        assert!(if_none_match_matches(etag, etag));
+        assert!(if_none_match_matches(r#""x", W/"10-20""#, etag));
+        assert!(if_none_match_matches("*", etag));
+        assert!(!if_none_match_matches(r#""other""#, etag));
     }
 }

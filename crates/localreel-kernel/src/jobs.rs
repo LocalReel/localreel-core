@@ -622,6 +622,12 @@ impl JobContext {
     pub fn queue(&self) -> &JobQueue {
         &self.queue
     }
+
+    /// Shared cancellation flag, for host operations such as ffprobe/ffmpeg
+    /// that poll a flag rather than an async token.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
 }
 
 #[derive(Default)]

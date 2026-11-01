@@ -6,13 +6,14 @@ use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::model::Source;
 
 /// Result of one discovery pass (no probe/thumbnail yet).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanDiscovery {
     pub run_id: i64,
     pub source_id: i64,

@@ -1,5 +1,6 @@
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
+use localreel_kernel::media_ops::ProbeResult;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use rusqlite::{params, OptionalExtension, Row};
@@ -120,6 +121,132 @@ impl MediaService {
                 media.push(row?);
             }
             Ok(media)
+        })
+    }
+
+    /// Paginated media list plus the total count, optionally filtered by source.
+    pub fn list_media_page(
+        &self,
+        limit: i64,
+        offset: i64,
+        source_id: Option<i64>,
+    ) -> Result<(Vec<Media>, i64)> {
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
+        self.db.with_read(|connection| {
+            let (rows, total) = if let Some(source_id) = source_id {
+                let total: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM media WHERE source_id = ?1",
+                    [source_id],
+                    |row| row.get(0),
+                )?;
+                let mut statement = connection.prepare(
+                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                            duration, width, height, file_size, modified_at, video_codec,
+                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                            updated_at
+                     FROM media WHERE source_id = ?1
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = statement.query_map(params![source_id, limit, offset], row_to_media)?;
+                let mut media = Vec::new();
+                for row in rows {
+                    media.push(row?);
+                }
+                (media, total)
+            } else {
+                let total: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?;
+                let mut statement = connection.prepare(
+                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                            duration, width, height, file_size, modified_at, video_codec,
+                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                            updated_at
+                     FROM media
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = statement.query_map(params![limit, offset], row_to_media)?;
+                let mut media = Vec::new();
+                for row in rows {
+                    media.push(row?);
+                }
+                (media, total)
+            };
+            Ok((rows, total))
+        })
+    }
+
+    /// Update the metadata fields produced by `ffprobe`.
+    pub fn update_probe(&self, media_id: i64, probe: &ProbeResult) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute(
+                "UPDATE media SET
+                     duration = ?1, width = ?2, height = ?3, video_codec = ?4,
+                     audio_codec = ?5, bitrate = ?6, updated_at = ?7
+                 WHERE id = ?8",
+                params![
+                    probe.duration,
+                    probe.width,
+                    probe.height,
+                    probe.video_codec,
+                    probe.audio_codec,
+                    probe.bitrate,
+                    now_secs(),
+                    media_id
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_thumbnail(&self, media_id: i64, thumbnail_path: &str) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute(
+                "UPDATE media SET thumbnail_path = ?1, updated_at = ?2 WHERE id = ?3",
+                params![thumbnail_path, now_secs(), media_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn record_variant(
+        &self,
+        media_id: i64,
+        kind: &str,
+        preset: &str,
+        path: &str,
+        size: i64,
+    ) -> Result<()> {
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO media_variants (media_id, kind, preset, path, size, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(media_id, kind, preset, path) DO UPDATE SET
+                     size = excluded.size, last_used_at = excluded.last_used_at",
+                params![media_id, kind, preset, path, size, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Media rows that still need metadata or a thumbnail for a source.
+    pub fn probe_candidate_ids(&self, source_id: i64) -> Result<Vec<i64>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id FROM media
+                 WHERE source_id = ?1
+                   AND (video_codec IS NULL OR width IS NULL OR thumbnail_path IS NULL)
+                 ORDER BY id ASC",
+            )?;
+            let rows = statement.query_map([source_id], |row| row.get(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            Ok(ids)
         })
     }
 

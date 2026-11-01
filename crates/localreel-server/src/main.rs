@@ -171,13 +171,13 @@ async fn serve() -> anyhow::Result<()> {
     let events = EventBus::new(256);
     let jobs = JobQueue::new(db.clone(), events.clone());
     let media = MediaService::new(db.clone());
-    let media_ops = MediaOps::new(
+    let media_ops = Arc::new(MediaOps::new(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
         config.media.probe_timeout,
         config.media.thumbnail_timeout,
         config.media.transcode_timeout,
-    );
+    ));
     let ffmpeg_available = media_ops.available();
     if !ffmpeg_available {
         tracing::warn!(
@@ -185,8 +185,16 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    // Kernel workers are generic. The media crate registers handlers in Phase 1/2.
-    let registry = Arc::new(JobRegistry::new());
+    // Kernel workers are generic; the media crate registers the domain handlers.
+    let mut registry = JobRegistry::new();
+    localreel_media::MediaJobs::new(
+        db.clone(),
+        media_ops.clone(),
+        config.media.thumbnail_dir.clone(),
+        config.media.transcode_dir.clone(),
+    )
+    .register(&mut registry);
+    let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut workers = Vec::new();
     for index in 0..config.jobs.workers {
