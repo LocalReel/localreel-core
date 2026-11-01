@@ -107,6 +107,22 @@ Include:
 - Stop the server; restore `data/localreel.db`; start the old binary.
 - Migrations are forward-only; restoring the DB is the supported rollback.
 
+## Verified acceptance (2026-11-01, Windows MSI)
+
+The final per-user MSI (`localreel-0.1.0-x64.msi`, 2.29 MiB) was installed with
+`msiexec /qn` and exercised against the real 12-file library:
+
+- health `ok`, ffmpeg available, CSP/security headers present;
+- scan: 12 media, 12 durations, 12 thumbnails (h264/aac);
+- playback: direct, `Range` 206;
+- state saved at 165s;
+- backup export written;
+- silent uninstall removed exe/Start Menu shortcut and kept
+  `data/localreel.db` (media rows remain).
+
+The portable zip for this build has SHA256
+`0621deec2d6a2cd8dc549c31683e8ebc36c170557d2a1b809a2e406fb1f96030`.
+
 ## Definition of done
 
 - [ ] Checks green on Windows and Linux CI.
