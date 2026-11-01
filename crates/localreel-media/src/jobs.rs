@@ -9,7 +9,7 @@ use localreel_kernel::media_ops::{MediaOps, TranscodePreset};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
-use crate::backup::Backup;
+use crate::backup::{read_backup_with_limit, Backup, MAX_BACKUP_RESTORE_BYTES};
 use crate::playback::DEFAULT_TRANSCODE_PRESET;
 use crate::restore::restore_backup;
 use crate::scan::discover_source_with_cancel;
@@ -57,6 +57,7 @@ impl MediaJobs {
         registry.register(TranscodeHandler(self.shared.clone()));
         registry.register(CacheGcHandler(self.shared.clone()));
         registry.register(RestoreBackupHandler(self.shared.clone()));
+        registry.register(RestoreBackupFileHandler(self.shared.clone()));
     }
 }
 
@@ -382,6 +383,44 @@ impl JobHandler for RestoreBackupHandler {
             &mut progress,
         )?;
         JobOutcome::json(report)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RestoreFilePayload {
+    path: String,
+}
+
+struct RestoreBackupFileHandler(Arc<Shared>);
+
+impl JobHandler for RestoreBackupFileHandler {
+    fn kind(&self) -> &'static str {
+        "restore_backup_file"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: RestoreFilePayload = context.payload()?;
+        let path = PathBuf::from(&payload.path);
+        let result = (|| {
+            let backup = read_backup_with_limit(&path, MAX_BACKUP_RESTORE_BYTES)?;
+            let cancel = context.cancel_flag();
+            let mut progress = |value: f32, message: &str| {
+                context.report_progress(f64::from(value), Some(message));
+            };
+            let report = restore_backup(
+                &self.0.db,
+                &backup,
+                &self.0.media_ops,
+                &self.0.thumbnail_dir,
+                false,
+                &cancel,
+                &mut progress,
+            )?;
+            JobOutcome::json(report)
+        })();
+        // The uploaded JSON is a one-shot job input; always clean it up.
+        let _ = std::fs::remove_file(&path);
+        result
     }
 }
 

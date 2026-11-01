@@ -14,6 +14,8 @@ pub const BACKUP_VERSION: u32 = 2;
 pub const MAX_BACKUP_SOURCES: usize = 256;
 pub const MAX_BACKUP_STATES: usize = 100_000;
 pub const MAX_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
+/// Uploaded restores use a separate, larger limit; the importer keeps 32 MiB.
+pub const MAX_BACKUP_RESTORE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupState {
@@ -117,23 +119,31 @@ pub struct BackupImportReport {
 }
 
 pub fn read_backup(path: &Path) -> Result<Backup> {
+    read_backup_with_limit(path, MAX_BACKUP_BYTES)
+}
+
+pub fn read_backup_with_limit(path: &Path, max_bytes: u64) -> Result<Backup> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         KernelError::InvalidInput(format!("cannot read backup {}: {error}", path.display()))
     })?;
-    if metadata.len() > MAX_BACKUP_BYTES {
+    if metadata.len() > max_bytes {
         return Err(KernelError::InvalidInput(format!(
-            "backup is too large: {} bytes (max {MAX_BACKUP_BYTES})",
+            "backup is too large: {} bytes (max {max_bytes})",
             metadata.len()
         )));
     }
     let bytes = std::fs::read(path)?;
-    parse_backup(&bytes)
+    parse_backup_with_limit(&bytes, max_bytes)
 }
 
 pub fn parse_backup(bytes: &[u8]) -> Result<Backup> {
-    if bytes.len() as u64 > MAX_BACKUP_BYTES {
+    parse_backup_with_limit(bytes, MAX_BACKUP_BYTES)
+}
+
+pub fn parse_backup_with_limit(bytes: &[u8], max_bytes: u64) -> Result<Backup> {
+    if bytes.len() as u64 > max_bytes {
         return Err(KernelError::InvalidInput(format!(
-            "backup is too large: {} bytes (max {MAX_BACKUP_BYTES})",
+            "backup is too large: {} bytes (max {max_bytes})",
             bytes.len()
         )));
     }

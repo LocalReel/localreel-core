@@ -89,8 +89,11 @@ HTTP equivalents:
 
 - `GET /api/v1/backup` downloads JSON;
 - `POST /api/v1/backup?dry_run=true|false` imports only (two-pass);
-- `POST /api/v1/backup/restore` queues a persistent `restore_backup` job
-  (same behavior as the CLI `restore`; 32 MiB body limit).
+- `POST /api/v1/backup/restore` queues a `restore_backup` job from a JSON body
+  (32 MiB limit);
+- `POST /api/v1/backup/restore/upload` streams the body to
+  `data/backup-uploads/<uuid>.json` and queues `restore_backup_file`
+  (512 MiB limit, cleaned after the job). Admin uses this streaming route.
 
 Admin -> Backup now has both **Import** and **Restore**; Restore queues the job
 and progress appears under Recent jobs. The job reports phases (`importing
@@ -105,6 +108,8 @@ a new machine, scan the sources before importing state; state is matched by
 
 A verified restore drill on the real 12-file library (2026-11-01):
 
+- streaming upload: a 34 MB JSON body was accepted (above the old 32 MiB
+  limit), job succeeded, and the temp upload was removed;
 - `restore` reported: 1 source, 12 discovered, 12 probed, 12 thumbnails,
   12 states imported, 0 missing;
 - `/media?filter=continue` total=12, E08 position=306.44337;

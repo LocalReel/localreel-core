@@ -13,7 +13,9 @@ use localreel_kernel::events::{Event, EventBus};
 use localreel_kernel::jobs::{JobQueue, JobRegistry, JobWorker};
 use localreel_kernel::media_ops::MediaOps;
 use localreel_kernel::migrations;
-use localreel_media::{read_backup, restore_backup, MediaService};
+use localreel_media::{
+    read_backup_with_limit, restore_backup, MediaService, MAX_BACKUP_RESTORE_BYTES,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "localreel", version, about = "Local-first media server")]
@@ -265,7 +267,7 @@ fn restore(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
-    let backup = read_backup(&from)?;
+    let backup = read_backup_with_limit(&from, MAX_BACKUP_RESTORE_BYTES)?;
     let media_ops = MediaOps::discover(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
@@ -372,12 +374,37 @@ fn import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove crash-stale streaming backup uploads (jobs normally delete their own).
+fn prune_backup_uploads(data_dir: &std::path::Path) {
+    let upload_dir = data_dir.join("backup-uploads");
+    let Ok(entries) = std::fs::read_dir(&upload_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 24 * 60 * 60);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 async fn serve() -> anyhow::Result<()> {
     let (config, source) = Config::load_with_source()?;
     if let Some(path) = &source {
         info!("loaded configuration from {}", path.display());
     }
     config.ensure_dirs()?;
+    prune_backup_uploads(&config.data_dir);
     let db = open_database(&config)?;
     run_migrations(&db)?;
 

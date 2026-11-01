@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
         .route("/api/v1/backup/restore", post(enqueue_restore))
+        .route("/api/v1/backup/restore/upload", post(upload_restore_file))
         .route("/api/v1/scan-runs", get(list_scan_runs))
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
@@ -220,6 +221,77 @@ async fn enqueue_restore(
             .jobs
             .enqueue("restore_backup", &payload, Some("restore_backup:manual"), 1)?;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
+}
+
+async fn upload_restore_file(
+    State(state): State<Arc<AppState>>,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let upload_dir = state.config.data_dir.join("backup-uploads");
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .map_err(|error| ApiError::internal(format!("cannot create upload dir: {error}")))?;
+    let path = upload_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| ApiError::internal(format!("cannot create upload: {error}")))?;
+    let mut stream = body.into_data_stream();
+    let mut total = 0_u64;
+
+    loop {
+        let chunk = match futures_util::StreamExt::next(&mut stream).await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(ApiError::bad_request(format!(
+                    "upload read failed: {error}"
+                )));
+            }
+            None => break,
+        };
+        total = total.saturating_add(chunk.len() as u64);
+        if total > localreel_media::MAX_BACKUP_RESTORE_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(ApiError::payload_too_large(format!(
+                "backup upload exceeds {} bytes",
+                localreel_media::MAX_BACKUP_RESTORE_BYTES
+            )));
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(ApiError::internal(format!("cannot write upload: {error}")));
+        }
+    }
+    if let Err(error) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(ApiError::internal(format!("cannot flush upload: {error}")));
+    }
+    drop(file);
+    if total == 0 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(ApiError::bad_request("empty backup upload"));
+    }
+
+    let payload = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+    match state.jobs.enqueue(
+        "restore_backup_file",
+        &payload,
+        Some("restore_backup:manual"),
+        1,
+    ) {
+        Ok(job_id) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "job_id": job_id })),
+        )
+            .into_response()),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(error.into())
+        }
+    }
 }
 
 async fn cache_stats(State(state): State<Arc<AppState>>) -> Result<Json<CacheStats>, ApiError> {
