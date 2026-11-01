@@ -46,6 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
+        .route("/api/v1/backup/restore", post(enqueue_restore))
         .route("/api/v1/scan-runs", get(list_scan_runs))
         .route("/api/v1/scan-issues", get(list_scan_issues))
         .route("/api/v1/events", get(events))
@@ -205,6 +206,19 @@ async fn upload_backup(
         &backup,
         query.dry_run.unwrap_or(false),
     )?))
+}
+
+async fn enqueue_restore(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let backup = localreel_media::parse_backup(&body)?;
+    let payload = serde_json::json!({ "backup": backup }).to_string();
+    let job_id =
+        state
+            .jobs
+            .enqueue("restore_backup", &payload, Some("restore_backup:manual"), 1)?;
+    Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
 async fn cache_stats(State(state): State<Arc<AppState>>) -> Result<Json<CacheStats>, ApiError> {

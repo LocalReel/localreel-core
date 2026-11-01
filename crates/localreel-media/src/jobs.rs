@@ -9,7 +9,9 @@ use localreel_kernel::media_ops::{MediaOps, TranscodePreset};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
+use crate::backup::Backup;
 use crate::playback::DEFAULT_TRANSCODE_PRESET;
+use crate::restore::restore_backup;
 use crate::scan::discover_source_with_cancel;
 use crate::service::MediaService;
 
@@ -54,6 +56,7 @@ impl MediaJobs {
         registry.register(ThumbnailHandler(self.shared.clone()));
         registry.register(TranscodeHandler(self.shared.clone()));
         registry.register(CacheGcHandler(self.shared.clone()));
+        registry.register(RestoreBackupHandler(self.shared.clone()));
     }
 }
 
@@ -347,6 +350,33 @@ impl JobHandler for CacheGcHandler {
             protect_recent_secs,
         )?;
         context.report_progress(1.0, Some("cache GC complete"));
+        JobOutcome::json(report)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RestorePayload {
+    backup: Backup,
+}
+
+struct RestoreBackupHandler(Arc<Shared>);
+
+impl JobHandler for RestoreBackupHandler {
+    fn kind(&self) -> &'static str {
+        "restore_backup"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: RestorePayload = context.payload()?;
+        context.report_progress(0.05, Some("importing backup"));
+        let report = restore_backup(
+            &self.0.db,
+            &payload.backup,
+            &self.0.media_ops,
+            &self.0.thumbnail_dir,
+            false,
+        )?;
+        context.report_progress(1.0, Some("restore complete"));
         JobOutcome::json(report)
     }
 }

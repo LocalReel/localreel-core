@@ -85,10 +85,15 @@ Application backup (portable, versioned JSON) is the primary state backup:
 # sources -> scan/probe/thumbnails -> state replay, in one command
 ```
 
-HTTP equivalents: `GET /api/v1/backup` and
-`POST /api/v1/backup?dry_run=true|false` (32 MiB limit) still import only.
-Admin -> Backup is the same two-pass flow: import, scan, import again. Use the
-CLI `restore` command for the automated path.
+HTTP equivalents:
+
+- `GET /api/v1/backup` downloads JSON;
+- `POST /api/v1/backup?dry_run=true|false` imports only (two-pass);
+- `POST /api/v1/backup/restore` queues a persistent `restore_backup` job
+  (same behavior as the CLI `restore`; 32 MiB body limit).
+
+Admin -> Backup now has both **Import** and **Restore**; Restore queues the job
+and progress appears under Recent jobs.
 
 The backup contains sources and per-media state (uid/path/flags/position). It
 does **not** contain media files, thumbnails or transcodes. After importing into
