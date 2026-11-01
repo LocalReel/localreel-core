@@ -94,6 +94,8 @@ HTTP equivalents:
 - `POST /api/v1/backup/restore/upload` streams the body to
   `data/backup-uploads/<uuid>.json` and queues `restore_backup_file`
   (512 MiB limit, cleaned after the job). Admin uses this streaming route.
+  The job deserializes directly from the file (no second raw byte buffer), but
+  the typed state list still fits in memory.
 
 Admin -> Backup now has both **Import** and **Restore**; Restore queues the job
 and progress appears under Recent jobs. The job reports phases (`importing

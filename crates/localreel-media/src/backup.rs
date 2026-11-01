@@ -123,17 +123,23 @@ pub fn read_backup(path: &Path) -> Result<Backup> {
 }
 
 pub fn read_backup_with_limit(path: &Path, max_bytes: u64) -> Result<Backup> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
+    let file = std::fs::File::open(path).map_err(|error| {
         KernelError::InvalidInput(format!("cannot read backup {}: {error}", path.display()))
     })?;
+    let metadata = file.metadata()?;
     if metadata.len() > max_bytes {
         return Err(KernelError::InvalidInput(format!(
             "backup is too large: {} bytes (max {max_bytes})",
             metadata.len()
         )));
     }
-    let bytes = std::fs::read(path)?;
-    parse_backup_with_limit(&bytes, max_bytes)
+    // Deserialize directly from the file: the raw JSON is never buffered as a
+    // second full copy. The typed `Backup` (states) still lives in memory.
+    let reader = std::io::BufReader::new(file);
+    let backup: Backup = serde_json::from_reader(reader)
+        .map_err(|error| KernelError::InvalidInput(format!("invalid backup JSON: {error}")))?;
+    backup.validate()?;
+    Ok(backup)
 }
 
 pub fn parse_backup(bytes: &[u8]) -> Result<Backup> {
@@ -319,6 +325,21 @@ mod tests {
             Ok(connection.last_insert_rowid())
         })
         .unwrap()
+    }
+
+    #[test]
+    fn reads_backup_from_file_and_enforces_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.json");
+        let mut bytes = serde_json::to_vec(&Backup::new()).unwrap();
+        bytes.extend(std::iter::repeat_n(b' ', 4096));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let parsed = read_backup_with_limit(&path, 64 * 1024).unwrap();
+        assert_eq!(parsed.version, BACKUP_VERSION);
+
+        let error = read_backup_with_limit(&path, 10).unwrap_err();
+        assert!(matches!(error, KernelError::InvalidInput(_)));
     }
 
     #[test]
