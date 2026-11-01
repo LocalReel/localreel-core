@@ -29,6 +29,10 @@ paths.
 # http://127.0.0.1:3001
 ```
 
+To start automatically at logon on Windows, see
+[service.md](service.md) (`install-task.ps1`). The installer's Start Menu
+shortcut is manual start only.
+
 Add a source through the UI/API or the Admin page:
 
 ```powershell

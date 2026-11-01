@@ -71,6 +71,8 @@ cd localreel-core
 - [ ] Run `.\uninstall.ps1 -InstallDir <temp> -Force`; confirm program files and
       shortcuts are removed while `data/`/`localreel.toml` remain; repeat with
       `-RemoveData` in a scratch install.
+- [ ] Register a scratch task (`.\install-task.ps1 -TaskName 'LocalReel Scratch'
+      -InstallDir <temp>`), verify action/working directory, then uninstall it.
 - [ ] Add/scan a small source; confirm thumbnail and playback.
 - [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
 - [ ] Check `/api/v1/health` and `/api/v1/admin/health`.

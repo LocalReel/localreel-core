@@ -57,6 +57,18 @@ console window to stop it. For a real service, use Task Scheduler/NSSM with
 `localreel.toml.example` to `localreel.toml`; on upgrade it leaves your config
 alone. `install.json` records the installed version, source and shortcuts.
 
+## Start automatically
+
+Use the included Task Scheduler helper (recommended; supports restart-on-failure
+and no console window):
+
+```powershell
+.\install-task.ps1
+```
+
+Or re-run the installer with `-StartOnLogin` for a Startup-folder shortcut.
+See [service.md](service.md) for logon vs boot, logs and removal.
+
 ## Uninstall
 
 From the install directory (or the extracted package), run:

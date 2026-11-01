@@ -79,12 +79,15 @@ Copy-Item -LiteralPath $binary -Destination (Join-Path $stage $exeName)
 Copy-Item -LiteralPath (Join-Path $root 'localreel.toml.example') -Destination (Join-Path $stage 'localreel.toml.example')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $stage 'README.md')
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'docs') | Out-Null
-Copy-Item -LiteralPath (Join-Path $root 'docs\packaging.md') -Destination (Join-Path $stage 'docs\packaging.md')
+Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Filter '*.md' -File | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage 'docs') -Force
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'tools') | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'scripts\fetch-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\fetch-ffmpeg.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\verify-ffmpeg.ps1') -Destination (Join-Path $stage 'tools\verify-ffmpeg.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\install.ps1') -Destination (Join-Path $stage 'install.ps1')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\uninstall.ps1') -Destination (Join-Path $stage 'uninstall.ps1')
+Copy-Item -LiteralPath (Join-Path $root 'scripts\install-task.ps1') -Destination (Join-Path $stage 'install-task.ps1')
 
 if ($FfmpegDir) {
     $source = if (Test-Path (Join-Path $FfmpegDir 'ffmpeg.exe')) {
@@ -109,8 +112,9 @@ Quick start (Windows):
      Uninstall later with .\uninstall.ps1 (keeps data unless -RemoveData).
   2. Or run in place: copy localreel.toml.example to localreel.toml,
      edit [data]/[media], then .\localreel.exe doctor && .\localreel.exe serve.
-  3. Optional: put ffmpeg.exe/ffprobe.exe in ffmpeg\bin, or run tools\fetch-ffmpeg.ps1.
-  4. Open http://127.0.0.1:3001
+  3. Optional: start at logon via Task Scheduler: .\install-task.ps1
+  4. Optional: put ffmpeg.exe/ffprobe.exe in ffmpeg\bin, or run tools\fetch-ffmpeg.ps1.
+  5. Open http://127.0.0.1:3001
 
 The web UI is embedded in localreel.exe; no separate dist directory is needed.
 "@

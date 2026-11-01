@@ -74,7 +74,8 @@ README.md
 README.txt
 install.ps1
 uninstall.ps1
-docs/packaging.md
+install-task.ps1
+docs/*.md
 tools/fetch-ffmpeg.ps1
 tools/verify-ffmpeg.ps1
 ffmpeg/bin/...        # only with -FfmpegDir
