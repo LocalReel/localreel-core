@@ -57,6 +57,19 @@ console window to stop it. For a real service, use Task Scheduler/NSSM with
 `localreel.toml.example` to `localreel.toml`; on upgrade it leaves your config
 alone. `install.json` records the installed version, source and shortcuts.
 
+## MSI
+
+A per-user MSI is available (WiX 5):
+
+```powershell
+msiexec /i .\dist\localreel-0.1.0-x64.msi
+msiexec /x .\dist\localreel-0.1.0-x64.msi
+```
+
+It installs to `%LOCALAPPDATA%\LocalReel`, creates a Start Menu shortcut, and
+leaves `data/`/`localreel.toml` untouched on uninstall. See
+[installer/README.md](../installer/README.md). The MSI is unsigned.
+
 ## Start automatically
 
 Use the included Task Scheduler helper (recommended; supports restart-on-failure

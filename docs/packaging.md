@@ -90,6 +90,18 @@ For installation see [install.md](install.md); the full release process is in
 [release-checklist.md](release-checklist.md); day-to-day operation is covered
 in [operations.md](operations.md).
 
+## MSI
+
+```powershell
+.\scripts\package.ps1 -Profile release -SkipBuild
+.\scripts\build-msi.ps1
+# dist/localreel-<version>-x64.msi
+```
+
+Requires WiX 5 CLI (`dotnet tool install --global wix --version 5.0.2`);
+`build-msi.ps1` builds and administrative-extracts the MSI to verify it. The
+MSI is per-user and unsigned. See [installer/README.md](../installer/README.md).
+
 ## Linux tarball
 
 On Linux (secondary target, not yet real-machine-verified here):

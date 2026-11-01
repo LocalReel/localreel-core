@@ -1,0 +1,62 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="LocalReel"
+      Manufacturer="LocalReel"
+      Version="$(var.Version)"
+      UpgradeCode="58A5C330-4BBB-475F-B6D2-58C0699B7551"
+      Scope="perUser"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of LocalReel is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="LocalReel" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="LocalReel" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="LocalReel" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents">
+      <Component Id="MainExecutable" Directory="INSTALLFOLDER" Guid="D45E80F3-863B-4AC1-8976-39E288EFC6E3">
+        <File Id="LocalReelExe" Source="$(var.SourceDir)\localreel.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ConfigExample" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="ConfigExampleFile" Source="$(var.SourceDir)\localreel.toml.example" />
+      </Component>
+      <Component Id="Readme" Directory="INSTALLFOLDER" Guid="8858074B-97EF-4190-B8FF-7E33F0F095B4">
+        <File Id="ReadmeMd" Source="$(var.SourceDir)\README.md" />
+        <File Id="ReadmeTxt" Source="$(var.SourceDir)\README.txt" />
+      </Component>
+      <Component Id="InstallTask" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="InstallTaskScript" Source="$(var.SourceDir)\install-task.ps1" />
+      </Component>
+      <Component Id="OperationsDoc" Directory="INSTALLFOLDER" Guid="F27F12C7-8729-414C-BED2-8CB5B2266E5A">
+        <File Id="OperationsDocFile" Source="$(var.SourceDir)\docs\operations.md" />
+        <File Id="PackagingDocFile" Source="$(var.SourceDir)\docs\packaging.md" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+          Id="StartMenuShortcut"
+          Name="LocalReel"
+          Description="Local-first media server"
+          Target="[INSTALLFOLDER]localreel.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Arguments="serve" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\LocalReel" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

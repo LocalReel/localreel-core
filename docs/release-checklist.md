@@ -77,6 +77,9 @@ cd localreel-core
       `-RemoveData` in a scratch install.
 - [ ] Register a scratch task (`.\install-task.ps1 -TaskName 'LocalReel Scratch'
       -InstallDir <temp>`), verify action/working directory, then uninstall it.
+- [ ] MSI: `.\scripts\build-msi.ps1`; silent install `/qn`, check exe +
+      Start Menu shortcut + `--version`, then silent uninstall and confirm a
+      data marker survives. MSI is unsigned.
 - [ ] Add/scan a small source; confirm thumbnail and playback.
 - [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
 - [ ] Check `/api/v1/health` and `/api/v1/admin/health`.
