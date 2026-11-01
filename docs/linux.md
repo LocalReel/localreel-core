@@ -14,9 +14,12 @@ Verified in this workspace (WSL2, Ubuntu 24.04, x86_64, 2026-11-01):
 - packaged release served `/api/v1/health` (`ok`) and `/` (`200`, embedded UI).
 - tarball (3.3 MB) + `install.sh` / `uninstall.sh` lifecycle passed, including
   preserving `data/` and `localreel.toml`.
+- installed Chrome 156 + Node 22 in WSL and ran the real-server browser resume
+  test: `expected=165, actual=165, duration=1449.970068, readyState=1` for
+  `S01E12.mp4`.
 
-This is not a bare-metal desktop test; GPU/desktop integration and Linux
-desktop/browser playback are still unverified.
+This is not a bare-metal desktop test; GPU/desktop integration and 4K/HDR
+hardware decode on Linux are still unverified.
 
 ## Build a tarball
 
