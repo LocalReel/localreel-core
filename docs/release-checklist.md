@@ -1,0 +1,93 @@
+# Release checklist
+
+A release is a zip built from a clean `localreel-core` checkout plus the web
+build. The server embeds `localreel-web/dist` at compile time.
+
+## 1. Preconditions
+
+- [ ] `Cargo.toml` workspace version and `localreel-web/package.json` version
+      agree (currently `0.1.0`).
+- [ ] If migrations changed, they are additive and tested against a copy of an
+      existing DB.
+- [ ] `localreel-web/dist` is **not** stale relative to `src/`.
+- [ ] License decision recorded (currently TBD by the repository owner).
+
+## 2. Automated checks
+
+```powershell
+cd localreel-core
+.\scripts\release-check.ps1
+```
+
+This runs:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- Web `npm test` (resume helper unit tests)
+- Web `npm run build` (includes `tsc`)
+
+Optional browser smoke (requires a running server and Chrome):
+
+```powershell
+cd localreel-web
+$env:LOCALREEL_BASE_URL = 'http://127.0.0.1:3317'
+$env:CHROME_PATH = 'C:\...\chrome.exe'
+npm run test:resume
+```
+
+Expected: `{"ok":true,...,"expected":165,"actual":165,...}` for a library whose
+first item has saved progress.
+
+## 3. Build the package
+
+```powershell
+cd localreel-core
+.\scripts\package.ps1 -BuildWeb -FfmpegDir '.tools\ffmpeg'
+```
+
+- Default profile: `release`.
+- Output: `dist/localreel-<version>-x64.zip` and `.sha256`.
+- `-FfmpegDir` is optional; without it the package uses PATH/discovery.
+- Record the SHA256 from the script output.
+
+## 4. Verify the artifact on a clean directory
+
+- [ ] Extract the zip into a new directory.
+- [ ] `.\localreel.exe --version` prints the expected version.
+- [ ] `.\localreel.exe doctor` shows `web: embedded`, DB ok, and the expected
+      ffmpeg status.
+- [ ] Start `.\localreel.exe serve`, open `http://127.0.0.1:3001`, confirm the UI
+      (not the API placeholder) loads.
+- [ ] Add/scan a small source; confirm thumbnail and playback.
+- [ ] Export a backup and re-import it in a second data dir (`--dry-run` first).
+- [ ] Check `/api/v1/health` and `/api/v1/admin/health`.
+
+## 5. Release notes
+
+Include:
+
+- version and commit;
+- user-visible changes (library/reels/admin/backup/cache/archive/remap);
+- DB migration note;
+- ffmpeg requirement and whether a bundle is included;
+- known limitations:
+  - single-user, loopback only;
+  - no HLS output, no plugins;
+  - no installer/signing (zip only);
+  - archived media hidden by default;
+  - browser resume smoke is manual, not CI;
+- SHA256 of the zip.
+
+## 6. Rollback
+
+- Keep the previous zip and a DB backup.
+- Stop the server; restore `data/localreel.db`; start the old binary.
+- Migrations are forward-only; restoring the DB is the supported rollback.
+
+## Definition of done
+
+- [ ] Checks green on Windows and Linux CI.
+- [ ] Package starts and serves the embedded UI on a clean machine.
+- [ ] Backup/restore drill passed.
+- [ ] Release notes and SHA256 published.

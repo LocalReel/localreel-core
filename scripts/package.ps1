@@ -124,4 +124,8 @@ if (Test-Path $zip) {
 }
 Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
 $zipInfo = Get-Item $zip
+$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+$checksum = "$hash  $($zipInfo.Name)"
+Set-Content -LiteralPath "$zip.sha256" -Value $checksum -Encoding ASCII
 Write-Host "Package: $($zipInfo.FullName) ($([math]::Round($zipInfo.Length / 1MB, 1)) MiB)"
+Write-Host "SHA256: $hash"

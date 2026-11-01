@@ -82,6 +82,11 @@ The script refuses to run if `localreel-web/dist` is missing; `-BuildWeb`
 builds it first. Use `-Profile debug` for a faster local package, and
 `-SkipBuild` to package an existing binary.
 
+It also writes `localreel-<version>-x64.zip.sha256` and prints the SHA256.
+For the full release process see
+[release-checklist.md](release-checklist.md); day-to-day operation is covered
+in [operations.md](operations.md).
+
 ## Downloading a Windows build
 
 There is no pinned URL in the repository (vendors move/retire builds). Download a
