@@ -445,4 +445,136 @@ mod tests {
         assert_eq!(audio, "aac");
         assert!(thumbnails.join(&thumbnail).is_file());
     }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_probe_thumbnail_chain_with_fake_shell_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("jobs.db").to_str().unwrap(), 1).unwrap();
+        kernel_migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
+        kernel_migrations::apply(&db, "media", migrations::list()).unwrap();
+
+        let media_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        std::fs::write(media_dir.join("a.mp4"), b"not a real video").unwrap();
+        let service = MediaService::new(db.clone());
+        let source = service.add_source(media_dir.to_str().unwrap()).unwrap();
+
+        let ffprobe = dir.path().join("ffprobe.sh");
+        let ffmpeg = dir.path().join("ffmpeg.sh");
+        std::fs::write(
+            &ffprobe,
+            r#"#!/bin/sh
+if [ "$1" = "-version" ]; then exit 0; fi
+cat <<'JSON'
+{"format":{"duration":"2.0","bit_rate":"123"},"streams":[{"codec_type":"video","codec_name":"h264","width":320,"height":240},{"codec_type":"audio","codec_name":"aac"}]}
+JSON
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &ffmpeg,
+            r#"#!/bin/sh
+if [ "$1" = "-version" ]; then exit 0; fi
+last=""
+for arg in "$@"; do last="$arg"; done
+if [ -n "$last" ]; then printf fake > "$last"; fi
+exit 0
+"#,
+        )
+        .unwrap();
+        for script in [&ffprobe, &ffmpeg] {
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let ops = Arc::new(MediaOps::new(
+            ffmpeg,
+            ffprobe,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        ));
+        let thumbnails = dir.path().join("thumbnails");
+        let transcodes = dir.path().join("transcodes");
+
+        let events = EventBus::new(64);
+        let queue = JobQueue::new(db.clone(), events);
+        let mut registry = JobRegistry::new();
+        MediaJobs::new(db.clone(), ops, thumbnails.clone(), transcodes).register(&mut registry);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = JobWorker::new(
+            queue.clone(),
+            Arc::new(registry),
+            "fake-shell-worker",
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+        )
+        .spawn_with_shutdown(shutdown.clone());
+
+        queue
+            .enqueue(
+                "scan_source",
+                &serde_json::json!({ "source_id": source.id }).to_string(),
+                Some(&format!("scan:{}", source.id)),
+                1,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let jobs = queue.list_recent(50).unwrap();
+            let active = jobs
+                .iter()
+                .any(|job| job.status == "queued" || job.status == "running");
+            let kinds = |kind: &str| {
+                jobs.iter()
+                    .any(|job| job.kind == kind && job.status == "succeeded")
+            };
+            if !active && kinds("scan_source") && kinds("probe_media") && kinds("thumbnail") {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("job chain did not finish: {jobs:#?}");
+            }
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = worker.await;
+
+        let (duration, width, height, video, audio, thumbnail): (
+            f64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+        ) = db
+            .with_read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT duration, width, height, video_codec, audio_codec, thumbnail_path
+                     FROM media LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(duration, 2.0);
+        assert_eq!(width, 320);
+        assert_eq!(height, 240);
+        assert_eq!(video, "h264");
+        assert_eq!(audio, "aac");
+        assert!(thumbnails.join(&thumbnail).is_file());
+    }
 }

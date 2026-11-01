@@ -57,6 +57,28 @@ If the UI was never built, the binary still runs and serves the API plus a
 placeholder page. `localreel doctor` prints `web: embedded`, `web: disk (...)`,
 or `web: missing`.
 
+## Downloading a Windows build
+
+There is no pinned URL in the repository (vendors move/retire builds). Download a
+trusted Windows zip, get its SHA256, then run:
+
+```powershell
+./scripts/fetch-ffmpeg.ps1 `
+  -Url 'https://example.invalid/ffmpeg-release-essentials.zip' `
+  -Sha256 '<sha256>' `
+  -Dest '.tools/ffmpeg'
+```
+
+The script verifies the hash before extracting, copies `ffmpeg.exe` and
+`ffprobe.exe` into `<Dest>/bin`, and runs `-version`. Use `verify-ffmpeg.ps1`
+against an existing install:
+
+```powershell
+./scripts/verify-ffmpeg.ps1 -Ffmpeg 'C:\ffmpeg\bin\ffmpeg.exe' -Ffprobe 'C:\ffmpeg\bin\ffprobe.exe'
+```
+
+`.tools/` is gitignored.
+
 ## Tests without real ffmpeg
 
 `MediaOps` supports `.cmd`/`.bat` harnesses on Windows (invoked through

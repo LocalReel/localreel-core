@@ -8,3 +8,7 @@ data/
 Thumbs.db
 .idea/
 .vscode/
+
+# bundled media tools (optional)
+.tools/
+
