@@ -365,6 +365,7 @@ fn local_path_to_uri(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn parses_windows_and_unc_file_uris() {
         assert_eq!(
@@ -374,6 +375,25 @@ mod tests {
         assert_eq!(
             MediaUri::parse("file://server/share/a.mp4").unwrap(),
             MediaUri::Local(PathBuf::from(r"\\server\share\a.mp4"))
+        );
+    }
+
+    /// On POSIX the same URIs are plain paths: a drive letter is just a
+    /// directory name, and a UNC-style authority is not special.
+    #[cfg(not(windows))]
+    #[test]
+    fn parses_posix_file_uris() {
+        assert_eq!(
+            MediaUri::parse("file:///home/user/a.mp4").unwrap(),
+            MediaUri::Local(PathBuf::from("/home/user/a.mp4"))
+        );
+        assert_eq!(
+            MediaUri::parse("file:///D:/Videos/a.mp4").unwrap(),
+            MediaUri::Local(PathBuf::from("/D:/Videos/a.mp4"))
+        );
+        assert_eq!(
+            MediaUri::parse("file:///home/user/a%20b.mp4").unwrap(),
+            MediaUri::Local(PathBuf::from("/home/user/a b.mp4"))
         );
     }
 
