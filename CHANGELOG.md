@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 — 2026-11-02
+
+The core is a component again: product output moved to the `LocalReel` product
+repository.
+
+### Added
+
+- `LOCALREEL_WEB_DIR`: `localreel-api/build.rs` embeds the UI from any web
+  checkout, so the product can compose components that do not sit next to each
+  other.
+
+### Changed
+
+- Installers, packaging scripts, install/uninstall helpers, product docs and
+  release notes moved to `LocalReel` (the product repository). This repository
+  now only builds and tests the server component; it produces no zip/MSI and
+  publishes no release artifacts.
+- README points at the product repository for downloads and release status.
+
+### Removed
+
+- `installer/`, `scripts/package.ps1`, `scripts/build-msi.ps1`,
+  `scripts/install*.ps1`, `scripts/uninstall.ps1`, `scripts/sign.ps1`,
+  `scripts/package-linux.sh`, `scripts/*.sh`, `scripts/fetch-ffmpeg.ps1`,
+  `scripts/verify-ffmpeg.ps1`, `docs/install.md`, `docs/packaging.md`,
+  `docs/release-checklist.md`, `docs/signing.md`, `docs/linux.md`,
+  `docs/docker.md`, `docs/service.md`, `docs/release/`.
+
 ## 0.2.0 — 2026-11-02
 
 Faster playback, reliable cancellation, a bilingual UI, and a dev/release split.

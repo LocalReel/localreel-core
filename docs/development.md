@@ -43,5 +43,6 @@ The same commands run in GitHub Actions (`.github/workflows/ci.yml`) on
   release into a checkout.
 - Test media should live under `.dev-data` (synthetic fixtures) or be read-only
   references to a library; do not write into a user's media directories.
-- A release artifact is built from a tag with `scripts/package.ps1` and
-  `scripts/build-msi.ps1`; a dev build is never distributed.
+- A release artifact is built by the product repository (`LocalReel`:
+  `scripts/compose.ps1` + `scripts/build-msi.ps1`) from a tag; this repository
+  only builds and tests the component, and a dev build is never distributed.

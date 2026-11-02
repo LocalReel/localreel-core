@@ -60,21 +60,27 @@ dev script uses port 3101 and `.dev-data/`, while the installed app uses 3001 an
 
 ## Status
 
-Version 0.2.0: usable local-first server with a bilingual (中文/EN) web UI,
+Version 0.3.0: usable local-first server with a bilingual (中文/EN) web UI,
 scans/metadata/thumbnails, direct playback plus an H.264 remux fast path,
-Reels resume, Admin, backup/restore, archive/remap, cache GC, Windows zip/MSI,
-Linux tarball and Docker. Windows is the primary target; Linux and Docker were
-verified under WSL2. Public v1.0 release is blocked by code signing; see the
-readiness report.
+Reels resume, Admin, backup/restore, archive/remap, cache GC, and a
+single-binary build with the UI embedded. Windows is the primary target; Linux
+and Docker were verified under WSL2.
+
+This repository is **a component, not the product**. Installers, the MSI/zip
+artifacts, release notes and download instructions live in the product
+repository [`LocalReel`](https://github.com/LocalReel/LocalReel). The core
+builds a binary; the product composes the binary with the web UI and docs.
 
 The full delivery plan (milestones, work breakdown, estimates, risks, next
 sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
 
 ## Release
 
-- [0.1.0 release notes](docs/release/v0.1.0.md)
-- [v1.0 readiness / blockers](docs/release/v1.0-readiness.md)
-- [CHANGELOG.md](CHANGELOG.md)
+- Component changelog: [CHANGELOG.md](CHANGELOG.md)
+- Product downloads and release notes:
+  [`LocalReel/LocalReel`](https://github.com/LocalReel/LocalReel)
+- v1.0 readiness / blockers:
+  [`LocalReel/LocalReel/docs/release/v1.0-readiness.md`](https://github.com/LocalReel/LocalReel/blob/main/docs/release/v1.0-readiness.md)
 
 ## License
 

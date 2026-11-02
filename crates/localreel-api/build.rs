@@ -4,8 +4,22 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    // localreel-core/crates/localreel-api -> ../../../localreel-web/dist
-    let dist = manifest.join("../../../localreel-web/dist");
+    // Components stay separable: the web build can live anywhere. Point
+    // LOCALREEL_WEB_DIR at a web checkout (or its dist) and the default
+    // sibling layout keeps working for a plain multi-repo checkout.
+    let dist = match env::var_os("LOCALREEL_WEB_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.join("dist").is_dir() {
+                dir.join("dist")
+            } else {
+                dir
+            }
+        }
+        // localreel-core/crates/localreel-api -> ../../../localreel-web/dist
+        None => manifest.join("../../../localreel-web/dist"),
+    };
+    println!("cargo:rerun-if-env-changed=LOCALREEL_WEB_DIR");
     println!("cargo:rerun-if-changed={}", dist.display());
     println!("cargo:rerun-if-changed=build.rs");
 

@@ -522,7 +522,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "localreel-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-media"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "localreel-kernel",
  "rusqlite",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
