@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.0 — 2026-11-02
+
+Faster playback, reliable cancellation, a bilingual UI, and a dev/release split.
+
+### Added
+
+- **Remux fast path**: H.264 sources in MKV/MOV/TS/M2TS/FLV/AVI are rewritten into
+  MP4 with `-c:v copy` instead of being re-encoded (audio is copied when the
+  browser accepts it, otherwise only the audio is re-encoded). A 60 s clip that
+  used to take a full re-encode now finishes in ~0.5 s; a typical movie drops
+  from tens of minutes to seconds.
+- **Bilingual UI (zh/en)**: every page (Library, Reels, Admin, player) is
+  translated, with a 中文/EN switch. The initial language follows
+  `navigator.language` and the choice persists in `localStorage`.
+- **Job priorities**: `enqueue_with_priority`; thumbnails run at priority 10 so
+  they are no longer starved behind a bulk probe backlog.
+- **Development server isolation**: `scripts/dev.ps1` runs a debug server on
+  port 3101 with data in `.dev-data/`, separate from an installed release
+  (port 3001, `%LOCALAPPDATA%\LocalReel`). Documented in
+  [docs/development.md](docs/development.md).
+
+### Fixed
+
+- **Cancelling a running transcode did not stop it.** `POST /jobs/{id}/cancel`
+  now latches the cancellation flag even when the worker has not created it yet,
+  the worker skips a handler whose job was cancelled before it started, and
+  Windows kills the whole process tree (`taskkill /T`) so a wrapper/shim cannot
+  leave the real encoder running. Measured: encoder gone in 0.7 s, job
+  `canceled`, no partial output file.
+- Cancelled/aborted transcodes remove their partial output file.
+
+### Changed
+
+- Thumbnail jobs carry priority 10; probes stay at 0.
+- Version bumped to 0.2.0 in the workspace and the web package.
+
 ## 0.1.0 — 2026-11-01
 
 First usable LocalReel v2 (B1) build.

@@ -6,12 +6,14 @@ build. The server embeds `localreel-web/dist` at compile time.
 ## 1. Preconditions
 
 - [ ] `Cargo.toml` workspace version and `localreel-web/package.json` version
-      agree (currently `0.1.0`).
+      agree (currently `0.2.0`).
 - [ ] If migrations changed, they are additive and tested against a copy of an
       existing DB.
 - [ ] `localreel-web/dist` is **not** stale relative to `src/`.
 - [ ] License decision recorded: Apache-2.0 (`LICENSE` in each repo, plus
       `license` in `Cargo.toml`/`package.json`). Re-confirm before distributing.
+- [ ] Any testing used the dev server (`scripts/dev.ps1`, port 3101,
+      `.dev-data/`), never an installed release database on port 3001.
 
 ## 2. Automated checks
 

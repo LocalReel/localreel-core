@@ -12,6 +12,9 @@ Thumbs.db
 # bundled media tools (optional)
 .tools/
 
+# development server state (scripts/dev.ps1) — never a release install
+.dev-data/
+
 
 # release packaging output
 dist/

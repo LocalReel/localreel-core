@@ -32,6 +32,9 @@ handlers or spawn `ffmpeg` directly.
 ## Commands
 
 ```powershell
+# development server (isolated: port 3101, data in .dev-data/)
+.\scripts\dev.ps1
+
 # from this repository
 cargo run -p localreel-server -- serve
 cargo run -p localreel-server -- migrate
@@ -51,13 +54,18 @@ Configuration is loaded from `localreel.toml` (or `LOCALREEL_CONFIG`) and then
 Default bind: `127.0.0.1:3001`. Data lives in `./data` unless
 `LOCALREEL_DATA_DIR` is set.
 
+A development checkout and an installed release are kept apart on purpose: the
+dev script uses port 3101 and `.dev-data/`, while the installed app uses 3001 and
+`%LOCALAPPDATA%\LocalReel`. See [docs/development.md](docs/development.md).
+
 ## Status
 
-Version 0.1.0: usable local-first server with the web UI, scans/metadata/
-thumbnails, direct playback, Reels resume, Admin, backup/restore, archive/remap,
-cache GC, Windows zip/MSI, Linux tarball and Docker. Windows is the primary
-target; Linux and Docker were verified under WSL2. Public v1.0 release is
-blocked by the license decision and code signing; see the readiness report.
+Version 0.2.0: usable local-first server with a bilingual (中文/EN) web UI,
+scans/metadata/thumbnails, direct playback plus an H.264 remux fast path,
+Reels resume, Admin, backup/restore, archive/remap, cache GC, Windows zip/MSI,
+Linux tarball and Docker. Windows is the primary target; Linux and Docker were
+verified under WSL2. Public v1.0 release is blocked by code signing; see the
+readiness report.
 
 The full delivery plan (milestones, work breakdown, estimates, risks, next
 sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
