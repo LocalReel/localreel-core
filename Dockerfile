@@ -25,7 +25,6 @@ RUN useradd --system --uid 10001 --create-home --home-dir /data localreel \
     && mkdir -p /data \
     && chown -R localreel:localreel /data
 COPY --from=builder /src/target/release/localreel /usr/local/bin/localreel
-COPY docs/operations.md /usr/local/share/localreel/operations.md
 VOLUME ["/data"]
 EXPOSE 3001
 # The container must bind 0.0.0.0 to be reachable through a published port.
