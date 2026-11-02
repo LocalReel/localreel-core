@@ -15,10 +15,21 @@ $cargo = if ($env:CARGO) {
     Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 }
 
-$npm = if (Get-Command npm -ErrorAction SilentlyContinue) {
-    (Get-Command npm).Source
+$npm = if ($env:NPM) {
+    $env:NPM
 } else {
-    'C:\Program Files\nodejs\npm.cmd'
+    # Prefer a real executable shim (npm.cmd on Windows); npm.ps1 breaks when
+    # invoked by full path because it builds its command via Invoke-Expression.
+    $shim = Get-Command npm -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandType -ne 'ExternalScript' } |
+        Select-Object -First 1
+    if ($shim) {
+        $shim.Source
+    } elseif (Test-Path 'C:\Program Files\nodejs\npm.cmd') {
+        'C:\Program Files\nodejs\npm.cmd'
+    } else {
+        'npm'
+    }
 }
 $nodeDir = Split-Path -Parent $npm
 if ($nodeDir) {

@@ -11,6 +11,17 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $webDir = Join-Path (Split-Path -Parent $root) 'localreel-web'
 
+# cargo metadata/build read the current directory, so do not depend on where the
+# caller happens to be.
+function Invoke-InRepo([scriptblock]$Command) {
+    Push-Location -LiteralPath $root
+    try {
+        & $Command
+    } finally {
+        Pop-Location
+    }
+}
+
 $cargo = if ($env:CARGO) {
     $env:CARGO
 } elseif (Get-Command cargo -ErrorAction SilentlyContinue) {
@@ -19,10 +30,22 @@ $cargo = if ($env:CARGO) {
     Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 }
 
-$npm = if (Get-Command npm -ErrorAction SilentlyContinue) {
-    (Get-Command npm).Source
+$npm = if ($env:NPM) {
+    $env:NPM
 } else {
-    'C:\Program Files\nodejs\npm.cmd'
+    # Prefer a real executable shim (npm.cmd on Windows). Node's npm.ps1 builds
+    # its command line with Invoke-Expression and mangles paths with spaces when
+    # it is invoked by full path.
+    $shim = Get-Command npm -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandType -ne 'ExternalScript' } |
+        Select-Object -First 1
+    if ($shim) {
+        $shim.Source
+    } elseif (Test-Path 'C:\Program Files\nodejs\npm.cmd') {
+        'C:\Program Files\nodejs\npm.cmd'
+    } else {
+        'npm'
+    }
 }
 
 if ($BuildWeb) {
@@ -47,7 +70,7 @@ if (-not (Test-Path $webIndex)) {
     throw "web dist is missing at $webIndex; run 'npm run build' in localreel-web or pass -BuildWeb"
 }
 
-$metadata = & $cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+$metadata = Invoke-InRepo { & $cargo metadata --no-deps --format-version 1 } | ConvertFrom-Json
 $package = $metadata.packages | Where-Object { $_.name -eq 'localreel-server' } | Select-Object -First 1
 if (-not $package) {
     throw 'could not determine localreel-server version from cargo metadata'
@@ -59,7 +82,7 @@ $stage = Join-Path (Join-Path $root $OutputDir) $stageName
 
 if (-not $SkipBuild) {
     Write-Host "Building localreel-server ($Profile)..."
-    & $cargo build -p localreel-server --profile $Profile
+    Invoke-InRepo { & $cargo build -p localreel-server --profile $Profile }
     if ($LASTEXITCODE -ne 0) {
         throw 'cargo build failed'
     }
