@@ -101,6 +101,7 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 Copy-Item -LiteralPath $binary -Destination (Join-Path $stage $exeName)
 Copy-Item -LiteralPath (Join-Path $root 'localreel.toml.example') -Destination (Join-Path $stage 'localreel.toml.example')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $stage 'README.md')
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE')
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'docs') | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Filter '*.md' -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage 'docs') -Force

@@ -72,6 +72,7 @@ localreel.exe
 localreel.toml.example
 README.md
 README.txt
+LICENSE
 install.ps1
 uninstall.ps1
 install-task.ps1

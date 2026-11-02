@@ -36,6 +36,9 @@
         <File Id="ReadmeMd" Source="$(var.SourceDir)\README.md" />
         <File Id="ReadmeTxt" Source="$(var.SourceDir)\README.txt" />
       </Component>
+      <Component Id="License" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="LicenseFile" Source="$(var.SourceDir)\LICENSE" />
+      </Component>
       <Component Id="InstallTask" Directory="INSTALLFOLDER" Guid="*">
         <File Id="InstallTaskScript" Source="$(var.SourceDir)\install-task.ps1" />
       </Component>
