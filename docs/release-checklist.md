@@ -10,7 +10,8 @@ build. The server embeds `localreel-web/dist` at compile time.
 - [ ] If migrations changed, they are additive and tested against a copy of an
       existing DB.
 - [ ] `localreel-web/dist` is **not** stale relative to `src/`.
-- [ ] License decision recorded (currently TBD by the repository owner).
+- [ ] License decision recorded: Apache-2.0 (`LICENSE` in each repo, plus
+      `license` in `Cargo.toml`/`package.json`). Re-confirm before distributing.
 
 ## 2. Automated checks
 
@@ -92,7 +93,8 @@ cd localreel-core
 
 Include:
 
-- version and commit;
+- version and commit (tag `v0.1.0` is applied consistently in all three repos);
+- license: Apache-2.0;
 - user-visible changes (library/reels/admin/backup/cache/archive/remap);
 - DB migration note;
 - ffmpeg requirement and whether a bundle is included;
@@ -124,8 +126,10 @@ The final per-user MSI (`localreel-0.1.0-x64.msi`, 2.29 MiB) was installed with
 - silent uninstall removed exe/Start Menu shortcut and kept
   `data/localreel.db` (media rows remain).
 
-The portable zip for this build has SHA256
+The portable zip for that build had SHA256
 `0621deec2d6a2cd8dc549c31683e8ebc36c170557d2a1b809a2e406fb1f96030`.
+Hashes for the current artifact are written to `dist/SHA256SUMS.txt` on every
+build; do not hand-edit them into prose.
 
 ## Definition of done
 

@@ -20,6 +20,8 @@ First usable LocalReel v2 (B1) build.
 - Windows portable zip + installer scripts + per-user WiX MSI.
 - Linux tarball + install/uninstall scripts; Dockerfile/Compose.
 - Operations, packaging, Linux, Docker, install and release-check docs.
+- License: Apache-2.0, with `LICENSE` in the core, web and format repositories
+  and `license` set in `Cargo.toml`/`package.json`.
 
 ### Known limitations
 

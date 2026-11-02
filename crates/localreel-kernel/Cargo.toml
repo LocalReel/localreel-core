@@ -3,6 +3,7 @@ name = "localreel-kernel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Generic LocalReel capabilities: config, SQLite, jobs, events, storage, typed media operations"
 publish = false
 

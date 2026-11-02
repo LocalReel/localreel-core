@@ -70,7 +70,8 @@ sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
 
 ## License
 
-TBD by the repository owner. The v2 plan's default is Apache-2.0, but no
-`LICENSE` file exists yet; see
-[docs/release/v1.0-readiness.md](docs/release/v1.0-readiness.md) for the
-release blocker.
+Apache-2.0 — see [`LICENSE`](LICENSE). Copyright 2026 LocalReel contributors.
+
+ffmpeg is **not** bundled: the server discovers `ffmpeg`/`ffprobe` on PATH, next
+to the binary, in `ffmpeg/bin`, or via `LOCALREEL_FFMPEG_DIR`. Any ffmpeg you
+install keeps its own license (GPL or LGPL depending on the build you choose).
