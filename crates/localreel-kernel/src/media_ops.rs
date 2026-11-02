@@ -190,17 +190,7 @@ impl MediaOps {
         }
 
         let mut command = binary_command(&self.ffmpeg);
-        command
-            .args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"])
-            .arg(input)
-            .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
-            .arg(&preset.video_codec)
-            .args(["-preset", &preset.speed])
-            .args(["-crf", &preset.crf.to_string(), "-c:a"])
-            .arg(&preset.audio_codec)
-            .args(["-b:a", &preset.audio_bitrate])
-            .args(["-movflags", "+faststart", "-f", "mp4"])
-            .arg(output);
+        command.args(transcode_args(input, output, preset));
 
         command
             .stdin(Stdio::null())
@@ -425,7 +415,69 @@ fn run_capture(
     })
 }
 
+/// Build the ffmpeg arguments for a typed preset.
+///
+/// `copy` means "remux this stream as-is": encoder-only flags (`-preset`,
+/// `-crf`, `-b:a`) are dropped, which turns a multi-minute re-encode of an
+/// H.264 file into a few seconds of container rewriting.
+pub(crate) fn transcode_args(
+    input: &Path,
+    output: &Path,
+    preset: &TranscodePreset,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    fn text(value: &str) -> OsString {
+        OsString::from(value)
+    }
+
+    let mut args: Vec<OsString> = ["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"]
+        .iter()
+        .map(|value| text(value))
+        .collect();
+    args.push(input.as_os_str().to_owned());
+    args.extend(
+        ["-map", "0:v:0", "-map", "0:a:0?", "-c:v"]
+            .iter()
+            .map(|value| text(value)),
+    );
+    args.push(text(&preset.video_codec));
+    if preset.video_codec != "copy" {
+        args.extend([
+            text("-preset"),
+            text(&preset.speed),
+            text("-crf"),
+            text(&preset.crf.to_string()),
+        ]);
+    }
+    args.push(text("-c:a"));
+    args.push(text(&preset.audio_codec));
+    if preset.audio_codec != "copy" {
+        args.push(text("-b:a"));
+        args.push(text(&preset.audio_bitrate));
+    }
+    args.extend(
+        ["-movflags", "+faststart", "-f", "mp4"]
+            .iter()
+            .map(|value| text(value)),
+    );
+    args.push(output.as_os_str().to_owned());
+    args
+}
+
 fn terminate(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        // Kill the whole tree. On Windows the resolved ffmpeg can be a shim or
+        // wrapper that spawns the real encoder; killing only the direct child
+        // would leave the encoder running as an orphan.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -618,5 +670,62 @@ mod tests {
         }"#;
         let result = parse_probe_json(json).unwrap();
         assert_eq!(result.audio_codec.as_deref(), Some("none"));
+    }
+
+    fn args_of(preset: &TranscodePreset) -> Vec<String> {
+        transcode_args(Path::new("in.mkv"), Path::new("out.mp4"), preset)
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn transcode_args_keep_encoder_flags_for_a_reencode() {
+        let args = args_of(&TranscodePreset::default());
+        assert!(args.contains(&"libx264".to_string()));
+        assert!(args.contains(&"-preset".to_string()));
+        assert!(args.contains(&"veryfast".to_string()));
+        assert!(args.contains(&"-crf".to_string()));
+        assert!(args.contains(&"23".to_string()));
+        assert!(args.contains(&"aac".to_string()));
+        assert!(args.contains(&"-b:a".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    #[test]
+    fn transcode_args_drop_encoder_flags_for_copy() {
+        let preset = TranscodePreset {
+            name: "remux".into(),
+            video_codec: "copy".into(),
+            audio_codec: "copy".into(),
+            crf: 23,
+            speed: "veryfast".into(),
+            audio_bitrate: "160k".into(),
+        };
+        let args = args_of(&preset);
+        assert!(args.contains(&"copy".to_string()));
+        // Encoder-only flags would make ffmpeg fail when copying streams.
+        assert!(!args.contains(&"-preset".to_string()));
+        assert!(!args.contains(&"-crf".to_string()));
+        assert!(!args.contains(&"-b:a".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+    }
+
+    #[test]
+    fn transcode_args_copy_video_with_aac_audio() {
+        let preset = TranscodePreset {
+            name: "remux_audio".into(),
+            video_codec: "copy".into(),
+            audio_codec: "aac".into(),
+            crf: 23,
+            speed: "veryfast".into(),
+            audio_bitrate: "160k".into(),
+        };
+        let args = args_of(&preset);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+        assert!(!args.contains(&"-preset".to_string()));
+        assert!(args.contains(&"-b:a".to_string()));
     }
 }

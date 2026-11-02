@@ -79,6 +79,20 @@ impl JobQueue {
         dedupe_key: Option<&str>,
         max_attempts: i64,
     ) -> Result<String> {
+        self.enqueue_with_priority(kind, payload, dedupe_key, max_attempts, 0)
+    }
+
+    /// Enqueue with an explicit priority. `claim` orders by
+    /// `priority DESC, created_at ASC`, so short follow-up work (thumbnails) can
+    /// overtake a long backlog (bulk probes) instead of starving behind it.
+    pub fn enqueue_with_priority(
+        &self,
+        kind: &str,
+        payload: &str,
+        dedupe_key: Option<&str>,
+        max_attempts: i64,
+        priority: i64,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_secs();
         let max_attempts = max_attempts.max(1);
@@ -108,8 +122,17 @@ impl JobQueue {
                      id, kind, payload, payload_version, dedupe_key, status,
                      priority, progress, attempts, max_attempts, available_at,
                      created_at, cancel_requested
-                 ) VALUES (?1, ?2, ?3, 1, ?4, 'queued', 0, 0, 0, ?5, ?6, ?7, 0)",
-                params![id, kind, payload, dedupe_key, max_attempts, now, now],
+                 ) VALUES (?1, ?2, ?3, 1, ?4, 'queued', ?5, 0, 0, ?6, ?7, ?8, 0)",
+                params![
+                    id,
+                    kind,
+                    payload,
+                    dedupe_key,
+                    priority,
+                    max_attempts,
+                    now,
+                    now
+                ],
             )?;
             transaction.commit()?;
             Ok((id.clone(), true))
@@ -376,14 +399,10 @@ impl JobQueue {
         })?;
 
         if changed {
-            if let Some(flag) = self
-                .cancel_flags
-                .lock()
-                .ok()
-                .and_then(|flags| flags.get(id).cloned())
-            {
-                flag.store(true, Ordering::SeqCst);
-            }
+            // Insert the flag when it is missing: a cancel can land before the
+            // worker created its flag, and the flag must carry the canceled
+            // state to the handler either way.
+            self.cancel_flag(id).store(true, Ordering::SeqCst);
             if was_queued {
                 self.events.publish(Event::JobCanceled {
                     job_id: id.to_string(),
@@ -729,17 +748,26 @@ impl JobWorker {
     }
 
     async fn execute(&self, job: JobRecord) {
+        let context = JobContext {
+            job: job.clone(),
+            queue: self.queue.clone(),
+            cancel: self.queue.cancel_flag(&job.id),
+        };
+
+        // A cancel that arrived between claim and execution must not be lost.
+        if context.is_cancelled() {
+            if let Err(error) = self.queue.mark_canceled(&job.id) {
+                error!(job_id = %job.id, "failed to mark canceled job: {error}");
+            }
+            return;
+        }
+
         self.queue.events().publish(Event::JobStarted {
             job_id: job.id.clone(),
             kind: job.kind.clone(),
         });
 
         let handler = self.registry.get(&job.kind);
-        let context = JobContext {
-            job: job.clone(),
-            queue: self.queue.clone(),
-            cancel: self.queue.cancel_flag(&job.id),
-        };
 
         let heartbeat = {
             let queue = self.queue.clone();
@@ -899,6 +927,50 @@ mod tests {
         assert!(queue.cancel(&id).unwrap());
         assert!(queue.claim("worker-1", 60).unwrap().is_none());
         assert_eq!(queue.get(&id).unwrap().unwrap().status, status::CANCELED);
+    }
+
+    #[test]
+    fn cancel_running_job_flips_the_handler_flag() {
+        let (_dir, queue) = setup();
+        let id = queue.enqueue("test", "{}", None, 3).unwrap();
+        let claimed = queue.claim("worker-1", 60).unwrap().unwrap();
+        // The worker creates this clone when it starts the handler.
+        let flag = queue.cancel_flag(&claimed.id);
+        assert!(!flag.load(Ordering::SeqCst));
+
+        assert!(queue.cancel(&id).unwrap());
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "cancelling a running job must reach the handler flag"
+        );
+        // The row stays running until the handler returns and the worker
+        // finalises it as canceled.
+        assert_eq!(queue.get(&id).unwrap().unwrap().status, status::RUNNING);
+        queue.mark_canceled(&id).unwrap();
+        assert_eq!(queue.get(&id).unwrap().unwrap().status, status::CANCELED);
+    }
+
+    #[test]
+    fn cancel_before_the_worker_claims_it_keeps_the_flag() {
+        let (_dir, queue) = setup();
+        let id = queue.enqueue("test", "{}", None, 3).unwrap();
+        assert!(queue.cancel(&id).unwrap());
+        assert!(queue.claim("worker-1", 60).unwrap().is_none());
+        // A flag created afterwards must already say "canceled", so a worker
+        // that starts late does not re-run the handler.
+        assert!(queue.cancel_flag(&id).load(Ordering::SeqCst));
+        assert_eq!(queue.get(&id).unwrap().unwrap().status, status::CANCELED);
+    }
+
+    #[test]
+    fn higher_priority_jobs_are_claimed_first() {
+        let (_dir, queue) = setup();
+        let low = queue.enqueue("test", "{}", None, 3).unwrap();
+        let high = queue
+            .enqueue_with_priority("test", "{}", None, 3, 10)
+            .unwrap();
+        assert_eq!(queue.claim("worker-1", 60).unwrap().unwrap().id, high);
+        assert_eq!(queue.claim("worker-2", 60).unwrap().unwrap().id, low);
     }
 
     #[test]

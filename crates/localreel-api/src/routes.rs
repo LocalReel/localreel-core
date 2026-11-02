@@ -22,7 +22,7 @@ use tower_http::services::ServeDir;
 use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
-use localreel_media::playback::{direct_play_supported, is_hls, DEFAULT_TRANSCODE_PRESET};
+use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
 use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter,
     MediaState, RemapReport, ScanIssue, ScanRun, Source,
@@ -666,17 +666,15 @@ async fn prepare_playback(
         .into_response());
     }
 
-    if let Some(variant) =
-        state
-            .media
-            .find_variant(media.id, "transcode", DEFAULT_TRANSCODE_PRESET)?
+    let preset_name = preferred_preset(&media);
+
+    if let Some(variant) = state
+        .media
+        .find_variant(media.id, "transcode", preset_name)?
     {
         let path = state.config.media.transcode_dir.join(&variant.path);
         if path.is_file() {
-            if let Err(error) = state
-                .media
-                .touch_variant(media.id, DEFAULT_TRANSCODE_PRESET)
-            {
+            if let Err(error) = state.media.touch_variant(media.id, preset_name) {
                 tracing::warn!(
                     media_id = media.id,
                     "failed to touch transcode variant: {error}"
@@ -694,16 +692,13 @@ async fn prepare_playback(
 
     let payload = serde_json::json!({
         "media_id": media.id,
-        "preset": DEFAULT_TRANSCODE_PRESET,
+        "preset": preset_name,
     })
     .to_string();
     let job_id = state.jobs.enqueue(
         "transcode",
         &payload,
-        Some(&format!(
-            "transcode:{}:{DEFAULT_TRANSCODE_PRESET}",
-            media.id
-        )),
+        Some(&format!("transcode:{}:{preset_name}", media.id)),
         2,
     )?;
     Ok((

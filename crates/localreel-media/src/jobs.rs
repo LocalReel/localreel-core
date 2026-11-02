@@ -5,15 +5,20 @@ use std::time::{Duration, Instant};
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::jobs::{JobContext, JobHandler, JobOutcome, JobRegistry};
-use localreel_kernel::media_ops::{MediaOps, TranscodePreset};
+use localreel_kernel::media_ops::MediaOps;
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
 use crate::backup::{read_backup_with_limit, Backup, MAX_BACKUP_RESTORE_BYTES};
-use crate::playback::DEFAULT_TRANSCODE_PRESET;
+use crate::playback::{preset_by_name, DEFAULT_TRANSCODE_PRESET};
 use crate::restore::restore_backup;
 use crate::scan::discover_source_with_cancel;
 use crate::service::MediaService;
+
+/// Job priority for thumbnails. Higher than the queue default (0) so short,
+/// user-visible thumbnail work overtakes a bulk probe backlog instead of
+/// starving behind it.
+const THUMBNAIL_PRIORITY: i64 = 10;
 
 /// Media-domain job handlers registered with the kernel worker.
 ///
@@ -158,11 +163,15 @@ impl JobHandler for ProbeMediaHandler {
 
         if media.thumbnail_path.is_none() {
             let payload = serde_json::json!({ "media_id": media.id }).to_string();
-            if let Err(error) = context.queue().enqueue(
+            // Thumbnails are short and user-visible, while a fresh scan can
+            // leave tens of thousands of probes queued; a higher priority keeps
+            // them from starving behind the probe backlog.
+            if let Err(error) = context.queue().enqueue_with_priority(
                 "thumbnail",
                 &payload,
                 Some(&format!("thumbnail:{}", media.id)),
                 3,
+                THUMBNAIL_PRIORITY,
             ) {
                 tracing::warn!(
                     media_id = media.id,
@@ -251,11 +260,9 @@ impl JobHandler for TranscodeHandler {
         let preset_name = payload
             .preset
             .unwrap_or_else(|| DEFAULT_TRANSCODE_PRESET.to_string());
-        if preset_name != DEFAULT_TRANSCODE_PRESET {
-            return Err(KernelError::InvalidInput(format!(
-                "unsupported transcode preset '{preset_name}'"
-            )));
-        }
+        let preset = preset_by_name(&preset_name).ok_or_else(|| {
+            KernelError::InvalidInput(format!("unsupported transcode preset '{preset_name}'"))
+        })?;
 
         let service = MediaService::new(self.0.db.clone());
         let media = service
@@ -285,7 +292,6 @@ impl JobHandler for TranscodeHandler {
             media.modified_at
         );
         let output = self.0.transcode_dir.join(&filename);
-        let preset = TranscodePreset::default();
         let mut last_progress = 0.0f64;
         let mut last_report = Instant::now() - Duration::from_secs(2);
 

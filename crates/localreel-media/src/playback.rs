@@ -1,11 +1,19 @@
 use std::path::Path;
 
+use localreel_kernel::media_ops::TranscodePreset;
 use localreel_kernel::storage::MediaUri;
 
 use crate::model::Media;
 
 /// Default preset name used by the playback endpoint and transcode job.
 pub const DEFAULT_TRANSCODE_PRESET: &str = "h264_aac";
+
+/// Remux preset: copy the H.264 video stream and the audio stream into MP4.
+pub const REMUX_PRESET: &str = "remux_h264";
+
+/// Remux preset with an AAC audio track, for containers whose audio (AC-3,
+/// DTS, FLAC, ...) the browser cannot play straight from MP4.
+pub const REMUX_PRESET_AAC: &str = "remux_h264_aac";
 
 /// True when the media URI is an HTTP(S) `.m3u8` playlist.
 pub fn is_hls(media: &Media) -> bool {
@@ -16,16 +24,95 @@ pub fn is_hls(media: &Media) -> bool {
     without_query.to_ascii_lowercase().ends_with(".m3u8")
 }
 
+fn extension(media: &Media) -> Option<String> {
+    match MediaUri::parse(&media.uri) {
+        Ok(MediaUri::Local(path)) => extension_of(&path),
+        Ok(MediaUri::Http(url)) => extension_of(Path::new(url.split('?').next().unwrap_or(&url))),
+        _ => None,
+    }
+}
+
+fn video_is_h264(media: &Media) -> bool {
+    matches!(
+        media
+            .video_codec
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "h264" | "avc" | "avc1"
+    )
+}
+
+fn audio_is_browser_safe(media: &Media) -> bool {
+    matches!(
+        media
+            .audio_codec
+            .as_deref()
+            .unwrap_or("none")
+            .to_ascii_lowercase()
+            .as_str(),
+        "aac" | "mp3" | "none"
+    )
+}
+
+/// Containers that are not playable as-is but whose H.264 stream can be
+/// rewritten into MP4 without re-encoding.
+fn remux_container(extension: Option<&str>) -> bool {
+    matches!(
+        extension,
+        Some("mkv") | Some("mov") | Some("ts") | Some("m2ts") | Some("flv") | Some("avi")
+    )
+}
+
+/// Preset to use when direct play is not possible.
+///
+/// * H.264 in a non-MP4 container → copy the video stream (and the audio when
+///   the browser can take it), which takes seconds instead of minutes.
+/// * anything else → a full H.264/AAC re-encode.
+pub fn preferred_preset(media: &Media) -> &'static str {
+    let extension = extension(media);
+    if remux_container(extension.as_deref()) && video_is_h264(media) {
+        return if audio_is_browser_safe(media) {
+            REMUX_PRESET
+        } else {
+            REMUX_PRESET_AAC
+        };
+    }
+    DEFAULT_TRANSCODE_PRESET
+}
+
+/// Resolve a preset name to the typed preset the transcode job executes.
+pub fn preset_by_name(name: &str) -> Option<TranscodePreset> {
+    let preset = match name {
+        DEFAULT_TRANSCODE_PRESET => TranscodePreset::default(),
+        REMUX_PRESET => TranscodePreset {
+            name: REMUX_PRESET.to_string(),
+            video_codec: "copy".to_string(),
+            audio_codec: "copy".to_string(),
+            crf: 0,
+            speed: "ultrafast".to_string(),
+            audio_bitrate: "160k".to_string(),
+        },
+        REMUX_PRESET_AAC => TranscodePreset {
+            name: REMUX_PRESET_AAC.to_string(),
+            video_codec: "copy".to_string(),
+            audio_codec: "aac".to_string(),
+            crf: 0,
+            speed: "ultrafast".to_string(),
+            audio_bitrate: "160k".to_string(),
+        },
+        _ => return None,
+    };
+    Some(preset)
+}
+
 /// Whether the browser can play the file directly without a transcode.
 ///
 /// This is deliberately conservative: unknown or missing codec metadata means
 /// "transcode", not "hope the browser handles it".
 pub fn direct_play_supported(media: &Media) -> bool {
-    let extension = match MediaUri::parse(&media.uri) {
-        Ok(MediaUri::Local(path)) => extension_of(&path),
-        Ok(MediaUri::Http(url)) => extension_of(Path::new(url.split('?').next().unwrap_or(&url))),
-        _ => None,
-    };
+    let extension = extension(media);
     let video = media
         .video_codec
         .as_deref()
@@ -120,5 +207,59 @@ mod tests {
             None
         )));
         assert!(!is_hls(&media("file:///D:/a.m3u8", None, None)));
+    }
+
+    #[test]
+    fn mkv_h264_aac_is_remuxed() {
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.mkv", Some("h264"), Some("aac"))),
+            REMUX_PRESET
+        );
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.flv", Some("avc1"), Some("mp3"))),
+            REMUX_PRESET
+        );
+    }
+
+    #[test]
+    fn remux_transcodes_only_the_audio_when_needed() {
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.mkv", Some("h264"), Some("ac3"))),
+            REMUX_PRESET_AAC
+        );
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.mkv", Some("h264"), Some("dts"))),
+            REMUX_PRESET_AAC
+        );
+    }
+
+    #[test]
+    fn non_h264_or_unknown_needs_a_full_reencode() {
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.mkv", Some("hevc"), Some("aac"))),
+            DEFAULT_TRANSCODE_PRESET
+        );
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.flv", Some("rv40"), Some("aac"))),
+            DEFAULT_TRANSCODE_PRESET
+        );
+        assert_eq!(
+            preferred_preset(&media("file:///D:/a.mkv", None, None)),
+            DEFAULT_TRANSCODE_PRESET
+        );
+    }
+
+    #[test]
+    fn presets_are_typed_and_reject_unknown_names() {
+        let copy = preset_by_name(REMUX_PRESET).unwrap();
+        assert_eq!(copy.video_codec, "copy");
+        assert_eq!(copy.audio_codec, "copy");
+
+        let copy_audio = preset_by_name(REMUX_PRESET_AAC).unwrap();
+        assert_eq!(copy_audio.video_codec, "copy");
+        assert_eq!(copy_audio.audio_codec, "aac");
+
+        assert!(preset_by_name(DEFAULT_TRANSCODE_PRESET).is_some());
+        assert!(preset_by_name("nope").is_none());
     }
 }
