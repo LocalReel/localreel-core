@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::Result;
-use localreel_kernel::media_ops::MediaOps;
+use localreel_kernel::media_ops::{MediaInput, MediaOps};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
@@ -133,7 +133,7 @@ pub fn restore_backup(
             }
 
             if media.duration.is_none() || media.video_codec.is_none() {
-                match media_ops.probe(&path, cancel) {
+                match media_ops.probe(&MediaInput::path(&path), cancel) {
                     Ok(probe) => {
                         if let Err(error) = service.update_probe(media.id, &probe) {
                             report
@@ -156,7 +156,7 @@ pub fn restore_backup(
                     .duration
                     .map(|duration| (duration * 0.1).clamp(1.0, 10.0))
                     .unwrap_or(3.0);
-                match media_ops.thumbnail(&path, &output, seek, 480, cancel) {
+                match media_ops.thumbnail(&MediaInput::path(&path), &output, seek, 480, cancel) {
                     Ok(()) => {
                         let size = std::fs::metadata(&output)
                             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))

@@ -454,6 +454,12 @@ async fn serve() -> anyhow::Result<()> {
 
     // Kernel workers are generic; the media crate registers the domain handlers.
     let mut registry = JobRegistry::new();
+    // Remote media is read through the server's own range-capable stream
+    // endpoint; bind address `0.0.0.0` is reached via loopback.
+    let stream_host = match config.host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        host => host.to_string(),
+    };
     localreel_media::MediaJobs::with_storage(
         db.clone(),
         media_ops.clone(),
@@ -461,6 +467,7 @@ async fn serve() -> anyhow::Result<()> {
         config.media.transcode_dir.clone(),
         storage.clone(),
     )
+    .with_stream_base(format!("http://{stream_host}:{}", config.port))
     .register(&mut registry);
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));

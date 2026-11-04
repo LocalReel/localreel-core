@@ -24,6 +24,45 @@ pub struct ProbeResult {
     pub bitrate: Option<i64>,
 }
 
+/// Input to one ffprobe/ffmpeg invocation.
+///
+/// Local files are opened directly. Remote sources are served by the host's own
+/// stream endpoint (`/api/v1/media/<id>/stream`), which supports byte ranges, so
+/// ffmpeg reads remote media without downloading it first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaInput {
+    Path(PathBuf),
+    Url(String),
+}
+
+impl MediaInput {
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        Self::Path(path.into())
+    }
+
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url(url.into())
+    }
+
+    pub fn is_url(&self) -> bool {
+        matches!(self, Self::Url(_))
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::Url(url) => url.clone(),
+        }
+    }
+
+    fn as_os(&self) -> std::ffi::OsString {
+        match self {
+            Self::Path(path) => path.as_os_str().to_owned(),
+            Self::Url(url) => url.into(),
+        }
+    }
+}
+
 /// Typed transcode profile. Extensions never pass raw ffmpeg argv; they pick a
 /// named preset that the host knows how to execute.
 #[derive(Debug, Clone)]
@@ -114,7 +153,7 @@ impl MediaOps {
         command_available(&self.ffmpeg) && command_available(&self.ffprobe)
     }
 
-    pub fn probe(&self, input: &Path, cancel: &AtomicBool) -> Result<ProbeResult> {
+    pub fn probe(&self, input: &MediaInput, cancel: &AtomicBool) -> Result<ProbeResult> {
         let mut command = binary_command(&self.ffprobe);
         command.args([
             "-v",
@@ -124,7 +163,7 @@ impl MediaOps {
             "-show_format",
             "-show_streams",
         ]);
-        command.arg(input);
+        command.arg(input.as_os());
         let output = run_capture(&mut command, self.probe_timeout, cancel)?;
         if !output.status_success {
             return Err(KernelError::Media(format!(
@@ -138,7 +177,7 @@ impl MediaOps {
 
     pub fn thumbnail(
         &self,
-        input: &Path,
+        input: &MediaInput,
         output: &Path,
         at_secs: f64,
         width: u32,
@@ -152,7 +191,7 @@ impl MediaOps {
             .args(["-y", "-v", "error", "-ss"])
             .arg(format!("{at_secs:.3}"))
             .arg("-i")
-            .arg(input)
+            .arg(input.as_os())
             .args(["-frames:v", "1", "-vf"])
             .arg(format!("scale={width}:-1"))
             .args(["-q:v", "5"])
@@ -178,7 +217,7 @@ impl MediaOps {
     /// 0..1 ratio. The callback is invoked from the calling thread.
     pub fn transcode(
         &self,
-        input: &Path,
+        input: &MediaInput,
         output: &Path,
         preset: &TranscodePreset,
         duration_secs: Option<f64>,
@@ -421,7 +460,7 @@ fn run_capture(
 /// `-crf`, `-b:a`) are dropped, which turns a multi-minute re-encode of an
 /// H.264 file into a few seconds of container rewriting.
 pub(crate) fn transcode_args(
-    input: &Path,
+    input: &MediaInput,
     output: &Path,
     preset: &TranscodePreset,
 ) -> Vec<std::ffi::OsString> {
@@ -435,7 +474,7 @@ pub(crate) fn transcode_args(
         .iter()
         .map(|value| text(value))
         .collect();
-    args.push(input.as_os_str().to_owned());
+    args.push(input.as_os());
     // Keep the web output clean: video + one audio track. Subtitles, data
     // streams and chapters are dropped — the mp4 muxer otherwise writes
     // chapters as an extra `text` track that no browser player needs.
@@ -666,7 +705,9 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(ops.available());
-        let probe = ops.probe(&input, &AtomicBool::new(false)).unwrap();
+        let probe = ops
+            .probe(&MediaInput::path(input), &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(probe.duration, Some(2.0));
         assert_eq!(probe.width, Some(320));
         assert_eq!(probe.height, Some(240));
@@ -686,10 +727,25 @@ mod tests {
     }
 
     fn args_of(preset: &TranscodePreset) -> Vec<String> {
-        transcode_args(Path::new("in.mkv"), Path::new("out.mp4"), preset)
+        transcode_args(&MediaInput::path("in.mkv"), Path::new("out.mp4"), preset)
             .into_iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn transcode_args_accept_a_url_input() {
+        let args: Vec<String> = transcode_args(
+            &MediaInput::url("http://127.0.0.1:3001/api/v1/media/7/stream"),
+            Path::new("out.mp4"),
+            &TranscodePreset::default(),
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-i", "http://127.0.0.1:3001/api/v1/media/7/stream"]));
     }
 
     #[test]

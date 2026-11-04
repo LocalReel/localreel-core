@@ -143,3 +143,18 @@ POST /api/v1/sources
 
 Sources without a `kind` keep the local behaviour (existing directories are
 canonicalized; other URI schemes map to their legacy kinds).
+## Remote media
+
+A storage provider may return URIs that are not local paths (for example
+`http://plugin.local/library/ep01.mp4`). The host then:
+
+- stores the URI as the media identity and derives series/episode information
+  from its path;
+- plays it through the provider (`stat` + `read`), exactly like a local file;
+- probes and transcodes it through the server's own range-capable endpoint
+  (`http://<host>:<port>/api/v1/media/<id>/stream`), so `ffprobe`/`ffmpeg` read
+  the bytes on demand instead of downloading the file first.
+
+The server's listen address is used for that endpoint; a bind on `0.0.0.0` is
+reached through `127.0.0.1`. Jobs that need remote media fail with a clear
+message when the server is not running (for example a one-off CLI command).

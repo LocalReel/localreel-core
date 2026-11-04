@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::jobs::{JobContext, JobHandler, JobOutcome, JobRegistry};
-use localreel_kernel::media_ops::MediaOps;
+use localreel_kernel::media_ops::{MediaInput, MediaOps};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,8 @@ struct Shared {
     thumbnail_dir: PathBuf,
     transcode_dir: PathBuf,
     storage: Arc<StorageRegistry>,
+    /// Base URL of the running server, used to read remote media over HTTP.
+    stream_base: Option<String>,
 }
 
 impl MediaJobs {
@@ -71,6 +73,24 @@ impl MediaJobs {
                 thumbnail_dir,
                 transcode_dir,
                 storage,
+                stream_base: None,
+            }),
+        }
+    }
+
+    /// Teach the handlers where the server listens, so remote media can be read
+    /// through `/api/v1/media/<id>/stream` instead of a local path.
+    pub fn with_stream_base(self, base: impl Into<String>) -> Self {
+        let base = base.into();
+        let existing = &*self.shared;
+        Self {
+            shared: Arc::new(Shared {
+                db: existing.db.clone(),
+                media_ops: existing.media_ops.clone(),
+                thumbnail_dir: existing.thumbnail_dir.clone(),
+                transcode_dir: existing.transcode_dir.clone(),
+                storage: existing.storage.clone(),
+                stream_base: Some(base),
             }),
         }
     }
@@ -83,6 +103,26 @@ impl MediaJobs {
         registry.register(CacheGcHandler(self.shared.clone()));
         registry.register(RestoreBackupHandler(self.shared.clone()));
         registry.register(RestoreBackupFileHandler(self.shared.clone()));
+    }
+}
+
+/// Where ffprobe/ffmpeg should read this media from.
+fn media_input(media: &crate::model::Media, stream_base: Option<&str>) -> Result<MediaInput> {
+    match MediaUri::parse(&media.uri)? {
+        MediaUri::Local(path) => Ok(MediaInput::path(path)),
+        _ => {
+            let base = stream_base.ok_or_else(|| {
+                KernelError::InvalidInput(format!(
+                    "media {} is remote; probing it requires the running server (start `serve`)",
+                    media.id
+                ))
+            })?;
+            Ok(MediaInput::url(format!(
+                "{}/api/v1/media/{}/stream",
+                base.trim_end_matches('/'),
+                media.id
+            )))
+        }
     }
 }
 
@@ -166,24 +206,18 @@ impl JobHandler for ProbeMediaHandler {
             .get_media(payload.media_id)?
             .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
 
-        let path = MediaUri::parse(&media.uri)?
-            .local_path()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                KernelError::InvalidInput(format!(
-                    "media {} is not local; remote probing is not supported",
-                    media.id
-                ))
-            })?;
-        if !path.is_file() {
-            return Err(KernelError::NotFound(format!(
-                "media file is missing: {}",
-                path.display()
-            )));
+        let input = media_input(&media, self.0.stream_base.as_deref())?;
+        if let MediaInput::Path(path) = &input {
+            if !path.is_file() {
+                return Err(KernelError::NotFound(format!(
+                    "media file is missing: {}",
+                    path.display()
+                )));
+            }
         }
 
         context.report_progress(0.1, Some("ffprobe"));
-        let probe = self.0.media_ops.probe(&path, &context.cancel_flag())?;
+        let probe = self.0.media_ops.probe(&input, &context.cancel_flag())?;
         service.update_probe(media.id, &probe)?;
         context.report_progress(0.9, Some("metadata updated"));
 
@@ -229,20 +263,14 @@ impl JobHandler for ThumbnailHandler {
             .get_media(payload.media_id)?
             .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
 
-        let path = MediaUri::parse(&media.uri)?
-            .local_path()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                KernelError::InvalidInput(format!(
-                    "media {} is not local; remote thumbnails are not supported",
-                    media.id
-                ))
-            })?;
-        if !path.is_file() {
-            return Err(KernelError::NotFound(format!(
-                "media file is missing: {}",
-                path.display()
-            )));
+        let input = media_input(&media, self.0.stream_base.as_deref())?;
+        if let MediaInput::Path(path) = &input {
+            if !path.is_file() {
+                return Err(KernelError::NotFound(format!(
+                    "media file is missing: {}",
+                    path.display()
+                )));
+            }
         }
 
         let filename = format!("thumb_{}.jpg", media.uid);
@@ -255,7 +283,7 @@ impl JobHandler for ThumbnailHandler {
         context.report_progress(0.1, Some("ffmpeg thumbnail"));
         self.0
             .media_ops
-            .thumbnail(&path, &output, seek, 480, &context.cancel_flag())?;
+            .thumbnail(&input, &output, seek, 480, &context.cancel_flag())?;
 
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
@@ -294,20 +322,14 @@ impl JobHandler for TranscodeHandler {
         let media = service
             .get_media(payload.media_id)?
             .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
-        let input = MediaUri::parse(&media.uri)?
-            .local_path()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                KernelError::InvalidInput(format!(
-                    "media {} is not local; remote transcoding is not supported",
-                    media.id
-                ))
-            })?;
-        if !input.is_file() {
-            return Err(KernelError::NotFound(format!(
-                "media file is missing: {}",
-                input.display()
-            )));
+        let input = media_input(&media, self.0.stream_base.as_deref())?;
+        if let MediaInput::Path(path) = &input {
+            if !path.is_file() {
+                return Err(KernelError::NotFound(format!(
+                    "media file is missing: {}",
+                    path.display()
+                )));
+            }
         }
 
         let filename = format!(
@@ -729,5 +751,45 @@ exit 0
         assert_eq!(video, "h264");
         assert_eq!(audio, "aac");
         assert!(thumbnails.join(&thumbnail).is_file());
+    }
+    #[test]
+    fn local_media_reads_from_its_path() {
+        let media = test_media("file:///D:/Videos/x.mp4");
+        let input = media_input(&media, None).unwrap();
+        assert!(!input.is_url());
+    }
+
+    #[test]
+    fn remote_media_reads_through_the_stream_endpoint() {
+        let media = test_media("http://plugin.local/Show/ep01.mp4");
+        assert_eq!(
+            media_input(&media, Some("http://127.0.0.1:3001/")).unwrap(),
+            MediaInput::url("http://127.0.0.1:3001/api/v1/media/7/stream")
+        );
+        assert!(media_input(&media, None).is_err());
+    }
+
+    fn test_media(uri: &str) -> crate::model::Media {
+        crate::model::Media {
+            id: 7,
+            uid: "uid-7".into(),
+            source_id: 1,
+            uri: uri.into(),
+            canonical_path: uri.into(),
+            filename: "x.mp4".into(),
+            title: None,
+            duration: None,
+            width: None,
+            height: None,
+            file_size: 1,
+            modified_at: 1,
+            video_codec: None,
+            audio_codec: None,
+            bitrate: None,
+            thumbnail_path: None,
+            missing_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 }

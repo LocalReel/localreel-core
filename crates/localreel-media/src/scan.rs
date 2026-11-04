@@ -180,28 +180,34 @@ pub fn discover_source_with_storage(
         if entry.is_dir {
             continue;
         }
-        let path = match MediaUri::parse(&entry.uri) {
-            Ok(MediaUri::Local(path)) => path,
-            _ => {
-                issues.push((
-                    entry.uri.clone(),
-                    "storage returned an entry without a local path".to_string(),
-                ));
+        let (canonical_path, filename) = match MediaUri::parse(&entry.uri) {
+            Ok(MediaUri::Local(path)) => {
+                if !is_video_path(&path) {
+                    continue;
+                }
+                let filename = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.name.clone());
+                (path.to_string_lossy().into_owned(), filename)
+            }
+            Ok(_) => {
+                // Remote entry: the URI is the identity and the provider knows
+                // how to reach the bytes. The extension comes from the name.
+                if !is_video_path(Path::new(&entry.name)) {
+                    continue;
+                }
+                (entry.uri.clone(), entry.name.clone())
+            }
+            Err(error) => {
+                issues.push((entry.uri.clone(), format!("invalid media uri: {error}")));
                 continue;
             }
         };
-        if !is_video_path(&path) {
-            continue;
-        }
-
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.name.clone());
         seen.insert(entry.uri.clone());
         candidates.push(Candidate {
             uri: entry.uri,
-            canonical_path: path.to_string_lossy().into_owned(),
+            canonical_path,
             filename,
             file_size: i64::try_from(entry.size).unwrap_or(i64::MAX),
             modified_at: entry.modified.unwrap_or(0),
@@ -624,6 +630,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(names, vec!["episode-01.mp4", "episode-02.mkv"]);
+    }
+
+    #[test]
+    fn scans_remote_entries_and_keeps_their_uri() {
+        let (dir, db, service) = setup();
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = service.add_source(root.to_str().unwrap()).unwrap();
+        let entry = |uri: &str, name: &str| localreel_kernel::storage::StorageEntry {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            is_dir: false,
+            size: 9,
+            modified: Some(1),
+        };
+        let mock = MockStorage {
+            entries: vec![
+                entry("http://plugin.local/Show/ep01.mp4", "ep01.mp4"),
+                entry("http://plugin.local/Show/notes.txt", "notes.txt"),
+            ],
+        };
+        let discovery =
+            discover_source_with_storage(&db, &source, &mock, &AtomicBool::new(false)).unwrap();
+        assert_eq!(discovery.discovered, 1);
+        let (uri, canonical): (String, String) = db
+            .with_read(|conn| {
+                Ok(
+                    conn.query_row("SELECT uri, canonical_path FROM media", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(uri, "http://plugin.local/Show/ep01.mp4");
+        assert_eq!(canonical, "http://plugin.local/Show/ep01.mp4");
     }
 
     #[test]
