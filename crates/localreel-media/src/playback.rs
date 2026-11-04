@@ -340,10 +340,6 @@ mod tests {
             playback_mode(Some("hevc"), Some("aac"), "a.mkv"),
             PlaybackMode::Transcode
         );
-        assert_eq!(
-            playback_mode(None, None, "a.mkv"),
-            PlaybackMode::Transcode
-        );
+        assert_eq!(playback_mode(None, None, "a.mkv"), PlaybackMode::Transcode);
     }
-
 }

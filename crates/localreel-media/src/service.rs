@@ -1636,7 +1636,9 @@ mod tests {
         let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
         let id = insert_media(&service, source.id, "state-patch");
 
-        let liked = service.patch_state(id, Some(true), None, None, None).unwrap();
+        let liked = service
+            .patch_state(id, Some(true), None, None, None)
+            .unwrap();
         assert!(liked.liked);
 
         // A progress save must not clear the like, and a like must not reset
@@ -1660,5 +1662,4 @@ mod tests {
             .patch_state(id, None, None, Some(f64::NAN), None)
             .is_err());
     }
-
 }

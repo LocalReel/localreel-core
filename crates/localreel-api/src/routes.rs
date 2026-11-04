@@ -24,8 +24,8 @@ use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
 use localreel_media::{
-    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media, MediaFilter,
-    MediaState, RemapReport, ScanIssue, ScanRun, Source,
+    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media,
+    MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
 
 use crate::error::ApiError;
@@ -79,12 +79,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/", get(embedded_index))
             .route("/admin", get(embedded_index))
             .route("/watch", get(embedded_index))
-            .route("/assets/*path", get(embedded_asset));
+            .route("/assets/*path", get(embedded_asset))
+            .route("/manifest.webmanifest", get(embedded_manifest))
+            .route("/favicon.ico", get(embedded_favicon))
+            .route("/icons/*path", get(embedded_public_file));
     } else {
         router = router
             .route("/", get(index))
             .route("/admin", get(index))
-            .route("/watch", get(index));
+            .route("/watch", get(index))
+            .route("/manifest.webmanifest", get(embedded_manifest))
+            .route("/favicon.ico", get(embedded_favicon))
+            .route("/icons/*path", get(embedded_public_file));
         if let Some(web_dir) = web_dir {
             router = router.nest_service("/assets", ServeDir::new(web_dir.join("assets")));
         }
@@ -115,6 +121,66 @@ async fn embedded_asset(Path(path): Path<String>) -> Response {
         Some((bytes, mime)) => bytes_response(bytes, mime, "public, max-age=31536000, immutable"),
         None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
     }
+}
+
+/// Root-level files the browser requests by fixed name (`manifest.webmanifest`,
+/// `favicon.ico`). Without these a packaged build 404s and the UI cannot be
+/// installed as a PWA even though the file is embedded.
+async fn root_file(state: &AppState, name: &str) -> Response {
+    if let Some((bytes, mime)) = crate::web::get(name) {
+        return bytes_response(bytes, mime, "public, max-age=3600");
+    }
+    if let Some(web_dir) = state.config.resolved_web_dir() {
+        if let Ok(bytes) = tokio::fs::read(web_dir.join(name)).await {
+            let mime = mime_guess::from_path(name)
+                .first_or_octet_stream()
+                .to_string();
+            return bytes_response_owned(bytes, mime, "public, max-age=3600");
+        }
+    }
+    (StatusCode::NOT_FOUND, "file not found").into_response()
+}
+
+async fn embedded_manifest(State(state): State<Arc<AppState>>) -> Response {
+    root_file(&state, "manifest.webmanifest").await
+}
+
+async fn embedded_favicon(State(state): State<Arc<AppState>>) -> Response {
+    root_file(&state, "favicon.ico").await
+}
+
+/// Files under `public/` subdirectories (currently `icons/`).
+async fn embedded_public_file(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    let asset = format!("public/{path}");
+    let nested = format!("icons/{path}");
+    for candidate in [asset.as_str(), nested.as_str()] {
+        if let Some((bytes, mime)) = crate::web::get(candidate) {
+            return bytes_response(bytes, mime, "public, max-age=86400");
+        }
+    }
+    if let Some(web_dir) = state.config.resolved_web_dir() {
+        for candidate in [asset.as_str(), nested.as_str()] {
+            if let Ok(bytes) = tokio::fs::read(web_dir.join(candidate)).await {
+                let mime = mime_guess::from_path(candidate)
+                    .first_or_octet_stream()
+                    .to_string();
+                return bytes_response_owned(bytes, mime, "public, max-age=86400");
+            }
+        }
+    }
+    (StatusCode::NOT_FOUND, "file not found").into_response()
+}
+
+fn bytes_response_owned(bytes: Vec<u8>, mime: String, cache: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn bytes_response(bytes: &'static [u8], mime: String, cache: &'static str) -> Response {
@@ -566,9 +632,13 @@ async fn put_state(
 ) -> Result<Json<MediaState>, ApiError> {
     // The service merges the patch inside one write transaction: progress saves
     // and like/favorite toggles arrive concurrently from the player.
-    let saved = state
-        .media
-        .patch_state(id, patch.liked, patch.favorite, patch.position, patch.duration)?;
+    let saved = state.media.patch_state(
+        id,
+        patch.liked,
+        patch.favorite,
+        patch.position,
+        patch.duration,
+    )?;
     Ok(Json(saved))
 }
 
@@ -1051,6 +1121,30 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("LocalReel"));
+    }
+
+    #[tokio::test]
+    async fn packaged_build_serves_the_pwa_assets() {
+        if !crate::web::is_embedded() {
+            // CI builds the core without a web checkout, so there is nothing to
+            // serve; the composition check happens in the product repository.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let manifest = app
+            .clone()
+            .oneshot(request("/manifest.webmanifest"))
+            .await
+            .unwrap();
+        assert_eq!(manifest.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(manifest.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("LocalReel"));
+
+        let icon = app.oneshot(request("/icons/icon-192.png")).await.unwrap();
+        assert_eq!(icon.status(), StatusCode::OK);
     }
 
     #[tokio::test]
