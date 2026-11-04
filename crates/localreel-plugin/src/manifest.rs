@@ -166,12 +166,26 @@ pub fn validate_relative_program(program: &str) -> Result<(), PluginError> {
     if program.trim().is_empty() || program.len() > 255 || program.contains('\0') {
         return Err(PluginError::Manifest("entry program is invalid".into()));
     }
-    let path = Path::new(program);
-    if path.is_absolute() {
+    // ZIP entries use '/'. A package must mean the same thing on every host, so
+    // a backslash separator or a Windows drive prefix is rejected even on Unix,
+    // where `C:/x` would otherwise be a relative file name.
+    if program.contains('\\') {
+        return Err(PluginError::Manifest(
+            "entry program must use '/' separators".into(),
+        ));
+    }
+    let bytes = program.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(PluginError::Manifest(
+            "entry program must not contain a drive prefix".into(),
+        ));
+    }
+    if program.starts_with('/') {
         return Err(PluginError::Manifest(
             "entry program must be relative to the package".into(),
         ));
     }
+    let path = Path::new(program);
     let mut components = path.components();
     let mut count = 0usize;
     for component in components.by_ref() {
