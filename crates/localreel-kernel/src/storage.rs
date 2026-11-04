@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
 use crate::error::{KernelError, Result};
 
@@ -64,6 +65,15 @@ impl MediaUri {
             MediaUri::Http(_) | MediaUri::S3 { .. } => None,
         }
     }
+
+    /// Provider family, used to pick a [`Storage`] implementation.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MediaUri::Local(_) => "local",
+            MediaUri::Http(_) => "http",
+            MediaUri::S3 { .. } => "s3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,14 +89,34 @@ pub struct StorageEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Seconds since the Unix epoch, when the backend can provide it. The
+    /// scanner fingerprints on size + mtime, so remote providers should map
+    /// their own timestamps here.
+    pub modified: Option<i64>,
 }
 
-/// Storage backend contract. v1 only ships [`LocalStorage`]; HTTP/HLS is
-/// passthrough handled by the media layer, and S3 is deliberately deferred.
+/// Storage backend contract.
+///
+/// `MediaUri` is the cross-database identity; a provider turns it into bytes.
+/// `LocalStorage` is the only provider shipped today. Future providers (WebDAV,
+/// SMB, HTTP) implement this trait and are registered in [`StorageRouter`]; the
+/// media layer never talks to a filesystem directly.
 pub trait Storage: Send + Sync {
+    /// Stable provider name, stored with a source so the right provider can be
+    /// selected later.
+    fn kind(&self) -> &'static str {
+        "local"
+    }
     fn stat(&self, uri: &MediaUri) -> Result<FileStat>;
     fn list(&self, uri: &MediaUri) -> Result<Vec<StorageEntry>>;
     fn open_range(&self, uri: &MediaUri, start: u64, len: u64) -> Result<Box<dyn Read + Send>>;
+    /// Recursively yield everything under `root` (directories included).
+    /// Errors are yielded per entry so one unreadable directory does not abort
+    /// a whole scan.
+    fn walk(
+        &self,
+        root: &MediaUri,
+    ) -> Result<Box<dyn Iterator<Item = Result<StorageEntry>> + Send>>;
 }
 
 /// Local filesystem backend with mandatory root confinement.
@@ -159,7 +189,11 @@ impl LocalStorage {
             .local_path()
             .ok_or_else(|| KernelError::Storage("not a local media uri".into()))?;
         let canonical = path.canonicalize().map_err(|error| {
-            KernelError::Storage(format!("cannot resolve {}: {error}", path.display()))
+            if error.kind() == std::io::ErrorKind::NotFound {
+                KernelError::NotFound(format!("media file is missing: {}", path.display()))
+            } else {
+                KernelError::Storage(format!("cannot resolve {}: {error}", path.display()))
+            }
         })?;
         let roots = self
             .roots
@@ -194,7 +228,13 @@ fn canonicalize_root(root: &Path) -> Result<PathBuf> {
 impl Storage for LocalStorage {
     fn stat(&self, uri: &MediaUri) -> Result<FileStat> {
         let path = self.resolve(uri)?;
-        let metadata = std::fs::metadata(&path)?;
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                KernelError::NotFound(format!("media file is missing: {}", path.display()))
+            } else {
+                KernelError::Io(error)
+            }
+        })?;
         Ok(FileStat {
             size: metadata.len(),
             modified: metadata
@@ -223,6 +263,11 @@ impl Storage for LocalStorage {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 is_dir: metadata.is_dir(),
                 size: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs() as i64),
             });
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -239,6 +284,114 @@ impl Storage for LocalStorage {
         file.seek(SeekFrom::Start(start))?;
         Ok(Box::new(file.take(len.min(size - start))))
     }
+
+    fn walk(
+        &self,
+        root: &MediaUri,
+    ) -> Result<Box<dyn Iterator<Item = Result<StorageEntry>> + Send>> {
+        let path = self.resolve(root)?;
+        let roots = self.roots();
+        let walker = WalkDir::new(&path).follow_links(false).into_iter();
+        Ok(Box::new(walker.filter_map(move |entry| match entry {
+            Ok(entry) => {
+                let entry_path = entry.path().to_path_buf();
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return Some(Err(KernelError::Storage(format!(
+                            "cannot read metadata for {}: {error}",
+                            entry_path.display()
+                        ))))
+                    }
+                };
+                if metadata.is_dir() {
+                    return Some(Ok(StorageEntry {
+                        uri: MediaUri::Local(entry_path.clone()).to_uri(),
+                        name: entry.file_name().to_string_lossy().into_owned(),
+                        is_dir: true,
+                        size: 0,
+                        modified: None,
+                    }));
+                }
+                let canonical = entry_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| entry_path.clone());
+                if !roots.iter().any(|root| canonical.starts_with(root)) {
+                    return None;
+                }
+                Some(Ok(StorageEntry {
+                    uri: MediaUri::Local(canonical).to_uri(),
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    is_dir: false,
+                    size: metadata.len(),
+                    modified: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|value| value.as_secs() as i64),
+                }))
+            }
+            Err(error) => Some(Err(KernelError::Storage(format!(
+                "failed to walk {}: {error}",
+                path.display()
+            )))),
+        })))
+    }
+}
+
+/// Dispatches a media URI to the provider that owns it.
+///
+/// Local files are the only registered provider today. A new provider (WebDAV,
+/// SMB, HTTP) is added by extending the match arms; callers keep using the
+/// `Storage` trait and never learn which backend served the bytes.
+pub struct StorageRouter {
+    local: LocalStorage,
+}
+
+impl StorageRouter {
+    pub fn new(local: LocalStorage) -> Self {
+        Self { local }
+    }
+}
+
+impl Storage for StorageRouter {
+    fn stat(&self, uri: &MediaUri) -> Result<FileStat> {
+        match uri {
+            MediaUri::Local(_) => self.local.stat(uri),
+            other => Err(unsupported(other)),
+        }
+    }
+
+    fn list(&self, uri: &MediaUri) -> Result<Vec<StorageEntry>> {
+        match uri {
+            MediaUri::Local(_) => self.local.list(uri),
+            other => Err(unsupported(other)),
+        }
+    }
+
+    fn open_range(&self, uri: &MediaUri, start: u64, len: u64) -> Result<Box<dyn Read + Send>> {
+        match uri {
+            MediaUri::Local(_) => self.local.open_range(uri, start, len),
+            other => Err(unsupported(other)),
+        }
+    }
+
+    fn walk(
+        &self,
+        root: &MediaUri,
+    ) -> Result<Box<dyn Iterator<Item = Result<StorageEntry>> + Send>> {
+        match root {
+            MediaUri::Local(_) => self.local.walk(root),
+            other => Err(unsupported(other)),
+        }
+    }
+}
+
+fn unsupported(uri: &MediaUri) -> KernelError {
+    KernelError::Storage(format!(
+        "no storage provider registered for {} uris",
+        uri.kind()
+    ))
 }
 
 fn has_prefix_ignore_ascii_case(value: &str, prefix: &str) -> bool {
@@ -364,6 +517,44 @@ fn local_path_to_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_yields_directories_and_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.mkv"), b"abc").unwrap();
+        std::fs::write(dir.path().join("sub").join("b.mp4"), b"de").unwrap();
+        let storage = LocalStorage::new([dir.path().to_path_buf()]).unwrap();
+        let entries: Vec<_> = storage
+            .walk(&MediaUri::Local(dir.path().to_path_buf()))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let files: Vec<_> = entries.iter().filter(|entry| !entry.is_dir).collect();
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .any(|entry| entry.name == "a.mkv" && entry.size == 3));
+        assert!(files
+            .iter()
+            .any(|entry| entry.name == "b.mp4" && entry.size == 2));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.is_dir && entry.name == "sub"));
+    }
+
+    #[test]
+    fn router_dispatches_local_and_rejects_unregistered_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mkv"), b"abc").unwrap();
+        let router = StorageRouter::new(LocalStorage::new([dir.path().to_path_buf()]).unwrap());
+        let local = MediaUri::Local(dir.path().join("a.mkv"));
+        assert_eq!(router.stat(&local).unwrap().size, 3);
+        let error = router
+            .stat(&MediaUri::Http("https://example.test/a.mkv".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("no storage provider registered"));
+    }
 
     #[cfg(windows)]
     #[test]

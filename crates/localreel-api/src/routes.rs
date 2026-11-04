@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::io::Read;
 use std::sync::Arc;
 
 use axum::{
@@ -14,15 +14,15 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
-use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
 
 use localreel_kernel::jobs::JobRecord;
-use localreel_kernel::storage::MediaUri;
+use localreel_kernel::storage::{MediaUri, Storage};
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
+use localreel_media::scan::storage_for_source;
 use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media,
     MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
@@ -797,7 +797,8 @@ async fn head_media(
 }
 
 struct ResolvedMedia {
-    path: PathBuf,
+    uri: MediaUri,
+    storage: Arc<dyn Storage>,
     size: u64,
     etag: String,
     mime: String,
@@ -808,39 +809,41 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
         .media
         .get_media(id)?
         .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
-    let path = MediaUri::parse(&media.uri)?
-        .local_path()
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented",
-                "remote media streaming is not supported in v1",
-            )
-        })?;
-    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+    let uri = MediaUri::parse(&media.uri)?;
+    let source = state
+        .media
+        .get_source(media.source_id)?
+        .ok_or_else(|| ApiError::not_found("media source is missing"))?;
+    let storage: Arc<dyn Storage> = Arc::new(storage_for_source(&source).map_err(|error| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_implemented",
+            format!("no storage provider for this source: {error}"),
+        )
+    })?);
+    let stat = storage.stat(&uri).map_err(|error| match error {
+        localreel_kernel::error::KernelError::NotFound(_) => {
             ApiError::not_found("media file is missing")
-        } else {
-            ApiError::internal(format!("failed to stat media: {error}"))
         }
+        _ => ApiError::internal(format!("failed to stat media: {error}")),
     })?;
-    if !metadata.is_file() {
+    if stat.is_dir {
         return Err(ApiError::bad_request("media path is not a file"));
     }
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_secs())
-        .unwrap_or(0);
-    let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), mtime);
-    let mime = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
+    let modified = stat.modified.unwrap_or(0);
+    let etag = format!("W/\"{:x}-{:x}\"", stat.size, modified);
+    let mime = uri
+        .local_path()
+        .map(|path| {
+            mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string()
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
     Ok(ResolvedMedia {
-        path,
-        size: metadata.len(),
+        uri,
+        storage,
+        size: stat.size,
         etag,
         mime,
     })
@@ -899,13 +902,43 @@ async fn serve_media(
     let body = if head_only {
         Body::empty()
     } else {
-        let mut file = tokio::fs::File::open(&media.path)
-            .await
-            .map_err(|error| ApiError::internal(format!("failed to open media: {error}")))?;
-        file.seek(SeekFrom::Start(start))
-            .await
-            .map_err(|error| ApiError::internal(format!("failed to seek media: {error}")))?;
-        Body::from_stream(ReaderStream::new(file.take(length)))
+        let storage = media.storage.clone();
+        let uri = media.uri.clone();
+        let mut reader =
+            tokio::task::spawn_blocking(move || storage.open_range(&uri, start, length))
+                .await
+                .map_err(|error| ApiError::internal(format!("reader task failed: {error}")))?
+                .map_err(|error| match error {
+                    localreel_kernel::error::KernelError::NotFound(_) => {
+                        ApiError::not_found("media file is missing")
+                    }
+                    _ => ApiError::internal(format!("failed to open media: {error}")),
+                })?;
+        let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+        tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                match Read::read(&mut *reader, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if sender
+                            .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
+        Body::from_stream(stream)
     };
 
     let mut builder = Response::builder()

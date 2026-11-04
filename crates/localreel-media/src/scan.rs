@@ -4,12 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
-use localreel_kernel::storage::MediaUri;
+use localreel_kernel::storage::{LocalStorage, MediaUri, Storage, StorageRouter};
 use localreel_kernel::time::now_secs;
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::model::Source;
 
@@ -44,7 +43,8 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 /// Missing files are marked with `missing_at`; rows and user state are never
 /// deleted by a scan.
 pub fn discover_source(db: &Database, source: &Source) -> Result<ScanDiscovery> {
-    discover_source_with_cancel(db, source, &AtomicBool::new(false))
+    let storage = storage_for_source(source)?;
+    discover_source_with_storage(db, source, &storage, &AtomicBool::new(false))
 }
 
 /// Same as [`discover_source`], but stops walking/upserting when `cancel`
@@ -55,34 +55,24 @@ pub fn discover_source_with_cancel(
     source: &Source,
     cancel: &AtomicBool,
 ) -> Result<ScanDiscovery> {
-    let parsed = MediaUri::parse(&source.uri)?;
-    let root = match &parsed {
-        MediaUri::Local(path) => path.clone(),
-        MediaUri::Http(_) => {
-            return Err(KernelError::InvalidInput(
-                "HLS source discovery is deferred to a later phase".into(),
-            ))
-        }
-        MediaUri::S3 { .. } => {
-            return Err(KernelError::InvalidInput(
-                "S3 source discovery is not supported in v1".into(),
-            ))
-        }
-    };
+    let storage = storage_for_source(source)?;
+    discover_source_with_storage(db, source, &storage, cancel)
+}
 
-    let run_id = db.with_write(|connection| {
-        connection.execute(
-            "INSERT INTO scan_runs (source_id, source_uri, started_at, status)
-             VALUES (?1, ?2, ?3, 'running')",
-            params![source.id, source.uri, now_secs()],
-        )?;
-        Ok(connection.last_insert_rowid())
-    })?;
-
-    let root = match root.canonicalize() {
-        Ok(path) => path,
+/// The provider-based entry point. The media layer only sees [`Storage`], so a
+/// future WebDAV/SMB source can be scanned by passing its provider here.
+pub fn discover_source_with_storage(
+    db: &Database,
+    source: &Source,
+    storage: &dyn Storage,
+    cancel: &AtomicBool,
+) -> Result<ScanDiscovery> {
+    let root = MediaUri::parse(&source.uri)?;
+    let root_stat = match storage.stat(&root) {
+        Ok(stat) => stat,
         Err(error) => {
             let message = format!("source root is unavailable: {error}");
+            let run_id = start_run(db, source)?;
             finish_run(
                 db,
                 run_id,
@@ -101,8 +91,9 @@ pub fn discover_source_with_cancel(
             });
         }
     };
-    if !root.is_dir() {
+    if !root_stat.is_dir {
         let message = "source root is not a directory".to_string();
+        let run_id = start_run(db, source)?;
         finish_run(
             db,
             run_id,
@@ -121,13 +112,40 @@ pub fn discover_source_with_cancel(
         });
     }
 
+    let run_id = start_run(db, source)?;
+
     let existing = load_existing(db, source.id)?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut candidates = Vec::new();
     let mut issues: Vec<(String, String)> = Vec::new();
     let mut traversal_incomplete = false;
 
-    for entry in WalkDir::new(&root).follow_links(false) {
+    let walker = match storage.walk(&root) {
+        Ok(walker) => walker,
+        Err(error) => {
+            finish_run(
+                db,
+                run_id,
+                "failed",
+                ScanCounts {
+                    failed: 1,
+                    ..ScanCounts::default()
+                },
+                &[(
+                    source.uri.clone(),
+                    format!("cannot walk source root: {error}"),
+                )],
+            )?;
+            return Ok(ScanDiscovery {
+                run_id,
+                source_id: source.id,
+                status: "failed".to_string(),
+                ..ScanDiscovery::empty(source.id, run_id)
+            });
+        }
+    };
+
+    for entry in walker {
         if cancel.load(Ordering::Relaxed) {
             let counts = ScanCounts {
                 discovered: candidates.len(),
@@ -153,45 +171,40 @@ pub fn discover_source_with_cancel(
             Err(error) => {
                 traversal_incomplete = true;
                 issues.push((
-                    error
-                        .path()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| source.uri.clone()),
+                    source.uri.clone(),
                     format!("failed to read directory entry: {error}"),
                 ));
                 continue;
             }
         };
-        if !entry.file_type().is_file() || !is_video_path(entry.path()) {
+        if entry.is_dir {
             continue;
         }
-
-        let path = entry.path();
-        let uri = MediaUri::Local(path.to_path_buf()).to_uri();
-        seen.insert(uri.clone());
-
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                issues.push((uri, format!("failed to read file metadata: {error}")));
+        let path = match MediaUri::parse(&entry.uri) {
+            Ok(MediaUri::Local(path)) => path,
+            _ => {
+                issues.push((
+                    entry.uri.clone(),
+                    "storage returned an entry without a local path".to_string(),
+                ));
                 continue;
             }
         };
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| value.as_secs() as i64)
-            .unwrap_or(0);
+        if !is_video_path(&path) {
+            continue;
+        }
+
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.name.clone());
+        seen.insert(entry.uri.clone());
         candidates.push(Candidate {
-            uri,
+            uri: entry.uri,
             canonical_path: path.to_string_lossy().into_owned(),
-            filename: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown".to_string()),
-            file_size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            modified_at,
+            filename,
+            file_size: i64::try_from(entry.size).unwrap_or(i64::MAX),
+            modified_at: entry.modified.unwrap_or(0),
         });
     }
 
@@ -416,6 +429,32 @@ struct Candidate {
     modified_at: i64,
 }
 
+fn start_run(db: &Database, source: &Source) -> Result<i64> {
+    db.with_write(|connection| {
+        connection.execute(
+            "INSERT INTO scan_runs (source_id, source_uri, started_at, status)
+             VALUES (?1, ?2, ?3, 'running')",
+            params![source.id, source.uri, now_secs()],
+        )?;
+        Ok(connection.last_insert_rowid())
+    })
+}
+
+/// Build the storage provider for a source.
+///
+/// Local paths are the only registered provider today; a remote source is
+/// rejected here with a clear message until its provider is added to
+/// [`StorageRouter`].
+pub fn storage_for_source(source: &Source) -> Result<StorageRouter> {
+    match MediaUri::parse(&source.uri)? {
+        MediaUri::Local(path) => Ok(StorageRouter::new(LocalStorage::new([path])?)),
+        other => Err(KernelError::Storage(format!(
+            "no storage provider registered for {} sources",
+            other.kind()
+        ))),
+    }
+}
+
 fn load_existing(db: &Database, source_id: i64) -> Result<HashMap<String, ExistingMedia>> {
     db.with_read(|connection| {
         let mut statement = connection
@@ -511,6 +550,80 @@ mod tests {
         kernel_migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
         kernel_migrations::apply(&db, "media", migrations::list()).unwrap();
         (dir, db.clone(), MediaService::new(db))
+    }
+
+    /// A provider that serves a fixed list of entries. The files never exist on
+    /// disk, which proves discovery goes through `Storage` only.
+    struct MockStorage {
+        entries: Vec<localreel_kernel::storage::StorageEntry>,
+    }
+
+    impl Storage for MockStorage {
+        fn stat(&self, _uri: &MediaUri) -> Result<localreel_kernel::storage::FileStat> {
+            Ok(localreel_kernel::storage::FileStat {
+                size: 0,
+                modified: Some(0),
+                is_dir: true,
+            })
+        }
+
+        fn list(&self, _uri: &MediaUri) -> Result<Vec<localreel_kernel::storage::StorageEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        fn open_range(
+            &self,
+            _uri: &MediaUri,
+            _start: u64,
+            _len: u64,
+        ) -> Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn walk(
+            &self,
+            _root: &MediaUri,
+        ) -> Result<Box<dyn Iterator<Item = Result<localreel_kernel::storage::StorageEntry>> + Send>>
+        {
+            let entries = self.entries.clone();
+            Ok(Box::new(entries.into_iter().map(Ok)))
+        }
+    }
+
+    #[test]
+    fn scans_through_the_storage_provider_without_files_on_disk() {
+        let (dir, db, service) = setup();
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = service.add_source(root.to_str().unwrap()).unwrap();
+        let entry =
+            |name: &str, size: u64, modified: i64| localreel_kernel::storage::StorageEntry {
+                uri: MediaUri::Local(root.join(name)).to_uri(),
+                name: name.to_string(),
+                is_dir: false,
+                size,
+                modified: Some(modified),
+            };
+        let mock = MockStorage {
+            entries: vec![
+                entry("episode-01.mp4", 11, 100),
+                entry("episode-02.mkv", 22, 200),
+                entry("notes.txt", 3, 300),
+            ],
+        };
+
+        let discovery =
+            discover_source_with_storage(&db, &source, &mock, &AtomicBool::new(false)).unwrap();
+        assert_eq!(discovery.discovered, 2);
+        assert_eq!(discovery.added, 2);
+        let names: Vec<String> = db
+            .with_read(|conn| {
+                let mut statement = conn.prepare("SELECT filename FROM media ORDER BY filename")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+            })
+            .unwrap();
+        assert_eq!(names, vec!["episode-01.mp4", "episode-02.mkv"]);
     }
 
     #[test]
