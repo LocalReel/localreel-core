@@ -7,103 +7,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::MediaService;
 
-/// Backup format version. Mirrors `localreel-format` v2; core keeps a local
-/// copy so its CI stays a single-repo workspace until the format crate is
-/// published.
-pub const BACKUP_VERSION: u32 = 2;
-pub const MAX_BACKUP_SOURCES: usize = 256;
-pub const MAX_BACKUP_STATES: usize = 100_000;
+pub use localreel_format::{
+    artifact_dir_name, artifact_file_name, ArtifactKind, Backup, BackupState, FormatError,
+    BACKUP_FORMAT_VERSION, MAX_BACKUP_SOURCES, MAX_BACKUP_STATES,
+};
+
+/// Backup format version (shared with the format crate).
+pub const BACKUP_VERSION: u32 = BACKUP_FORMAT_VERSION;
 pub const MAX_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
 /// Uploaded restores use a separate, larger limit; the importer keeps 32 MiB.
 pub const MAX_BACKUP_RESTORE_BYTES: u64 = 512 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BackupState {
-    #[serde(default)]
-    pub uid: Option<String>,
-    pub path: String,
-    #[serde(default)]
-    pub liked: bool,
-    #[serde(default)]
-    pub favorite: bool,
-    #[serde(default)]
-    pub position: f64,
-    #[serde(default)]
-    pub duration: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Backup {
-    pub version: u32,
-    #[serde(default)]
-    pub created_at: Option<i64>,
-    #[serde(default)]
-    pub sources: Vec<String>,
-    #[serde(default)]
-    pub states: Vec<BackupState>,
-}
-
-impl Backup {
-    pub fn new() -> Self {
-        Self {
-            version: BACKUP_VERSION,
-            created_at: Some(localreel_kernel::time::now_secs()),
-            sources: Vec::new(),
-            states: Vec::new(),
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.version != BACKUP_VERSION {
-            return Err(KernelError::InvalidInput(format!(
-                "unsupported backup version {} (expected {BACKUP_VERSION})",
-                self.version
-            )));
-        }
-        if self.sources.len() > MAX_BACKUP_SOURCES {
-            return Err(KernelError::InvalidInput(format!(
-                "too many sources: {} (max {MAX_BACKUP_SOURCES})",
-                self.sources.len()
-            )));
-        }
-        if self.states.len() > MAX_BACKUP_STATES {
-            return Err(KernelError::InvalidInput(format!(
-                "too many states: {} (max {MAX_BACKUP_STATES})",
-                self.states.len()
-            )));
-        }
-        for source in &self.sources {
-            if source.trim().is_empty() {
-                return Err(KernelError::InvalidInput(
-                    "backup contains an empty source URI".into(),
-                ));
-            }
-        }
-        for state in &self.states {
-            if state.path.trim().is_empty() {
-                return Err(KernelError::InvalidInput(
-                    "backup contains an empty state path".into(),
-                ));
-            }
-            if !state.position.is_finite() || state.position < 0.0 {
-                return Err(KernelError::InvalidInput(
-                    "backup contains an invalid position".into(),
-                ));
-            }
-            if !state.duration.is_finite() || state.duration < 0.0 {
-                return Err(KernelError::InvalidInput(
-                    "backup contains an invalid duration".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for Backup {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Validate a backup with the shared format rules.
+pub fn validate_backup(backup: &Backup) -> Result<()> {
+    backup
+        .validate()
+        .map_err(|error| KernelError::InvalidInput(error.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,7 +57,7 @@ pub fn read_backup_with_limit(path: &Path, max_bytes: u64) -> Result<Backup> {
     let reader = std::io::BufReader::new(file);
     let backup: Backup = serde_json::from_reader(reader)
         .map_err(|error| KernelError::InvalidInput(format!("invalid backup JSON: {error}")))?;
-    backup.validate()?;
+    validate_backup(&backup)?;
     Ok(backup)
 }
 
@@ -155,7 +74,7 @@ pub fn parse_backup_with_limit(bytes: &[u8], max_bytes: u64) -> Result<Backup> {
     }
     let backup: Backup = serde_json::from_slice(bytes)
         .map_err(|error| KernelError::InvalidInput(format!("invalid backup JSON: {error}")))?;
-    backup.validate()?;
+    validate_backup(&backup)?;
     Ok(backup)
 }
 
@@ -197,12 +116,12 @@ pub fn export_backup(db: &Database) -> Result<Backup> {
         sources,
         states,
     };
-    backup.validate()?;
+    validate_backup(&backup)?;
     Ok(backup)
 }
 
 pub fn import_backup(db: &Database, backup: &Backup, dry_run: bool) -> Result<BackupImportReport> {
-    backup.validate()?;
+    validate_backup(&backup)?;
     let service = MediaService::new(db.clone());
     let mut report = BackupImportReport {
         dry_run,
@@ -430,6 +349,6 @@ mod tests {
     fn rejects_unsupported_versions() {
         let mut backup = Backup::new();
         backup.version = 99;
-        assert!(backup.validate().is_err());
+        assert!(validate_backup(&backup).is_err());
     }
 }

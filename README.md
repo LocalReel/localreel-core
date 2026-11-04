@@ -29,6 +29,7 @@ persistent job queue.
 ## Workspace
 
 ```text
+crates/localreel-format/   versioned backup/artifact schema (no I/O)
 crates/localreel-kernel/   generic capabilities: config, db, jobs, events,
                            storage, media-ops (typed ffmpeg)
 crates/localreel-media/    media domain: sources, scan, metadata, state,

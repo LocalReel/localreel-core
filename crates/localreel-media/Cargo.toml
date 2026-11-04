@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 localreel-kernel = { path = "../localreel-kernel" }
+localreel-format = { path = "../localreel-format" }
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

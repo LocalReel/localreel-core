@@ -7,6 +7,7 @@ use localreel_kernel::media_ops::MediaOps;
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
+use crate::backup::validate_backup;
 use crate::backup::{import_backup, Backup};
 use crate::scan::discover_source;
 use crate::service::MediaService;
@@ -37,7 +38,7 @@ pub fn restore_backup(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32, &str),
 ) -> Result<RestoreReport> {
-    backup.validate()?;
+    validate_backup(&backup)?;
     let mut report = RestoreReport {
         dry_run,
         sources: backup.sources.len(),

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/localreel-format",
     "crates/localreel-kernel",
     "crates/localreel-media",
     "crates/localreel-api",

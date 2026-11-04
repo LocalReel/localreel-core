@@ -1,0 +1,12 @@
+[package]
+name = "localreel-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned backup and artifact formats shared by the LocalReel crates"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -14,12 +14,13 @@ independent consumer.
 
 - Product name: **LocalReel**. Repositories use the `localreel-` prefix.
 - v1 repositories:
-  - `localreel-core` — server workspace (kernel/media/api/server), migrations,
+  - `localreel-core` — server workspace (kernel/media/api/server) plus the
+    `localreel-format` crate for the shared backup/artifact schema, migrations,
     ADRs, CI.
   - `localreel-web` — React UI.
-  - `localreel-format` — standalone format crate (backup/artifact naming). Not a
-    build dependency of `localreel-core` yet; it becomes one when the backup
-    API is implemented, either as a published crate or a workspace crate.
+- `localreel-format` was extracted early, but with no independent consumer the
+  crate now lives in `localreel-core/crates/localreel-format`; the standalone
+  repository is archived.
 - Reserved names, created only when a real consumer exists:
   `localreel-cli`, `localreel-protocol`, `localreel-sdk`,
   `localreel-ffmpeg-release`, `localreel-toolchains`, `localreel-link`.
@@ -33,6 +34,6 @@ independent consumer.
 
 - CI for `localreel-core` is a normal single-repo workspace; no cross-repo
   checkout tricks.
-- `localreel-format` can be published independently later, but v1 does not
-  block on it.
+- The backup format is a workspace crate, so schema changes and migrations land
+  in the same commit and release.
 - Adding a repository is a product decision, not a default.

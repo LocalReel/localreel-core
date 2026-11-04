@@ -542,6 +542,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "localreel-format"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "localreel-kernel"
 version = "0.4.1"
 dependencies = [
@@ -561,6 +569,7 @@ dependencies = [
 name = "localreel-media"
 version = "0.4.1"
 dependencies = [
+ "localreel-format",
  "localreel-kernel",
  "regex",
  "rusqlite",
