@@ -12,6 +12,7 @@ pub mod model;
 pub mod playback;
 pub mod restore;
 pub mod scan;
+pub mod series;
 pub mod service;
 pub mod state_migration;
 

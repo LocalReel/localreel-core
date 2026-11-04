@@ -13,6 +13,10 @@ use walkdir::WalkDir;
 
 use crate::model::Source;
 
+/// Bump when the series parser's output changes so existing rows are recomputed
+/// on the next scan (see `media.series_rev`).
+const SERIES_REV: i64 = 1;
+
 /// Result of one discovery pass (no probe/thumbnail yet).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanDiscovery {
@@ -242,6 +246,8 @@ pub fn discover_source_with_cancel(
                 }
             }
 
+            let series = crate::series::derive(&candidate.canonical_path, &candidate.filename);
+            let series_rev = SERIES_REV;
             match existing.get(&candidate.uri) {
                 Some(existing) => {
                     let changed = existing.file_size != candidate.file_size
@@ -251,14 +257,21 @@ pub fn discover_source_with_cancel(
                             "UPDATE media SET
                                  canonical_path = ?1, filename = ?2,
                                  file_size = ?3, modified_at = ?4,
+                                 series_key = ?5, series_title = ?6,
+                                 episode = ?7, is_extra = ?8, series_rev = ?9,
                                  thumbnail_path = NULL, missing_at = NULL,
-                                 updated_at = ?5
-                             WHERE id = ?6",
+                                 updated_at = ?10
+                             WHERE id = ?11",
                             params![
                                 candidate.canonical_path,
                                 candidate.filename,
                                 candidate.file_size,
                                 candidate.modified_at,
+                                series.key,
+                                series.title,
+                                series.episode,
+                                series.is_extra as i64,
+                                series_rev,
                                 now,
                                 existing.id
                             ],
@@ -269,6 +282,20 @@ pub fn discover_source_with_cancel(
                             "UPDATE media SET missing_at = NULL WHERE id = ?1 AND missing_at IS NOT NULL",
                             [existing.id],
                         )?;
+                        // Backfill rows created before the series migration.
+                        transaction.execute(
+                            "UPDATE media SET series_key = ?2, series_title = ?3,
+                                 episode = ?4, is_extra = ?5, series_rev = ?6
+                             WHERE id = ?1 AND series_rev < ?6",
+                            params![
+                                existing.id,
+                                series.key,
+                                series.title,
+                                series.episode,
+                                series.is_extra as i64,
+                                series_rev
+                            ],
+                        )?;
                         unchanged += 1;
                     }
                 }
@@ -277,8 +304,9 @@ pub fn discover_source_with_cancel(
                     transaction.execute(
                         "INSERT INTO media (
                              uid, source_id, uri, canonical_path, filename, title,
+                             series_key, series_title, episode, is_extra, series_rev,
                              file_size, modified_at, created_at, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
                         params![
                             uid,
                             source.id,
@@ -286,6 +314,11 @@ pub fn discover_source_with_cancel(
                             candidate.canonical_path,
                             candidate.filename,
                             derive_title(&candidate.filename),
+                            series.key,
+                            series.title,
+                            series.episode,
+                            series.is_extra as i64,
+                            series_rev,
                             candidate.file_size,
                             candidate.modified_at,
                             now
