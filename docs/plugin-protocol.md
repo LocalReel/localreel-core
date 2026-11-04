@@ -132,9 +132,9 @@ base_url = "https://dav.example.test/dav"
 username = "reader"
 ```
 
-The package is extracted under `<data>/plugins/<id>/<version>/` and the plan is
-to hand the `config` table to the plugin as `LOCALREEL_PLUGIN_CONFIG`. A source
-then names the plugin kind:
+The package is extracted under `<data>/plugins/<id>/<version>/`; the `config`
+table is handed to the plugin as `LOCALREEL_PLUGIN_CONFIG`. A source then names
+the plugin kind:
 
 ```http
 POST /api/v1/sources
