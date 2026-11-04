@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::backup::{read_backup_with_limit, Backup, MAX_BACKUP_RESTORE_BYTES};
 use crate::playback::{preset_by_name, DEFAULT_TRANSCODE_PRESET};
 use crate::restore::restore_backup;
-use crate::scan::discover_source_with_cancel;
+use crate::scan::discover_source_with_storage;
 use crate::service::MediaService;
+use crate::storage::StorageRegistry;
 
 /// Job priority for thumbnails. Higher than the queue default (0) so short,
 /// user-visible thumbnail work overtakes a bulk probe backlog instead of
@@ -36,6 +37,7 @@ struct Shared {
     media_ops: Arc<MediaOps>,
     thumbnail_dir: PathBuf,
     transcode_dir: PathBuf,
+    storage: Arc<StorageRegistry>,
 }
 
 impl MediaJobs {
@@ -45,12 +47,30 @@ impl MediaJobs {
         thumbnail_dir: PathBuf,
         transcode_dir: PathBuf,
     ) -> Self {
+        Self::with_storage(
+            db,
+            media_ops,
+            thumbnail_dir,
+            transcode_dir,
+            Arc::new(StorageRegistry::new()),
+        )
+    }
+
+    /// Build handlers whose sources can resolve plugin-provided storage.
+    pub fn with_storage(
+        db: Database,
+        media_ops: Arc<MediaOps>,
+        thumbnail_dir: PathBuf,
+        transcode_dir: PathBuf,
+        storage: Arc<StorageRegistry>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 db,
                 media_ops,
                 thumbnail_dir,
                 transcode_dir,
+                storage,
             }),
         }
     }
@@ -80,7 +100,7 @@ impl JobHandler for ScanSourceHandler {
 
     fn run(&self, context: &JobContext) -> Result<JobOutcome> {
         let payload: ScanPayload = context.payload()?;
-        let service = MediaService::new(self.0.db.clone());
+        let service = MediaService::with_storage(self.0.db.clone(), self.0.storage.clone());
         let source = service
             .get_source(payload.source_id)?
             .ok_or_else(|| KernelError::NotFound(format!("source {}", payload.source_id)))?;
@@ -98,7 +118,13 @@ impl JobHandler for ScanSourceHandler {
         }
 
         context.report_progress(0.05, Some("discovering"));
-        let discovery = discover_source_with_cancel(&self.0.db, &source, &context.cancel_flag())?;
+        let provider = service.storage_for(&source)?;
+        let discovery = discover_source_with_storage(
+            &self.0.db,
+            &source,
+            provider.as_ref(),
+            &context.cancel_flag(),
+        )?;
         if discovery.status == "canceled" {
             return JobOutcome::json(discovery);
         }

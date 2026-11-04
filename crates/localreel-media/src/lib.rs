@@ -15,6 +15,7 @@ pub mod scan;
 pub mod series;
 pub mod service;
 pub mod state_migration;
+pub mod storage;
 
 pub use backup::{
     export_backup, import_backup, parse_backup, read_backup, read_backup_with_limit, Backup,
@@ -32,3 +33,4 @@ pub use service::MediaService;
 pub use state_migration::{
     episode_key, migrate_legacy_state, StateMigrationDetail, StateMigrationReport,
 };
+pub use storage::StorageRegistry;

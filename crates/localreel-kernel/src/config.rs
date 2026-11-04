@@ -23,6 +23,18 @@ pub struct Config {
     pub allow_remote: bool,
     pub jobs: JobsConfig,
     pub media: MediaConfig,
+    /// Sidecar plugins to start with the server (packages on disk).
+    pub plugins: Vec<PluginConfig>,
+}
+
+/// One configured sidecar plugin.
+#[derive(Debug, Clone)]
+pub struct PluginConfig {
+    /// Path to the `.lrplug` package.
+    pub package: PathBuf,
+    pub enabled: bool,
+    /// JSON handed to the plugin via `LOCALREEL_PLUGIN_CONFIG`.
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +89,7 @@ impl Default for Config {
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
             },
+            plugins: Vec::new(),
         }
     }
 }
@@ -178,6 +191,17 @@ impl Config {
         if let Some(value) = file.media.cache_max_age_hours {
             self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
         }
+        if !file.plugins.is_empty() {
+            self.plugins = file
+                .plugins
+                .into_iter()
+                .map(|plugin| PluginConfig {
+                    package: plugin.package,
+                    enabled: plugin.enabled,
+                    config: plugin.config,
+                })
+                .collect();
+        }
         Ok(())
     }
 
@@ -262,6 +286,13 @@ impl Config {
                 self.host
             )));
         }
+        for plugin in &self.plugins {
+            if plugin.package.as_os_str().is_empty() {
+                return Err(KernelError::Config(
+                    "plugin package path must not be empty".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -319,6 +350,21 @@ struct ConfigFile {
     jobs: JobsFile,
     #[serde(default)]
     media: MediaFile,
+    #[serde(default)]
+    plugins: Vec<PluginFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginFile {
+    package: PathBuf,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -427,6 +473,25 @@ fn env_bool(key: &str) -> Result<Option<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_plugin_entries() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+            [[plugins]]
+            package = "C:/plugins/demo.lrplug"
+            enabled = false
+            [plugins.config]
+            root = "D:/library"
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert!(!config.plugins[0].enabled);
+        assert_eq!(config.plugins[0].config["root"], "D:/library");
+    }
 
     #[test]
     fn loopback_hosts_are_accepted() {

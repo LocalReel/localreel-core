@@ -15,6 +15,7 @@ path = "src/main.rs"
 localreel-kernel = { path = "../localreel-kernel" }
 localreel-media = { path = "../localreel-media" }
 localreel-api = { path = "../localreel-api" }
+localreel-plugin = { path = "../localreel-plugin" }
 axum.workspace = true
 anyhow.workspace = true
 clap.workspace = true

@@ -6,6 +6,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
+use anyhow::Context;
 use localreel_api::AppState;
 use localreel_kernel::config::Config;
 use localreel_kernel::db::Database;
@@ -410,7 +411,33 @@ async fn serve() -> anyhow::Result<()> {
 
     let events = EventBus::new(256);
     let jobs = JobQueue::new(db.clone(), events.clone());
-    let media = MediaService::new(db.clone());
+
+    // Start configured sidecar plugins before anything resolves a source.
+    let storage = Arc::new(localreel_media::StorageRegistry::new());
+    let mut plugin_runtimes = Vec::new();
+    for plugin in config.plugins.iter().filter(|plugin| plugin.enabled) {
+        let manifest = localreel_plugin::inspect(&plugin.package)
+            .with_context(|| format!("plugin package {}", plugin.package.display()))?;
+        let install = config
+            .data_dir
+            .join("plugins")
+            .join(&manifest.id)
+            .join(&manifest.version);
+        let manifest = localreel_plugin::extract(&plugin.package, &install)?;
+        let program = install.join(&manifest.entry.program);
+        let runtime = Arc::new(localreel_plugin::PluginRuntime::start(
+            &program,
+            &manifest,
+            &plugin.config,
+        )?);
+        storage.register(
+            manifest.id.clone(),
+            Arc::new(localreel_plugin::PluginStorage::new(runtime.clone())),
+        );
+        info!(id = %manifest.id, version = %manifest.version, "plugin started");
+        plugin_runtimes.push(runtime);
+    }
+    let media = MediaService::with_storage(db.clone(), storage.clone());
     let media_ops = Arc::new(MediaOps::discover(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
@@ -427,11 +454,12 @@ async fn serve() -> anyhow::Result<()> {
 
     // Kernel workers are generic; the media crate registers the domain handlers.
     let mut registry = JobRegistry::new();
-    localreel_media::MediaJobs::new(
+    localreel_media::MediaJobs::with_storage(
         db.clone(),
         media_ops.clone(),
         config.media.thumbnail_dir.clone(),
         config.media.transcode_dir.clone(),
+        storage.clone(),
     )
     .register(&mut registry);
     let registry = Arc::new(registry);

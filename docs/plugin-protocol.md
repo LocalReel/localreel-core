@@ -116,3 +116,30 @@ mtime, so providers should return a value that changes when the object changes.
 - **No host database access**: plugins receive no SQLite handle and no session.
   A storage plugin sees only the URIs the host asks about and the configuration
   it was started with.
+
+## Host configuration
+
+The server starts enabled plugins at boot and registers each provider under the
+plugin id, which becomes the source `kind`:
+
+```toml
+[[plugins]]
+package = "plugins/webdav.lrplug"
+enabled = true
+
+[plugins.config]
+base_url = "https://dav.example.test/dav"
+username = "reader"
+```
+
+The package is extracted under `<data>/plugins/<id>/<version>/` and the plan is
+to hand the `config` table to the plugin as `LOCALREEL_PLUGIN_CONFIG`. A source
+then names the plugin kind:
+
+```http
+POST /api/v1/sources
+{"uri": "https://dav.example.test/dav/library", "kind": "webdav"}
+```
+
+Sources without a `kind` keep the local behaviour (existing directories are
+canonicalized; other URI schemes map to their legacy kinds).

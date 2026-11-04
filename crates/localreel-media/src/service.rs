@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::media_ops::ProbeResult;
-use localreel_kernel::storage::{normalize_local_path, MediaUri};
+use localreel_kernel::storage::{normalize_local_path, MediaUri, Storage};
 use localreel_kernel::time::now_secs;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBehavior};
@@ -12,6 +13,7 @@ use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBeha
 use crate::model::{
     CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
 };
+use crate::storage::StorageRegistry;
 
 /// First-party media service.
 ///
@@ -21,11 +23,24 @@ use crate::model::{
 #[derive(Clone)]
 pub struct MediaService {
     db: Database,
+    storage: Arc<StorageRegistry>,
 }
 
 impl MediaService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            storage: Arc::new(StorageRegistry::new()),
+        }
+    }
+
+    /// Build a service whose sources can resolve plugin-provided storage.
+    pub fn with_storage(db: Database, storage: Arc<StorageRegistry>) -> Self {
+        Self { db, storage }
+    }
+
+    pub fn storage_for(&self, source: &Source) -> Result<Arc<dyn Storage>> {
+        self.storage.for_source(source)
     }
 
     pub fn get_source(&self, id: i64) -> Result<Option<Source>> {
@@ -68,30 +83,48 @@ impl MediaService {
     /// must exist; duplicates are returned as-is.
     pub fn add_source(&self, raw_uri: &str) -> Result<Source> {
         let parsed = MediaUri::parse(raw_uri)?;
-        let normalized = match parsed {
-            MediaUri::Local(path) => {
-                let canonical = path.canonicalize().map_err(|error| {
-                    KernelError::InvalidInput(format!(
-                        "source does not exist: {} ({error})",
-                        path.display()
-                    ))
-                })?;
-                if !canonical.is_dir() {
-                    return Err(KernelError::InvalidInput(format!(
-                        "source is not a directory: {}",
-                        canonical.display()
-                    )));
-                }
-                MediaUri::Local(canonical)
-            }
-            other => other,
-        };
-        let uri = normalized.to_uri();
-        let kind = match normalized {
+        let kind = match &parsed {
             MediaUri::Local(_) => "local",
             MediaUri::Http(_) => "hls",
             MediaUri::S3 { .. } => "s3",
         };
+        self.add_source_with_kind(raw_uri, kind)
+    }
+
+    /// Add a source whose kind is served by a registered provider.
+    ///
+    /// `local` is canonicalized and must be an existing directory; other kinds
+    /// must be registered and keep the URI as parsed.
+    pub fn add_source_with_kind(&self, raw_uri: &str, kind: &str) -> Result<Source> {
+        if !self.storage.has(kind) {
+            return Err(KernelError::InvalidInput(format!(
+                "no storage provider registered for source kind '{kind}'"
+            )));
+        }
+        let parsed = MediaUri::parse(raw_uri)?;
+        let normalized = if kind == "local" {
+            match parsed {
+                MediaUri::Local(path) => {
+                    let canonical = path.canonicalize().map_err(|error| {
+                        KernelError::InvalidInput(format!(
+                            "source does not exist: {} ({error})",
+                            path.display()
+                        ))
+                    })?;
+                    if !canonical.is_dir() {
+                        return Err(KernelError::InvalidInput(format!(
+                            "source is not a directory: {}",
+                            canonical.display()
+                        )));
+                    }
+                    MediaUri::Local(canonical)
+                }
+                other => other,
+            }
+        } else {
+            parsed
+        };
+        let uri = normalized.to_uri();
         let now = now_secs();
 
         self.db.with_write(|connection| {

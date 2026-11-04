@@ -22,7 +22,6 @@ use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::{MediaUri, Storage};
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
-use localreel_media::scan::storage_for_source;
 use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media,
     MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
@@ -435,13 +434,18 @@ async fn list_sources(
 #[derive(Debug, Deserialize)]
 struct AddSourceRequest {
     uri: String,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn add_source(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AddSourceRequest>,
 ) -> Result<Response, ApiError> {
-    let source = state.media.add_source(&payload.uri)?;
+    let source = match payload.kind.as_deref() {
+        Some(kind) => state.media.add_source_with_kind(&payload.uri, kind)?,
+        None => state.media.add_source(&payload.uri)?,
+    };
     Ok((StatusCode::CREATED, Json(source)).into_response())
 }
 
@@ -814,13 +818,13 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
         .media
         .get_source(media.source_id)?
         .ok_or_else(|| ApiError::not_found("media source is missing"))?;
-    let storage: Arc<dyn Storage> = Arc::new(storage_for_source(&source).map_err(|error| {
+    let storage: Arc<dyn Storage> = state.media.storage_for(&source).map_err(|error| {
         ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
             "not_implemented",
             format!("no storage provider for this source: {error}"),
         )
-    })?);
+    })?;
     let stat = storage.stat(&uri).map_err(|error| match error {
         localreel_kernel::error::KernelError::NotFound(_) => {
             ApiError::not_found("media file is missing")

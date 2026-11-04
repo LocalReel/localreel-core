@@ -64,7 +64,7 @@ impl PluginRuntime {
             .env("LOCALREEL_PLUGIN_ID", &manifest.id)
             .env("LOCALREEL_PLUGIN_TOKEN", &token)
             .env("LOCALREEL_PLUGIN_CONFIG", &config)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
@@ -130,7 +130,14 @@ impl PluginRuntime {
         };
         let ready: Ready = serde_json::from_str(ready_line.trim()).map_err(|error| {
             kill(&mut child);
-            PluginError::NotReady(format!("invalid ready line: {error}"))
+            let tail = stderr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            PluginError::NotReady(format!(
+                "invalid ready line {ready_line:?}: {error}; stderr: {}",
+                String::from_utf8_lossy(&tail).trim()
+            ))
         })?;
         if !ready.ready || ready.port == 0 {
             kill(&mut child);

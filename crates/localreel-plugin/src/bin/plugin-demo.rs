@@ -25,6 +25,15 @@ fn main() {
         .expect("LOCALREEL_PLUGIN_CONFIG must contain root");
     let root = root.canonicalize().expect("plugin root must exist");
 
+    // Exit when the host closes stdin (normal shutdown or a crash that drops the
+    // pipe), so no orphan process keeps the plugin port alive.
+    std::thread::spawn(|| {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0u8; 64];
+        while matches!(stdin.read(&mut buffer), Ok(read) if read > 0) {}
+        std::process::exit(0);
+    });
+
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     println!("{}", json!({ "ready": true, "port": port }));
