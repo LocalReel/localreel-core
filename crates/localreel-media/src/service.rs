@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use localreel_kernel::db::Database;
@@ -10,7 +10,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row};
 
 use crate::model::{
-    CacheGcReport, CacheStats, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
+    CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
 };
 
 /// First-party media service.
@@ -478,6 +478,55 @@ impl MediaService {
         })
     }
 
+    /// Ranked feed: continue-watching first, then unwatched episodes in series
+    /// order, then already-watched items. Extras and missing files never enter
+    /// the feed. Returns `(items, total)` where `total` is the candidate count
+    /// before the limit.
+    pub fn feed(&self, limit: i64) -> Result<(Vec<FeedItem>, i64)> {
+        let limit = limit.clamp(1, 200) as usize;
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.id, m.title, m.filename, m.series_key, m.series_title,
+                        m.episode, m.width, m.height,
+                        COALESCE(m.duration, s.duration, 0.0),
+                        COALESCE(s.position, 0.0),
+                        COALESCE(s.updated_at, 0),
+                        COALESCE(s.favorite, 0),
+                        COALESCE(s.liked, 0),
+                        m.created_at
+                 FROM media m
+                 JOIN sources src ON src.id = m.source_id
+                 LEFT JOIN media_state s ON s.media_id = m.id
+                 WHERE src.archived_at IS NULL
+                   AND m.missing_at IS NULL
+                   AND m.is_extra = 0",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(FeedCandidate {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    filename: row.get(2)?,
+                    series_key: row.get(3)?,
+                    series_title: row.get(4)?,
+                    episode: row.get(5)?,
+                    width: row.get(6)?,
+                    height: row.get(7)?,
+                    duration: row.get(8)?,
+                    position: row.get(9)?,
+                    state_updated_at: row.get(10)?,
+                    favorite: row.get::<_, i64>(11)? != 0,
+                    liked: row.get::<_, i64>(12)? != 0,
+                    created_at: row.get(13)?,
+                })
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                candidates.push(row?);
+            }
+            Ok(rank_feed(candidates, limit))
+        })
+    }
+
     /// Update the metadata fields produced by `ffprobe`.
     pub fn update_probe(&self, media_id: i64, probe: &ProbeResult) -> Result<()> {
         self.db.with_write(|connection| {
@@ -915,6 +964,173 @@ fn is_safe_variant_name(name: &str) -> bool {
     path.components().count() == 1 && path.file_name().is_some()
 }
 
+/// One row considered for the feed, before ranking.
+#[derive(Debug, Clone)]
+struct FeedCandidate {
+    id: i64,
+    title: Option<String>,
+    filename: String,
+    series_key: Option<String>,
+    series_title: Option<String>,
+    episode: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    duration: f64,
+    position: f64,
+    state_updated_at: i64,
+    favorite: bool,
+    liked: bool,
+    created_at: i64,
+}
+
+impl FeedCandidate {
+    fn finished(&self) -> bool {
+        self.position > 0.0 && self.duration > 0.0 && self.position >= self.duration - 15.0
+    }
+}
+
+/// Rank candidates and keep at most `limit` items.
+///
+/// Order: continue-watching (most recently resumed first), then unwatched
+/// episodes grouped by series (newest series first, episodes ascending), then
+/// unwatched single items (newest first), then finished items.
+fn rank_feed(candidates: Vec<FeedCandidate>, limit: usize) -> (Vec<FeedItem>, i64) {
+    use std::cmp::Ordering;
+
+    let total = candidates.len() as i64;
+
+    // Next episode per series, for autoplay.
+    let mut series_episodes: HashMap<&str, Vec<(i64, i64)>> = HashMap::new();
+    for candidate in &candidates {
+        if let (Some(key), Some(episode)) = (candidate.series_key.as_deref(), candidate.episode) {
+            series_episodes
+                .entry(key)
+                .or_default()
+                .push((episode, candidate.id));
+        }
+    }
+    for episodes in series_episodes.values_mut() {
+        episodes.sort_unstable();
+    }
+    let mut next_by_id: HashMap<i64, i64> = HashMap::new();
+    for episodes in series_episodes.values() {
+        for window in episodes.windows(2) {
+            next_by_id.insert(window[0].1, window[1].1);
+        }
+    }
+
+    let mut ordered: Vec<&FeedCandidate> = Vec::with_capacity(candidates.len());
+    let mut seen: HashSet<i64> = HashSet::new();
+    fn push<'a>(
+        ordered: &mut Vec<&'a FeedCandidate>,
+        seen: &mut HashSet<i64>,
+        candidate: &'a FeedCandidate,
+    ) {
+        if seen.insert(candidate.id) {
+            ordered.push(candidate);
+        }
+    }
+
+    let mut resume: Vec<&FeedCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.position > 0.0 && !candidate.finished())
+        .collect();
+    resume.sort_by(|left, right| {
+        right
+            .state_updated_at
+            .cmp(&left.state_updated_at)
+            .then(right.id.cmp(&left.id))
+    });
+    for candidate in resume {
+        push(&mut ordered, &mut seen, candidate);
+    }
+
+    let mut groups: HashMap<&str, Vec<&FeedCandidate>> = HashMap::new();
+    for candidate in &candidates {
+        if candidate.position > 0.0 {
+            continue;
+        }
+        if let Some(key) = candidate.series_key.as_deref() {
+            groups.entry(key).or_default().push(candidate);
+        }
+    }
+    let mut groups: Vec<(&str, Vec<&FeedCandidate>)> = groups.into_iter().collect();
+    groups.sort_by(|left, right| {
+        let newest = |episodes: &[&FeedCandidate]| {
+            episodes
+                .iter()
+                .map(|candidate| candidate.created_at)
+                .max()
+                .unwrap_or(0)
+        };
+        newest(&right.1)
+            .cmp(&newest(&left.1))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    for (_, mut episodes) in groups {
+        episodes.sort_by(|left, right| match (left.episode, right.episode) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => left.filename.cmp(&right.filename),
+        });
+        for candidate in episodes {
+            push(&mut ordered, &mut seen, candidate);
+        }
+    }
+
+    let mut singles: Vec<&FeedCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.position <= 0.0 && candidate.series_key.is_none())
+        .collect();
+    singles.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then(right.id.cmp(&left.id))
+    });
+    for candidate in singles {
+        push(&mut ordered, &mut seen, candidate);
+    }
+
+    let mut finished: Vec<&FeedCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.finished())
+        .collect();
+    finished.sort_by(|left, right| {
+        right
+            .state_updated_at
+            .cmp(&left.state_updated_at)
+            .then(right.id.cmp(&left.id))
+    });
+    for candidate in finished {
+        push(&mut ordered, &mut seen, candidate);
+    }
+
+    let items = ordered
+        .into_iter()
+        .take(limit)
+        .map(|candidate| FeedItem {
+            id: candidate.id,
+            title: candidate.title.clone(),
+            filename: candidate.filename.clone(),
+            series_key: candidate.series_key.clone(),
+            series_title: candidate.series_title.clone(),
+            episode: candidate.episode,
+            width: candidate.width,
+            height: candidate.height,
+            duration: candidate.duration,
+            position: candidate.position,
+            finished: candidate.finished(),
+            favorite: candidate.favorite,
+            liked: candidate.liked,
+            next_id: next_by_id.get(&candidate.id).copied(),
+            created_at: candidate.created_at,
+        })
+        .collect();
+    (items, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,4 +1455,65 @@ mod tests {
         assert!(!state.liked);
         assert_eq!(state.position, 0.0);
     }
+    fn candidate(
+        id: i64,
+        series: Option<&str>,
+        episode: Option<i64>,
+        created_at: i64,
+        position: f64,
+        duration: f64,
+    ) -> FeedCandidate {
+        FeedCandidate {
+            id,
+            title: None,
+            filename: format!("{id}.mp4"),
+            series_key: series.map(str::to_string),
+            series_title: series.map(str::to_string),
+            episode,
+            width: None,
+            height: None,
+            duration,
+            position,
+            state_updated_at: if position > 0.0 { created_at } else { 0 },
+            favorite: false,
+            liked: false,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn feed_ranks_continue_then_series_then_movies_then_finished() {
+        let candidates = vec![
+            candidate(1, Some("a"), Some(1), 100, 1400.0, 1400.0),
+            candidate(2, Some("a"), Some(2), 200, 500.0, 1400.0),
+            candidate(3, Some("a"), Some(3), 300, 0.0, 1400.0),
+            candidate(4, None, None, 500, 0.0, 7200.0),
+            candidate(5, Some("b"), Some(1), 400, 0.0, 1400.0),
+        ];
+        let (items, total) = rank_feed(candidates, 10);
+        assert_eq!(total, 5);
+        let ids: Vec<i64> = items.iter().map(|item| item.id).collect();
+        // continue (2), newest series first (b=5), then a=3, then the movie, then finished.
+        assert_eq!(ids, vec![2, 5, 3, 4, 1]);
+        let next = |id: i64| items.iter().find(|item| item.id == id).unwrap().next_id;
+        assert_eq!(next(1), Some(2));
+        assert_eq!(next(2), Some(3));
+        assert_eq!(next(3), None);
+        assert_eq!(next(4), None);
+    }
+
+    #[test]
+    fn feed_respects_the_limit() {
+        let candidates = vec![
+            candidate(1, Some("a"), Some(1), 100, 0.0, 100.0),
+            candidate(2, Some("a"), Some(2), 200, 0.0, 100.0),
+            candidate(3, Some("a"), Some(3), 300, 0.0, 100.0),
+        ];
+        let (items, total) = rank_feed(candidates, 2);
+        assert_eq!(total, 3);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, 1);
+        assert_eq!(items[1].id, 2);
+    }
+
 }

@@ -55,6 +55,32 @@ pub struct Media {
     pub updated_at: i64,
 }
 
+/// One item of the scrollable feed.
+///
+/// The feed is a ranked view over the library, not a raw page: the server
+/// decides what plays next (continue-watching first, then unwatched episodes in
+/// series order, then already-watched items).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedItem {
+    pub id: i64,
+    pub title: Option<String>,
+    pub filename: String,
+    pub series_key: Option<String>,
+    pub series_title: Option<String>,
+    pub episode: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub duration: f64,
+    pub position: f64,
+    pub finished: bool,
+    pub favorite: bool,
+    pub liked: bool,
+    /// Next episode in the same series, for autoplay; `None` for movies or the
+    /// last episode.
+    pub next_id: Option<i64>,
+    pub created_at: i64,
+}
+
 /// Per-media user state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaState {

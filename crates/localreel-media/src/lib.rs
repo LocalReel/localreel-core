@@ -23,8 +23,8 @@ pub use backup::{
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
 pub use model::{
-    CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter, MediaState, MediaVariant,
-    RemapReport, ScanIssue, ScanRun, Source,
+    CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media, MediaFilter, MediaState,
+    MediaVariant, RemapReport, ScanIssue, ScanRun, Source,
 };
 pub use restore::{restore_backup, RestoreReport};
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};

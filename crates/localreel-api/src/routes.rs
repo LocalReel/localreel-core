@@ -24,7 +24,7 @@ use localreel_kernel::storage::MediaUri;
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
 use localreel_media::{
-    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, Media, MediaFilter,
+    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media, MediaFilter,
     MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
 
@@ -59,6 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sources/:id/scan", post(scan_source))
         .route("/api/v1/sources/:id/remap", post(remap_source))
         .route("/api/v1/media", get(list_media))
+        .route("/api/v1/feed", get(feed))
         .route("/api/v1/search", get(search_media))
         .route("/api/v1/media/:id", get(get_media))
         .route("/api/v1/media/:id/state", get(get_state).put(put_state))
@@ -478,6 +479,23 @@ struct MediaPage {
     items: Vec<Media>,
     total: i64,
     next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeedPage {
+    items: Vec<FeedItem>,
+    total: i64,
+}
+
+/// Ranked feed for the scroll view: continue-watching first, then unwatched
+/// episodes in series order, then already-watched items.
+async fn feed(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<FeedPage>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let (items, total) = state.media.feed(limit)?;
+    Ok(Json(FeedPage { items, total }))
 }
 
 async fn list_media(
