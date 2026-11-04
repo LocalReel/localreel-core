@@ -247,7 +247,7 @@ mod tests {
             r"\\?\D:\library\flip flapper\FLIP FLAPPERS 02话.mp4",
             "FLIP FLAPPERS 02话.mp4",
         );
-        assert_eq!(info.key, "i:/library/flip flapper");
+        assert_eq!(info.key, "d:/library/flip flapper");
         assert_eq!(info.title, "flip flapper");
         assert_eq!(info.episode, Some(2));
         assert!(!info.is_extra);
