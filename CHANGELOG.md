@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-04
+
+The scroll feed becomes real: series-aware, server-ranked, with an endpoint the
+UI can autoplay from.
+
+### Added
+
+- **`GET /api/v1/feed`** — ranked view over the library: continue-watching
+  first, then unwatched episodes grouped by series in episode order, then
+  unwatched single items, then finished items. Extras, missing files and
+  archived sources are excluded. Items carry `width`/`height`, `duration`,
+  `position`, `favorite`/`liked` and `next_id` (next episode in the series).
+- **Series derivation** (`media/series.rs`): `series_key`/`series_title` from
+  the directory (season folders prefixed with their parent, extras folders
+  recognised), `episode` from release-style names (`[12]`, `S02E05`, `EP05`,
+  `第5话`, `- 01v2`, `01 标题`), resolution and CRC tags rejected.
+- Migrations `0003_series` + `0004_series_rev`: existing rows are backfilled on
+  the next scan when the parser revision changes.
 
 ### Fixed
 
