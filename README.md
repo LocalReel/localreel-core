@@ -95,9 +95,11 @@ downloads and the composed product live in the
 
 Apache-2.0 — see [`LICENSE`](LICENSE). Copyright 2026 LocalReel contributors.
 
-`ffmpeg` is not bundled: the server discovers `ffmpeg`/`ffprobe` on `PATH`, next
-to the binary, in `ffmpeg/bin`, or via `LOCALREEL_FFMPEG_DIR`. Any ffmpeg you
-install keeps its own license.
+`ffmpeg` is not bundled by default: the server discovers `ffmpeg`/`ffprobe` on
+`PATH`, next to the binary, in `ffmpeg/bin`, or via `LOCALREEL_FFMPEG_DIR`. A
+product package can ship a build (the MSI/zip layouts then contain
+`ffmpeg/bin` plus its license and notice); any ffmpeg you install or bundle
+keeps its own license.
 
 ---
 
