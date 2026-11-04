@@ -10,6 +10,7 @@ pub mod http;
 pub mod manifest;
 pub mod package;
 pub mod runtime;
+pub mod server;
 pub mod storage;
 
 pub use manifest::{Manifest, PluginError, PluginKind, API_VERSION};

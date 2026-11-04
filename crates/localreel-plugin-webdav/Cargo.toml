@@ -1,0 +1,22 @@
+[package]
+name = "localreel-plugin-webdav"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WebDAV storage provider for LocalReel"
+publish = false
+
+[[bin]]
+name = "webdav-plugin"
+path = "src/main.rs"
+
+[dependencies]
+localreel-plugin = { path = "../localreel-plugin" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+base64.workspace = true
+httpdate = "1"
+tracing.workspace = true

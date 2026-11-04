@@ -836,14 +836,10 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
     }
     let modified = stat.modified.unwrap_or(0);
     let etag = format!("W/\"{:x}-{:x}\"", stat.size, modified);
-    let mime = uri
-        .local_path()
-        .map(|path| {
-            mime_guess::from_path(path)
-                .first_or_octet_stream()
-                .to_string()
-        })
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    // The stored file name works for local paths and remote URIs alike.
+    let mime = mime_guess::from_path(&media.filename)
+        .first_or_octet_stream()
+        .to_string();
     Ok(ResolvedMedia {
         uri,
         storage,

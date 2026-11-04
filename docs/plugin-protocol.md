@@ -158,3 +158,35 @@ A storage provider may return URIs that are not local paths (for example
 The server's listen address is used for that endpoint; a bind on `0.0.0.0` is
 reached through `127.0.0.1`. Jobs that need remote media fail with a clear
 message when the server is not running (for example a one-off CLI command).
+## Reference plugins
+
+Two sidecar plugins ship with the repository:
+
+**`plugin-demo`** (`crates/localreel-plugin`) exposes one local directory. With
+`public_http_base` set it reports HTTP URIs, which is how a remote provider looks
+to the host; without it, entries are `file://` URIs.
+
+**`webdav-plugin`** (`crates/localreel-plugin-webdav`) maps a WebDAV collection:
+
+```toml
+[[plugins]]
+package = "plugins/webdav.lrplug"
+
+[plugins.config]
+base_url = "https://nas.local/dav/library"
+username = "reader"
+password = "secret"
+```
+
+A source then points at the same collection:
+
+```http
+POST /api/v1/sources
+{"uri": "https://nas.local/dav/library", "kind": "webdav"}
+```
+
+The plugin uses `PROPFIND` (`Depth: 0`, `1` and `infinity`) for metadata and
+listing, `GET` with `Range` for reads, and HTTP Basic authorization when a
+username is configured. Entries are reported as the absolute HTTP(S) URLs of the
+objects; the host keeps those URIs as media identities and reads bytes through
+the plugin.
