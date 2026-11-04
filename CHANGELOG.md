@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Jobs interrupted by a crash stayed `running` forever.** `JobQueue::reclaim_expired`
+  existed but the server never called it, so after a crash (or a `kill`) the row
+  kept its dead owner and workers — which only claim `queued` rows — never
+  touched it again. The server now reclaims expired leases at startup and every
+  half lease, and records the error
+  `interrupted: the server stopped while this job was running` instead of the
+  developer-only `lease expired`. Covered by
+  `restart_recovers_a_crashed_job_after_its_lease_expires`; verified by
+  killing the dev server mid-transcode and watching the job resolve.
+- **Transcoded variants carried a stray `text` data track.** The mp4 muxer
+  writes source chapters as an extra chapter track, so a re-encoded episode
+  ended up with `video + audio + bin_data`. Transcodes and remuxes now pass
+  `-sn -dn -map_chapters -1`; a variant contains exactly one video and one
+  audio stream.
+
 ## 0.3.0 — 2026-11-02
 
 The core is a component again: product output moved to the `LocalReel` product

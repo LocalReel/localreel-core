@@ -436,6 +436,16 @@ async fn serve() -> anyhow::Result<()> {
     .register(&mut registry);
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Recover jobs left `running` by a previous process (crash, kill, reboot).
+    // Workers only claim `queued` rows, so without a reclaimer such a row would
+    // stay stuck until the lease expires and then forever.
+    match jobs.reclaim_expired() {
+        Ok(0) => {}
+        Ok(count) => info!(count, "reclaimed jobs with expired leases on startup"),
+        Err(error) => tracing::warn!("failed to reclaim jobs on startup: {error}"),
+    }
+
     let mut workers = Vec::new();
     for index in 0..config.jobs.workers {
         workers.push(
@@ -448,6 +458,27 @@ async fn serve() -> anyhow::Result<()> {
             )
             .spawn_with_shutdown(shutdown.clone()),
         );
+    }
+
+    // Keep reclaiming: a job whose worker died while its lease was still valid
+    // is only reclaimable once the lease has expired.
+    {
+        let reclaim_jobs = jobs.clone();
+        let reclaim_shutdown = shutdown.clone();
+        let reclaim_interval = Duration::from_secs((config.jobs.lease.as_secs() / 2).max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(reclaim_interval).await;
+                if reclaim_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                match reclaim_jobs.reclaim_expired() {
+                    Ok(0) => {}
+                    Ok(count) => tracing::warn!(count, "reclaimed jobs with expired leases"),
+                    Err(error) => tracing::warn!("failed to reclaim expired jobs: {error}"),
+                }
+            }
+        });
     }
 
     let cache_gc_interval = config.jobs.cache_gc_interval;

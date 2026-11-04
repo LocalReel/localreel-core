@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Error recorded when a job is resolved because its worker disappeared.
+const INTERRUPTED: &str = "interrupted: the server stopped while this job was running";
+
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -507,7 +510,8 @@ impl JobQueue {
                     transaction.execute(
                         "UPDATE sys_jobs
                          SET status = 'failed', attempts = ?1,
-                             error = 'lease expired', finished_at = ?2,
+                             error = 'interrupted: the server stopped while this job was running',
+                             finished_at = ?2,
                              lease_owner = NULL, lease_expires_at = NULL
                          WHERE id = ?3 AND status = 'running'",
                         params![next_attempt, now, id],
@@ -515,13 +519,13 @@ impl JobQueue {
                     events.push(Event::JobFailed {
                         job_id: id.clone(),
                         kind: kind.clone(),
-                        error: "lease expired".to_string(),
+                        error: INTERRUPTED.to_string(),
                     });
                 } else {
                     transaction.execute(
                         "UPDATE sys_jobs
                          SET status = 'queued', attempts = ?1, available_at = ?2,
-                             error = 'lease expired', lease_owner = NULL,
+                             error = NULL, lease_owner = NULL,
                              lease_expires_at = NULL
                          WHERE id = ?3 AND status = 'running'",
                         params![next_attempt, now, id],
@@ -1005,6 +1009,43 @@ mod tests {
         let reclaimed = queue.reclaim_expired().unwrap();
         assert_eq!(reclaimed, 1);
         assert_eq!(queue.get(&id).unwrap().unwrap().status, status::FAILED);
+    }
+
+    #[test]
+    fn restart_recovers_a_crashed_job_after_its_lease_expires() {
+        let (dir, queue) = setup();
+        let id = queue.enqueue("test", "{}", None, 3).unwrap();
+        queue.claim("worker-1", 60).unwrap().unwrap();
+
+        // The process "dies" here: a fresh queue on the same database must not
+        // pick up the running row, and must leave it alone while the lease is
+        // still valid.
+        let restarted = JobQueue::new(queue.db.clone(), queue.events().clone());
+        assert!(restarted.claim("worker-2", 60).unwrap().is_none());
+        assert_eq!(restarted.reclaim_expired().unwrap(), 0);
+        assert_eq!(restarted.get(&id).unwrap().unwrap().status, status::RUNNING);
+
+        // Once the old lease expires the job is reclaimed (requeued, attempts
+        // incremented) and can be claimed again.
+        restarted
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE sys_jobs SET lease_expires_at = 0 WHERE id = ?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(restarted.reclaim_expired().unwrap(), 1);
+        let recovered = restarted.get(&id).unwrap().unwrap();
+        assert_eq!(recovered.status, status::QUEUED);
+        // claim already counted the first attempt, reclaim counts the retry.
+        assert_eq!(recovered.attempts, 2);
+        let claimed = restarted.claim("worker-2", 60).unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.attempts, 3);
+        drop(dir);
     }
 
     struct TestHandler;

@@ -436,10 +436,23 @@ pub(crate) fn transcode_args(
         .map(|value| text(value))
         .collect();
     args.push(input.as_os_str().to_owned());
+    // Keep the web output clean: video + one audio track. Subtitles, data
+    // streams and chapters are dropped — the mp4 muxer otherwise writes
+    // chapters as an extra `text` track that no browser player needs.
     args.extend(
-        ["-map", "0:v:0", "-map", "0:a:0?", "-c:v"]
-            .iter()
-            .map(|value| text(value)),
+        [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-map_chapters",
+            "-1",
+            "-c:v",
+        ]
+        .iter()
+        .map(|value| text(value)),
     );
     args.push(text(&preset.video_codec));
     if preset.video_codec != "copy" {
@@ -677,6 +690,16 @@ mod tests {
             .into_iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn transcode_args_drop_subtitles_data_and_chapters() {
+        // The mp4 muxer would otherwise turn chapters into an extra `text`
+        // track, which no browser player uses and which bloats the variant.
+        let args = args_of(&TranscodePreset::default());
+        assert!(args.windows(2).any(|pair| pair == ["-sn", "-dn"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map_chapters", "-1"]));
+        assert_eq!(args.iter().filter(|arg| *arg == "-map_chapters").count(), 1);
     }
 
     #[test]
