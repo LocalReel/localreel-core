@@ -77,8 +77,11 @@ pub struct FeedItem {
     pub liked: bool,
     /// Next episode in the same series, for autoplay; `None` for movies or the
     /// last episode.
+    /// "direct" | "remux" | "transcode" from the server playback policy.
+    pub playback: String,
     pub next_id: Option<i64>,
     pub created_at: i64,
+    pub thumbnail_path: Option<String>,
 }
 
 /// Per-media user state.

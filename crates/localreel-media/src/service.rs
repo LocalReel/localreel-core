@@ -487,13 +487,13 @@ impl MediaService {
         self.db.with_read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT m.id, m.title, m.filename, m.series_key, m.series_title,
-                        m.episode, m.width, m.height,
+                        m.episode, m.width, m.height, m.video_codec, m.audio_codec,
                         COALESCE(m.duration, s.duration, 0.0),
                         COALESCE(s.position, 0.0),
                         COALESCE(s.updated_at, 0),
                         COALESCE(s.favorite, 0),
                         COALESCE(s.liked, 0),
-                        m.created_at
+                        m.created_at, m.thumbnail_path
                  FROM media m
                  JOIN sources src ON src.id = m.source_id
                  LEFT JOIN media_state s ON s.media_id = m.id
@@ -511,12 +511,15 @@ impl MediaService {
                     episode: row.get(5)?,
                     width: row.get(6)?,
                     height: row.get(7)?,
-                    duration: row.get(8)?,
-                    position: row.get(9)?,
-                    state_updated_at: row.get(10)?,
-                    favorite: row.get::<_, i64>(11)? != 0,
-                    liked: row.get::<_, i64>(12)? != 0,
-                    created_at: row.get(13)?,
+                    video_codec: row.get(8)?,
+                    audio_codec: row.get(9)?,
+                    duration: row.get(10)?,
+                    position: row.get(11)?,
+                    state_updated_at: row.get(12)?,
+                    favorite: row.get::<_, i64>(13)? != 0,
+                    liked: row.get::<_, i64>(14)? != 0,
+                    created_at: row.get(15)?,
+                    thumbnail_path: row.get(16)?,
                 })
             })?;
             let mut candidates = Vec::new();
@@ -1070,12 +1073,15 @@ struct FeedCandidate {
     episode: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
     duration: f64,
     position: f64,
     state_updated_at: i64,
     favorite: bool,
     liked: bool,
     created_at: i64,
+    thumbnail_path: Option<String>,
 }
 
 impl FeedCandidate {
@@ -1219,8 +1225,16 @@ fn rank_feed(candidates: Vec<FeedCandidate>, limit: usize) -> (Vec<FeedItem>, i6
             finished: candidate.finished(),
             favorite: candidate.favorite,
             liked: candidate.liked,
+            playback: crate::playback::playback_mode(
+                candidate.video_codec.as_deref(),
+                candidate.audio_codec.as_deref(),
+                &candidate.filename,
+            )
+            .as_str()
+            .to_string(),
             next_id: next_by_id.get(&candidate.id).copied(),
             created_at: candidate.created_at,
+            thumbnail_path: candidate.thumbnail_path.clone(),
         })
         .collect();
     (items, total)
@@ -1567,12 +1581,15 @@ mod tests {
             episode,
             width: None,
             height: None,
+            video_codec: None,
+            audio_codec: None,
             duration,
             position,
             state_updated_at: if position > 0.0 { created_at } else { 0 },
             favorite: false,
             liked: false,
             created_at,
+            thumbnail_path: None,
         }
     }
 

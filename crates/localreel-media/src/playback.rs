@@ -107,6 +107,62 @@ pub fn preset_by_name(name: &str) -> Option<TranscodePreset> {
     Some(preset)
 }
 
+/// How a file will be played. `Remux` is cheap (seconds, stream copy);
+/// `Transcode` re-encodes and can take minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMode {
+    Direct,
+    Remux,
+    Transcode,
+}
+
+impl PlaybackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlaybackMode::Direct => "direct",
+            PlaybackMode::Remux => "remux",
+            PlaybackMode::Transcode => "transcode",
+        }
+    }
+}
+
+/// Decide the playback mode from probe metadata, without a full [`Media`] row.
+///
+/// The feed uses this to tell the UI which neighbours are cheap to prepare, and
+/// the API uses it for the same decision, so both stay in sync.
+pub fn playback_mode(
+    video_codec: Option<&str>,
+    audio_codec: Option<&str>,
+    filename: &str,
+) -> PlaybackMode {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    let video = video_codec.unwrap_or("").to_ascii_lowercase();
+    let audio = audio_codec.unwrap_or("none").to_ascii_lowercase();
+    let video_is_h264 = matches!(video.as_str(), "h264" | "avc" | "avc1");
+    let audio_is_safe = matches!(audio.as_str(), "aac" | "mp3" | "none");
+
+    let direct = match extension.as_deref() {
+        Some("mp4") | Some("m4v") => {
+            video_is_h264 && matches!(audio.as_str(), "aac" | "mp3" | "none")
+        }
+        Some("webm") => {
+            matches!(video.as_str(), "vp8" | "vp9")
+                && matches!(audio.as_str(), "opus" | "vorbis" | "none")
+        }
+        _ => false,
+    };
+    if direct {
+        return PlaybackMode::Direct;
+    }
+    if remux_container(extension.as_deref()) && video_is_h264 && audio_is_safe {
+        return PlaybackMode::Remux;
+    }
+    PlaybackMode::Transcode
+}
+
 /// Whether the browser can play the file directly without a transcode.
 ///
 /// This is deliberately conservative: unknown or missing codec metadata means
@@ -262,4 +318,32 @@ mod tests {
         assert!(preset_by_name(DEFAULT_TRANSCODE_PRESET).is_some());
         assert!(preset_by_name("nope").is_none());
     }
+    #[test]
+    fn playback_mode_matches_the_api_policy() {
+        assert_eq!(
+            playback_mode(Some("h264"), Some("aac"), "a.mp4"),
+            PlaybackMode::Direct
+        );
+        assert_eq!(
+            playback_mode(Some("h264"), Some("mp3"), "a.mp4"),
+            PlaybackMode::Direct
+        );
+        assert_eq!(
+            playback_mode(Some("h264"), Some("aac"), "a.mkv"),
+            PlaybackMode::Remux
+        );
+        assert_eq!(
+            playback_mode(Some("h264"), Some("flac"), "a.mkv"),
+            PlaybackMode::Transcode
+        );
+        assert_eq!(
+            playback_mode(Some("hevc"), Some("aac"), "a.mkv"),
+            PlaybackMode::Transcode
+        );
+        assert_eq!(
+            playback_mode(None, None, "a.mkv"),
+            PlaybackMode::Transcode
+        );
+    }
+
 }
