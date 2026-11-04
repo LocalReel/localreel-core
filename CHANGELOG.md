@@ -76,7 +76,7 @@ Faster playback, reliable cancellation, a bilingual UI, and a dev/release split.
   used to take a full re-encode now finishes in ~0.5 s; a typical movie drops
   from tens of minutes to seconds.
 - **Bilingual UI (zh/en)**: every page (Library, Reels, Admin, player) is
-  translated, with a 中文/EN switch. The initial language follows
+  translated, with an English/Simplified Chinese switch. The initial language follows
   `navigator.language` and the choice persists in `localStorage`.
 - **Job priorities**: `enqueue_with_priority`; thumbnails run at priority 10 so
   they are no longer starved behind a bulk probe backlog.

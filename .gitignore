@@ -9,13 +9,12 @@ Thumbs.db
 .idea/
 .vscode/
 
-# bundled media tools (optional)
+# optional local media tools
 .tools/
 
-# development server state (scripts/dev.ps1) — never a release install
+# development server state
 .dev-data/
 
-
-# release packaging output
+# packaging output
 dist/
 

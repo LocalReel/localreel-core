@@ -1,8 +1,8 @@
 # Architecture Decision Records
 
-These ADRs constrain the B1 implementation (modular monolith). They are
-deliberately short: the goal is to keep future changes from re-litigating the
-same trade-offs or drifting back into "everything is a plugin".
+These ADRs constrain the implementation. They are deliberately short: the goal is
+to keep future changes from re-litigating the same trade-offs or drifting away
+from the module boundaries.
 
 | # | Decision |
 |---|----------|
@@ -15,5 +15,6 @@ same trade-offs or drifting back into "everything is a plugin".
 | 007 | [API and UI](007-api-ui.md) |
 | 008 | [Extension contract](008-extension-contract.md) |
 | 009 | [Repositories and versioning](009-repositories.md) |
+| 010 | [Playback transport](010-playback-transport.md) |
 
 Status: all **Accepted** on 2026-11-01 unless noted otherwise.

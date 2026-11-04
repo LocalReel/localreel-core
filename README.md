@@ -1,23 +1,41 @@
 # localreel-core
 
-The LocalReel server: a single binary that indexes local media, serves a web UI,
-and runs scan/probe/thumbnail/transcode work through a persistent job queue.
+The LocalReel server: a single Rust binary that indexes local media, serves the
+web UI built into it, and runs scan/probe/thumbnail/transcode work through a
+persistent job queue.
 
-This is the **B1** implementation: a modular monolith with strict internal
-boundaries, not a WASM plugin host. Extension seams are defined as traits and
-stay out of the critical path until the product is stable.
+## Features
+
+- **Library indexing** — add local folders as sources; incremental scans
+  fingerprint files, record scan history, and mark missing files without
+  deleting their state.
+- **Metadata and thumbnails** — `ffprobe`/`ffmpeg` extract duration, codecs,
+  dimensions and JPEG thumbnails through typed operations.
+- **Playback policy** — direct streaming (HTTP Range, ETag, HEAD) for browser
+  codecs; H.264 in MKV/MOV/TS/FLV/AVI is remuxed (stream copy) instead of
+  re-encoded; other sources are transcoded to cached variants.
+- **Series model** — the scanner derives series, season and episode numbers from
+  the library layout and release-style file names.
+- **Ranked feed** — `GET /api/v1/feed` orders continue-watching first, then
+  unwatched episodes by series, then movies, then finished items.
+- **Persistent jobs** — scan, probe, thumbnail, transcode, cache GC and backup
+  restore run in `sys_jobs` with leases, retries, progress, cancellation and
+  crash recovery.
+- **State and backup** — per-file playback position, likes and favourites;
+  versioned backup export/import; legacy import from a LocalReel v1 database.
+- **Local by design** — binds loopback only by default, single user, no
+  authentication layer.
 
 ## Workspace
 
 ```text
 crates/localreel-kernel/   generic capabilities: config, db, jobs, events,
-                           storage (VFS), media-ops (typed ffmpeg)
-crates/localreel-media/    first-party media domain: sources, scan, metadata,
-                           state, search, playback policy, variants
+                           storage, media-ops (typed ffmpeg)
+crates/localreel-media/    media domain: sources, scan, metadata, state,
+                           search, playback policy, variants
 crates/localreel-api/      HTTP /api/v1, SSE events, static assets, loopback guard
 crates/localreel-server/   the `localreel` binary: wiring, migrations, serve
-migrations/               referenced by the kernel/media crates
-docs/adr/                 architecture decision records
+docs/adr/                  architecture decision records
 ```
 
 Dependency direction is one-way:
@@ -26,7 +44,7 @@ Dependency direction is one-way:
 web -> api -> media -> kernel
 ```
 
-The kernel must never know about videos; the media crate must never write HTTP
+The kernel does not know about videos; the media crate does not write HTTP
 handlers or spawn `ffmpeg` directly.
 
 ## Commands
@@ -35,57 +53,74 @@ handlers or spawn `ffmpeg` directly.
 # development server (isolated: port 3101, data in .dev-data/)
 .\scripts\dev.ps1
 
-# from this repository
 cargo run -p localreel-server -- serve
 cargo run -p localreel-server -- migrate
 cargo run -p localreel-server -- doctor
 
-# discover media under an already configured source (walk/fingerprint only)
+# walk/fingerprint an already configured source
 cargo run -p localreel-server -- scan --source-id 1
 
-# import a *copy* of a LocalReel v1 database (dry-run first)
+# import a copy of a LocalReel v1 database
 cargo run -p localreel-server -- import C:\backup\localreel.db --dry-run
 cargo run -p localreel-server -- import C:\backup\localreel.db
 ```
 
-Configuration is loaded from `localreel.toml` (or `LOCALREEL_CONFIG`) and then
-`LOCALREEL_*` environment variables; see `localreel.toml.example`.
+Configuration comes from `localreel.toml` (or `LOCALREEL_CONFIG`) and then
+`LOCALREEL_*` environment variables; see `localreel.toml.example`. Default bind
+is `127.0.0.1:3001`; data lives in `./data` unless `LOCALREEL_DATA_DIR` is set.
 
-Default bind: `127.0.0.1:3001`. Data lives in `./data` unless
-`LOCALREEL_DATA_DIR` is set.
+A development checkout and an installed release stay apart: the dev script uses
+port 3101 and `.dev-data/`, an installed app uses 3001 and its install folder.
+See [docs/development.md](docs/development.md).
 
-A development checkout and an installed release are kept apart on purpose: the
-dev script uses port 3101 and `.dev-data/`, while the installed app uses 3001 and
-`%LOCALAPPDATA%\LocalReel`. See [docs/development.md](docs/development.md).
+## Quality gates
 
-## Status
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
-Version 0.3.0: usable local-first server with a bilingual (中文/EN) web UI,
-scans/metadata/thumbnails, direct playback plus an H.264 remux fast path,
-Reels resume, Admin, backup/restore, archive/remap, cache GC, and a
-single-binary build with the UI embedded. Windows is the primary target; Linux
-and Docker were verified under WSL2.
+CI runs the same gates on Windows and Ubuntu.
 
-This repository is **a component, not the product**. Installers, the MSI/zip
-artifacts, release notes and download instructions live in the product
-repository [`LocalReel`](https://github.com/LocalReel/LocalReel). The core
-builds a binary; the product composes the binary with the web UI and docs.
+## Where this fits
 
-The full delivery plan (milestones, work breakdown, estimates, risks, next
-sprint) is in [`docs/roadmap/v2-plan.md`](docs/roadmap/v2-plan.md).
-
-## Release
-
-- Component changelog: [CHANGELOG.md](CHANGELOG.md)
-- Product downloads and release notes:
-  [`LocalReel/LocalReel`](https://github.com/LocalReel/LocalReel)
-- v1.0 readiness / blockers:
-  [`LocalReel/LocalReel/docs/release/v1.0-readiness.md`](https://github.com/LocalReel/LocalReel/blob/main/docs/release/v1.0-readiness.md)
+This repository is a **component**: it builds the server binary. Installers,
+downloads and the composed product live in the
+[`LocalReel`](https://github.com/LocalReel/LocalReel) product repository. See
+[docs/adr/](docs/adr/) for the architecture decisions behind the boundaries.
 
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE). Copyright 2026 LocalReel contributors.
 
-ffmpeg is **not** bundled: the server discovers `ffmpeg`/`ffprobe` on PATH, next
+`ffmpeg` is not bundled: the server discovers `ffmpeg`/`ffprobe` on `PATH`, next
 to the binary, in `ffmpeg/bin`, or via `LOCALREEL_FFMPEG_DIR`. Any ffmpeg you
-install keeps its own license (GPL or LGPL depending on the build you choose).
+install keeps its own license.
+
+---
+
+## 简体中文
+
+LocalReel 的服务器组件：一个 Rust 单文件程序，索引本地媒体、内置 Web UI，并通过
+持久化任务队列执行扫描、探测、缩略图与转码。
+
+- **媒体库索引**：把本地目录添加为来源；增量扫描记录文件指纹、扫描历史，文件
+  缺失时只标记、不删除状态。
+- **元数据与缩略图**：通过 `ffprobe`/`ffmpeg` 提取时长、编码、分辨率与缩略图。
+- **播放策略**：浏览器可直接播放的格式走直连（支持 Range、ETag、HEAD）；MKV、
+  MOV、TS、FLV、AVI 中的 H.264 用流拷贝封装成 MP4；其余格式转码为缓存副本。
+- **剧集模型**：扫描时从目录结构与发布式文件名推导系列、季、集数。
+- **排序 feed**：`GET /api/v1/feed` 按「续播 → 未看剧集 → 未看电影 → 已看完」
+  排序。
+- **持久化任务**：扫描、探测、缩略图、转码、缓存回收与备份恢复都走 `sys_jobs`，
+  支持租约、重试、进度、取消与崩溃恢复。
+- **播放状态与备份**：按文件保存进度、喜欢与收藏；支持版本化备份导入导出，以及
+  从 LocalReel v1 数据库导入。
+- **本地优先**：默认只监听回环地址，单用户，无鉴权层。
+
+构建与测试：`cargo fmt --all -- --check`、`cargo clippy --workspace
+--all-targets -- -D warnings`、`cargo test --workspace`。
+
+本仓库是组件，产物（安装包、下载）在产品仓库
+[`LocalReel`](https://github.com/LocalReel/LocalReel)。
