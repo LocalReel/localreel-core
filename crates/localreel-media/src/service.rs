@@ -7,7 +7,7 @@ use localreel_kernel::media_ops::ProbeResult;
 use localreel_kernel::storage::{normalize_local_path, MediaUri};
 use localreel_kernel::time::now_secs;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBehavior};
 
 use crate::model::{
     CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
@@ -916,6 +916,101 @@ impl MediaService {
         })
     }
 
+    /// Apply a partial state patch atomically.
+    ///
+    /// The merge must happen inside one write transaction: the player saves
+    /// progress every few seconds while the user can toggle like/favorite at the
+    /// same time, and a read-modify-write outside a transaction silently loses
+    /// one of the two updates.
+    pub fn patch_state(
+        &self,
+        media_id: i64,
+        liked: Option<bool>,
+        favorite: Option<bool>,
+        position: Option<f64>,
+        duration: Option<f64>,
+    ) -> Result<MediaState> {
+        fn check(value: Option<f64>, name: &str) -> Result<()> {
+            if let Some(value) = value {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(KernelError::InvalidInput(format!(
+                        "{name} must be finite and non-negative"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        check(position, "position")?;
+        check(duration, "duration")?;
+
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT liked, favorite, position, duration
+                     FROM media_state WHERE media_id = ?1",
+                    [media_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? != 0,
+                            row.get::<_, i64>(1)? != 0,
+                            row.get::<_, f64>(2)?,
+                            row.get::<_, f64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let (mut liked_value, mut favorite_value, mut position_value, mut duration_value) =
+                existing.unwrap_or((false, false, 0.0, 0.0));
+            if let Some(value) = liked {
+                liked_value = value;
+            }
+            if let Some(value) = favorite {
+                favorite_value = value;
+            }
+            if let Some(value) = position {
+                position_value = value;
+            }
+            if let Some(value) = duration {
+                duration_value = value;
+            }
+            if duration_value > 0.0 && position_value > duration_value + 30.0 {
+                return Err(KernelError::InvalidInput(
+                    "position exceeds duration".to_string(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(media_id) DO UPDATE SET
+                     liked = excluded.liked,
+                     favorite = excluded.favorite,
+                     position = excluded.position,
+                     duration = excluded.duration,
+                     updated_at = excluded.updated_at",
+                params![
+                    media_id,
+                    liked_value as i64,
+                    favorite_value as i64,
+                    position_value,
+                    duration_value,
+                    now
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(MediaState {
+                media_id,
+                liked: liked_value,
+                favorite: favorite_value,
+                position: position_value,
+                duration: duration_value,
+                updated_at: now,
+            })
+        })
+    }
+
     pub fn media_count(&self) -> Result<i64> {
         self.db.with_read(|connection| {
             Ok(connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?)
@@ -1514,6 +1609,39 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id, 1);
         assert_eq!(items[1].id, 2);
+    }
+
+    #[test]
+    fn patch_state_merges_without_losing_concurrent_fields() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+        let id = insert_media(&service, source.id, "state-patch");
+
+        let liked = service.patch_state(id, Some(true), None, None, None).unwrap();
+        assert!(liked.liked);
+
+        // A progress save must not clear the like, and a like must not reset
+        // the position: the merge happens inside one write transaction.
+        let progressed = service
+            .patch_state(id, None, None, Some(42.0), Some(600.0))
+            .unwrap();
+        assert!(progressed.liked, "progress save must keep the like");
+        assert_eq!(progressed.position, 42.0);
+
+        let favorited = service
+            .patch_state(id, Some(true), Some(true), None, None)
+            .unwrap();
+        assert!(favorited.favorite);
+        assert_eq!(favorited.position, 42.0);
+
+        assert!(service
+            .patch_state(id, None, None, Some(9999.0), None)
+            .is_err());
+        assert!(service
+            .patch_state(id, None, None, Some(f64::NAN), None)
+            .is_err());
     }
 
 }

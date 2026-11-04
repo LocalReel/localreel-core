@@ -564,33 +564,12 @@ async fn put_state(
     Path(id): Path<i64>,
     Json(patch): Json<StatePatch>,
 ) -> Result<Json<MediaState>, ApiError> {
-    let mut current = state.media.get_state(id)?;
-    if let Some(value) = patch.liked {
-        current.liked = value;
-    }
-    if let Some(value) = patch.favorite {
-        current.favorite = value;
-    }
-    if let Some(value) = patch.position {
-        if !value.is_finite() || value < 0.0 {
-            return Err(ApiError::bad_request(
-                "position must be finite and non-negative",
-            ));
-        }
-        current.position = value;
-    }
-    if let Some(value) = patch.duration {
-        if !value.is_finite() || value < 0.0 {
-            return Err(ApiError::bad_request(
-                "duration must be finite and non-negative",
-            ));
-        }
-        current.duration = value;
-    }
-    if current.duration > 0.0 && current.position > current.duration + 30.0 {
-        return Err(ApiError::bad_request("position exceeds duration"));
-    }
-    Ok(Json(state.media.save_state(&current)?))
+    // The service merges the patch inside one write transaction: progress saves
+    // and like/favorite toggles arrive concurrently from the player.
+    let saved = state
+        .media
+        .patch_state(id, patch.liked, patch.favorite, patch.position, patch.duration)?;
+    Ok(Json(saved))
 }
 
 #[derive(Debug, Deserialize)]
