@@ -1,0 +1,22 @@
+[package]
+name = "localreel-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sidecar plugin runtime and package format for LocalReel storage providers"
+publish = false
+
+[dependencies]
+localreel-kernel = { path = "../localreel-kernel" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+walkdir.workspace = true
