@@ -121,7 +121,7 @@ pub fn export_backup(db: &Database) -> Result<Backup> {
 }
 
 pub fn import_backup(db: &Database, backup: &Backup, dry_run: bool) -> Result<BackupImportReport> {
-    validate_backup(&backup)?;
+    validate_backup(backup)?;
     let service = MediaService::new(db.clone());
     let mut report = BackupImportReport {
         dry_run,

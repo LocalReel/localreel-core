@@ -38,7 +38,7 @@ pub fn restore_backup(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32, &str),
 ) -> Result<RestoreReport> {
-    validate_backup(&backup)?;
+    validate_backup(backup)?;
     let mut report = RestoreReport {
         dry_run,
         sources: backup.sources.len(),
