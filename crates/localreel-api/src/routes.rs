@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
@@ -882,6 +883,7 @@ struct ResolvedMedia {
     uri: MediaUri,
     storage: Arc<dyn Storage>,
     size: u64,
+    modified: i64,
     etag: String,
     mime: String,
 }
@@ -922,6 +924,7 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
         uri,
         storage,
         size: stat.size,
+        modified,
         etag,
         mime,
     })
@@ -935,14 +938,26 @@ async fn serve_media(
 ) -> Result<Response, ApiError> {
     let media = resolve_media(&state, id).await?;
 
-    if headers
+    let last_modified = http_date(media.modified);
+    let if_none_match = headers
         .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| if_none_match_matches(value, &media.etag))
-    {
-        return Response::builder()
+        .and_then(|value| value.to_str().ok());
+    let if_modified_since = headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok());
+    let not_modified = match (if_none_match, if_modified_since) {
+        (Some(value), _) => if_none_match_matches(value, &media.etag),
+        (None, Some(value)) => if_modified_since_not_modified(value, media.modified),
+        (None, None) => false,
+    };
+    if not_modified {
+        let mut builder = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, &media.etag)
+            .header(header::ETAG, &media.etag);
+        if let Some(date) = &last_modified {
+            builder = builder.header(header::LAST_MODIFIED, date);
+        }
+        return builder
             .body(Body::empty())
             .map_err(|error| ApiError::internal(error.to_string()));
     }
@@ -950,23 +965,41 @@ async fn serve_media(
     let range_header = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    let range = range_header.and_then(|value| parse_range(value, media.size));
-    if range_header.is_some() && range.is_none() {
-        return Response::builder()
+    let if_range = headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let honor_range = range_header.is_some()
+        && if_range.is_none_or(|value| if_range_matches(value, &media.etag, media.modified));
+    let range = if honor_range {
+        range_header.and_then(|value| parse_range(value, media.size))
+    } else {
+        None
+    };
+    if honor_range && range.is_none() {
+        let mut builder = Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{}", media.size))
             .header(header::ETAG, &media.etag)
+            .header(header::ACCEPT_RANGES, "bytes");
+        if let Some(date) = &last_modified {
+            builder = builder.header(header::LAST_MODIFIED, date);
+        }
+        return builder
             .body(Body::empty())
             .map_err(|error| ApiError::internal(error.to_string()));
     }
 
     if media.size == 0 {
-        return Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, &media.mime)
             .header(header::CONTENT_LENGTH, "0")
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::ETAG, &media.etag)
+            .header(header::ETAG, &media.etag);
+        if let Some(date) = &last_modified {
+            builder = builder.header(header::LAST_MODIFIED, date);
+        }
+        return builder
             .body(Body::empty())
             .map_err(|error| ApiError::internal(error.to_string()));
     }
@@ -1026,6 +1059,9 @@ async fn serve_media(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, &media.etag)
         .header(header::CACHE_CONTROL, "private, max-age=3600");
+    if let Some(date) = &last_modified {
+        builder = builder.header(header::LAST_MODIFIED, date);
+    }
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -1043,6 +1079,36 @@ fn if_none_match_matches(value: &str, etag: &str) -> bool {
         let candidate = candidate.trim();
         candidate == "*" || candidate.trim_start_matches("W/") == target
     })
+}
+
+fn http_date(seconds: i64) -> Option<String> {
+    if seconds <= 0 {
+        return None;
+    }
+    let time = UNIX_EPOCH + Duration::from_secs(seconds as u64);
+    Some(httpdate::fmt_http_date(time))
+}
+
+fn parse_http_date_secs(value: &str) -> Option<i64> {
+    httpdate::parse_http_date(value.trim())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+}
+
+fn if_modified_since_not_modified(value: &str, modified: i64) -> bool {
+    modified > 0 && parse_http_date_secs(value).is_some_and(|date| modified <= date)
+}
+
+/// `If-Range` accepts either an entity tag or an HTTP date. A matching weak tag
+/// is treated like a matching strong tag: the host only emits weak tags, and a
+/// strict reading would make resumption impossible.
+fn if_range_matches(value: &str, etag: &str, modified: i64) -> bool {
+    let value = value.trim();
+    if value.starts_with("W/") || value.starts_with('"') {
+        return value == etag;
+    }
+    parse_http_date_secs(value).is_some_and(|date| modified > 0 && modified <= date)
 }
 
 fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
@@ -1363,5 +1429,27 @@ mod tests {
         assert!(if_none_match_matches(r#""x", W/"10-20""#, etag));
         assert!(if_none_match_matches("*", etag));
         assert!(!if_none_match_matches(r#""other""#, etag));
+    }
+
+    #[test]
+    fn if_range_matches_etags_and_dates() {
+        let etag = r#"W/"10-20""#;
+        assert!(if_range_matches(etag, etag, 1_700_000_000));
+        assert!(!if_range_matches(r#"W/"10-21""#, etag, 1_700_000_000));
+
+        let date = http_date(1_700_000_000).unwrap();
+        assert!(if_range_matches(&date, etag, 1_699_999_999));
+        assert!(if_range_matches(&date, etag, 1_700_000_000));
+        assert!(!if_range_matches(&date, etag, 1_700_000_001));
+        assert!(!if_range_matches("not a date", etag, 1_700_000_000));
+    }
+
+    #[test]
+    fn if_modified_since_compares_whole_seconds() {
+        let date = http_date(1_700_000_000).unwrap();
+        assert!(if_modified_since_not_modified(&date, 1_700_000_000));
+        assert!(if_modified_since_not_modified(&date, 1_699_999_999));
+        assert!(!if_modified_since_not_modified(&date, 1_700_000_001));
+        assert!(!if_modified_since_not_modified(&date, 0));
     }
 }

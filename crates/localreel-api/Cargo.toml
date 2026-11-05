@@ -19,6 +19,7 @@ futures-util.workspace = true
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+httpdate.workspace = true
 mime_guess.workspace = true
 tracing.workspace = true
 
