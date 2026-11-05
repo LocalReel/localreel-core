@@ -57,6 +57,8 @@ pub struct MediaConfig {
     pub transcode_timeout: Duration,
     pub thumbnail_dir: PathBuf,
     pub transcode_dir: PathBuf,
+    /// HLS playlists and segments produced on demand.
+    pub hls_dir: PathBuf,
     pub cache_max_bytes: u64,
     pub cache_max_age: Duration,
 }
@@ -86,6 +88,7 @@ impl Default for Config {
                 transcode_timeout: Duration::from_secs(30 * 60),
                 thumbnail_dir: data_dir.join("thumbnails"),
                 transcode_dir: data_dir.join("transcodes"),
+                hls_dir: data_dir.join("hls"),
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
             },
@@ -143,6 +146,7 @@ impl Config {
             self.db_path = self.data_dir.join("localreel.db");
             self.media.thumbnail_dir = self.data_dir.join("thumbnails");
             self.media.transcode_dir = self.data_dir.join("transcodes");
+            self.media.hls_dir = self.data_dir.join("hls");
         }
         if let Some(db) = file.data.db {
             self.db_path = db;
@@ -185,6 +189,9 @@ impl Config {
         if let Some(value) = file.media.transcodes_dir {
             self.media.transcode_dir = value;
         }
+        if let Some(value) = file.media.hls_dir {
+            self.media.hls_dir = value;
+        }
         if let Some(value) = file.media.cache_max_bytes {
             self.media.cache_max_bytes = value;
         }
@@ -218,6 +225,7 @@ impl Config {
             self.db_path = self.data_dir.join("localreel.db");
             self.media.thumbnail_dir = self.data_dir.join("thumbnails");
             self.media.transcode_dir = self.data_dir.join("transcodes");
+            self.media.hls_dir = self.data_dir.join("hls");
         }
         if let Some(value) = env_string("LOCALREEL_DB") {
             self.db_path = PathBuf::from(value);
@@ -242,6 +250,9 @@ impl Config {
         }
         if let Some(value) = env_u64("LOCALREEL_CACHE_GC_INTERVAL_SECS")? {
             self.jobs.cache_gc_interval = Duration::from_secs(value);
+        }
+        if let Some(value) = env_string("LOCALREEL_HLS_DIR") {
+            self.media.hls_dir = PathBuf::from(value);
         }
         if let Some(value) = env_string("LOCALREEL_FFMPEG") {
             self.media.ffmpeg = PathBuf::from(value);
@@ -302,6 +313,7 @@ impl Config {
             &self.data_dir,
             &self.media.thumbnail_dir,
             &self.media.transcode_dir,
+            &self.media.hls_dir,
         ] {
             std::fs::create_dir_all(dir).map_err(|error| {
                 KernelError::Config(format!(
@@ -399,6 +411,7 @@ struct MediaFile {
     transcode_timeout_secs: Option<u64>,
     thumbnails_dir: Option<PathBuf>,
     transcodes_dir: Option<PathBuf>,
+    hls_dir: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
     cache_max_age_hours: Option<u64>,
 }

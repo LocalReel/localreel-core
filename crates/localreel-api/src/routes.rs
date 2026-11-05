@@ -71,7 +71,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/jobs/:id", get(get_job))
         .route("/api/v1/jobs/:id/cancel", post(cancel_job))
         .nest_service("/thumbnails", thumbnails)
-        .nest_service("/transcodes", transcodes);
+        .nest_service("/transcodes", transcodes)
+        .route("/hls/*path", get(serve_hls));
 
     if embedded {
         router = router
@@ -685,6 +686,11 @@ async fn cancel_job(
     Ok(Json(serde_json::json!({ "canceled": true })))
 }
 
+#[derive(Debug, Deserialize)]
+struct PlaybackQuery {
+    format: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct PlaybackResponse {
     mode: &'static str,
@@ -699,6 +705,7 @@ struct PlaybackResponse {
 async fn prepare_playback(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<PlaybackQuery>,
 ) -> Result<Response, ApiError> {
     let media = state
         .media
@@ -715,6 +722,10 @@ async fn prepare_playback(
             }),
         )
             .into_response());
+    }
+
+    if query.format.as_deref() == Some("hls") {
+        return prepare_hls_playback(state, &media);
     }
 
     if is_hls(&media) {
@@ -780,6 +791,73 @@ async fn prepare_playback(
             job_id: Some(job_id),
             message: Some("transcode started".into()),
         }),
+    )
+        .into_response())
+}
+
+fn prepare_hls_playback(
+    state: Arc<AppState>,
+    media: &localreel_media::Media,
+) -> Result<Response, ApiError> {
+    if let Some(variant) = state.media.find_variant(media.id, "hls", "default")? {
+        let path = state.config.media.hls_dir.join(&variant.path);
+        if path.is_file() {
+            return Ok(Json(PlaybackResponse {
+                mode: "ready",
+                url: Some(format!("/hls/{}", variant.path)),
+                job_id: None,
+                message: None,
+            })
+            .into_response());
+        }
+    }
+
+    let payload = serde_json::json!({ "media_id": media.id }).to_string();
+    let job_id = state.jobs.enqueue(
+        "hls_package",
+        &payload,
+        Some(&format!("hls:{}", media.id)),
+        2,
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PlaybackResponse {
+            mode: "preparing",
+            url: None,
+            job_id: Some(job_id),
+            message: Some("hls packaging started".into()),
+        }),
+    )
+        .into_response())
+}
+
+async fn serve_hls(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Result<Response, ApiError> {
+    use std::path::{Component, Path as FsPath};
+
+    // Only plain relative components; no `..`, no drive prefixes, no roots.
+    let relative = FsPath::new(&path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiError::not_found("hls file not found"));
+    }
+    let file = state.config.media.hls_dir.join(relative);
+    let bytes = std::fs::read(&file).map_err(|_| ApiError::not_found("hls file not found"))?;
+    let mime = match file.extension().and_then(|extension| extension.to_str()) {
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("ts") => "video/mp2t",
+        _ => "application/octet-stream",
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
     )
         .into_response())
 }

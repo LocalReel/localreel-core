@@ -37,6 +37,7 @@ struct Shared {
     media_ops: Arc<MediaOps>,
     thumbnail_dir: PathBuf,
     transcode_dir: PathBuf,
+    hls_dir: PathBuf,
     storage: Arc<StorageRegistry>,
     /// Base URL of the running server, used to read remote media over HTTP.
     stream_base: Option<String>,
@@ -70,6 +71,10 @@ impl MediaJobs {
             shared: Arc::new(Shared {
                 db,
                 media_ops,
+                hls_dir: thumbnail_dir
+                    .parent()
+                    .map(|parent| parent.join("hls"))
+                    .unwrap_or_else(|| PathBuf::from("hls")),
                 thumbnail_dir,
                 transcode_dir,
                 storage,
@@ -89,8 +94,26 @@ impl MediaJobs {
                 media_ops: existing.media_ops.clone(),
                 thumbnail_dir: existing.thumbnail_dir.clone(),
                 transcode_dir: existing.transcode_dir.clone(),
+                hls_dir: existing.hls_dir.clone(),
                 storage: existing.storage.clone(),
                 stream_base: Some(base),
+            }),
+        }
+    }
+
+    /// Point HLS packaging at the configured directory.
+    pub fn with_hls_dir(self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let existing = &*self.shared;
+        Self {
+            shared: Arc::new(Shared {
+                db: existing.db.clone(),
+                media_ops: existing.media_ops.clone(),
+                thumbnail_dir: existing.thumbnail_dir.clone(),
+                transcode_dir: existing.transcode_dir.clone(),
+                hls_dir: dir,
+                storage: existing.storage.clone(),
+                stream_base: existing.stream_base.clone(),
             }),
         }
     }
@@ -100,6 +123,7 @@ impl MediaJobs {
         registry.register(ProbeMediaHandler(self.shared.clone()));
         registry.register(ThumbnailHandler(self.shared.clone()));
         registry.register(TranscodeHandler(self.shared.clone()));
+        registry.register(HlsPackageHandler(self.shared.clone()));
         registry.register(CacheGcHandler(self.shared.clone()));
         registry.register(RestoreBackupHandler(self.shared.clone()));
         registry.register(RestoreBackupFileHandler(self.shared.clone()));
@@ -375,6 +399,106 @@ impl JobHandler for TranscodeHandler {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct HlsPayload {
+    media_id: i64,
+    #[serde(default)]
+    segment_secs: Option<u32>,
+}
+
+struct HlsPackageHandler(Arc<Shared>);
+
+impl JobHandler for HlsPackageHandler {
+    fn kind(&self) -> &'static str {
+        "hls_package"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: HlsPayload = context.payload()?;
+        let service = MediaService::with_storage(self.0.db.clone(), self.0.storage.clone());
+        let media = service
+            .get_media(payload.media_id)?
+            .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
+        let input = media_input(&media, self.0.stream_base.as_deref())?;
+        if let MediaInput::Path(path) = &input {
+            if !path.is_file() {
+                return Err(KernelError::NotFound(format!(
+                    "media file is missing: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let variant_path = format!("{}/index.m3u8", media.uid);
+        let final_dir = self.0.hls_dir.join(&media.uid);
+        let playlist = final_dir.join("index.m3u8");
+        if playlist.is_file() {
+            let size = std::fs::metadata(&playlist)
+                .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            service.record_variant(media.id, "hls", "default", &variant_path, size)?;
+            return JobOutcome::json(serde_json::json!({
+                "playlist": variant_path,
+                "exists": true,
+            }));
+        }
+
+        let segment_secs = payload.segment_secs.unwrap_or(4).clamp(1, 30);
+        let temp_dir = self.0.hls_dir.join(format!("{}.tmp", media.uid));
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        context.report_progress(0.05, Some("packaging hls"));
+        self.0.media_ops.package_hls(
+            &input,
+            &temp_dir,
+            segment_secs,
+            media.duration,
+            &context.cancel_flag(),
+            |progress| context.report_progress(0.05 + progress * 0.9, Some("packaging hls")),
+        )?;
+
+        if final_dir.exists() {
+            std::fs::remove_dir_all(&final_dir).map_err(|error| {
+                KernelError::Media(format!("cannot replace {}: {error}", final_dir.display()))
+            })?;
+        }
+        std::fs::rename(&temp_dir, &final_dir).map_err(|error| {
+            KernelError::Media(format!(
+                "cannot move {} to {}: {error}",
+                temp_dir.display(),
+                final_dir.display()
+            ))
+        })?;
+
+        let size = i64::try_from(directory_size(&final_dir)).unwrap_or(i64::MAX);
+        service.record_variant(media.id, "hls", "default", &variant_path, size)?;
+        context.report_progress(1.0, Some("hls ready"));
+        JobOutcome::json(serde_json::json!({
+            "playlist": variant_path,
+            "segment_secs": segment_secs,
+            "bytes": size,
+        }))
+    }
+}
+
+fn directory_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_dir() {
+                total = total.saturating_add(directory_size(&entry.path()));
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct CacheGcPayload {
     #[serde(default)]
     max_bytes: Option<u64>,
@@ -398,12 +522,18 @@ impl JobHandler for CacheGcHandler {
         let protect_recent_secs = payload.protect_recent_secs.unwrap_or(3600);
 
         context.report_progress(0.1, Some("scanning transcode cache"));
-        let report = MediaService::new(self.0.db.clone()).gc_transcode_cache(
+        let service = MediaService::new(self.0.db.clone());
+        let mut report = service.gc_transcode_cache(
             &self.0.transcode_dir,
             max_bytes,
             max_age_secs,
             protect_recent_secs,
         )?;
+        context.report_progress(0.8, Some("scanning hls packages"));
+        if let Ok((hls_removed, hls_freed)) = service.gc_hls_cache(&self.0.hls_dir, max_age_secs) {
+            report.removed += hls_removed;
+            report.freed_bytes = report.freed_bytes.saturating_add(hls_freed);
+        }
         context.report_progress(1.0, Some("cache GC complete"));
         JobOutcome::json(report)
     }

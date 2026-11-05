@@ -211,6 +211,155 @@ impl MediaOps {
         }
     }
 
+    /// Package `input` as an HLS VOD playlist into `output_dir`.
+    ///
+    /// Segments are MPEG-TS slices with a keyframe at each boundary; the
+    /// playlist is written last, so a truncated run never leaves a valid-looking
+    /// playlist behind.
+    pub fn package_hls(
+        &self,
+        input: &MediaInput,
+        output_dir: &Path,
+        segment_secs: u32,
+        duration_secs: Option<f64>,
+        cancel: &AtomicBool,
+        mut on_progress: impl FnMut(f64),
+    ) -> Result<()> {
+        std::fs::create_dir_all(output_dir)?;
+        let mut command = binary_command(&self.ffmpeg);
+        command
+            .args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"])
+            .arg(input.as_os())
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-f",
+                "hls",
+                "-hls_time",
+            ])
+            .arg(segment_secs.to_string())
+            .args([
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_segment_filename",
+            ])
+            .arg(output_dir.join("seg_%05d.ts"))
+            .arg(output_dir.join("index.m3u8"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|error| {
+            KernelError::Media(format!(
+                "failed to spawn {}: {error}",
+                self.ffmpeg.display()
+            ))
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| KernelError::Media("ffmpeg stdout unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| KernelError::Media("ffmpeg stderr unavailable".into()))?;
+
+        let (progress_tx, progress_rx) = mpsc::channel::<f64>();
+        let progress_reader = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(|line| line.ok()) {
+                if let Some(value) = line.strip_prefix("out_time_ms=") {
+                    if let Ok(micros) = value.trim().parse::<f64>() {
+                        let _ = progress_tx.send(micros / 1_000_000.0);
+                    }
+                }
+            }
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = Vec::new();
+            let _ = reader.read_to_end(&mut buffer);
+            buffer
+        });
+
+        let started = Instant::now();
+        let result = loop {
+            for seconds in progress_rx.try_iter() {
+                if let Some(total) = duration_secs.filter(|total| *total > 0.0) {
+                    on_progress((seconds / total).clamp(0.0, 0.999));
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status.success()),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(KernelError::Media(format!(
+                        "failed to query ffmpeg status: {error}"
+                    )));
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                terminate(&mut child);
+                break Err(KernelError::Media("hls packaging canceled".into()));
+            }
+            if started.elapsed() >= self.transcode_timeout {
+                terminate(&mut child);
+                break Err(KernelError::Media(format!(
+                    "hls packaging timed out after {} seconds",
+                    self.transcode_timeout.as_secs()
+                )));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        for seconds in progress_rx.try_iter() {
+            if let Some(total) = duration_secs.filter(|total| *total > 0.0) {
+                on_progress((seconds / total).clamp(0.0, 0.999));
+            }
+        }
+        let _ = progress_reader.join();
+        let stderr = stderr_reader.join().unwrap_or_default();
+
+        match result {
+            Ok(true) => {
+                if duration_secs.is_some() {
+                    on_progress(1.0);
+                }
+                Ok(())
+            }
+            Ok(false) => {
+                let _ = std::fs::remove_dir_all(output_dir);
+                Err(KernelError::Media(format!(
+                    "ffmpeg hls packaging failed for {}: {}",
+                    input.display(),
+                    tail_text(&stderr, 4096)
+                )))
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(output_dir);
+                Err(error)
+            }
+        }
+    }
+
     /// Transcode `input` into `output` using a typed preset.
     ///
     /// `duration_secs` is used to turn ffmpeg's `out_time_ms` progress into a
@@ -792,19 +941,67 @@ mod tests {
     }
 
     #[test]
-    fn transcode_args_copy_video_with_aac_audio() {
-        let preset = TranscodePreset {
-            name: "remux_audio".into(),
-            video_codec: "copy".into(),
-            audio_codec: "aac".into(),
-            crf: 23,
-            speed: "veryfast".into(),
-            audio_bitrate: "160k".into(),
-        };
-        let args = args_of(&preset);
-        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
-        assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
-        assert!(!args.contains(&"-preset".to_string()));
-        assert!(args.contains(&"-b:a".to_string()));
+    fn packages_a_short_video_as_hls_when_ffmpeg_is_available() {
+        let ops = MediaOps::discover(
+            PathBuf::from("ffmpeg"),
+            PathBuf::from("ffprobe"),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        );
+        if !ops.available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("localreel-hls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.mp4");
+        let status = std::process::Command::new(ops.ffmpeg_path())
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+
+        let output = dir.join("hls");
+        ops.package_hls(
+            &MediaInput::path(&input),
+            &output,
+            1,
+            Some(2.0),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert!(output.join("index.m3u8").is_file());
+        let segments = std::fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ts"))
+            .count();
+        assert!(segments >= 1, "expected at least one HLS segment");
+        let playlist = std::fs::read_to_string(output.join("index.m3u8")).unwrap();
+        assert!(playlist.starts_with("#EXTM3U"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

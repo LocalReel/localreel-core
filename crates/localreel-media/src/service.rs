@@ -697,6 +697,46 @@ impl MediaService {
         })
     }
 
+    /// Remove HLS package directories older than `max_age_secs` and drop their
+    /// variant rows. Returns `(directories_removed, bytes_freed)`.
+    pub fn gc_hls_cache(&self, hls_dir: &Path, max_age_secs: i64) -> Result<(i64, i64)> {
+        let now = now_secs();
+        let mut removed = 0i64;
+        let mut freed = 0i64;
+        if let Ok(entries) = std::fs::read_dir(hls_dir) {
+            for entry in entries.flatten() {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_dir() {
+                    continue;
+                }
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs() as i64)
+                    .unwrap_or(0);
+                if now.saturating_sub(modified) < max_age_secs {
+                    continue;
+                }
+                let size = directory_size(&entry.path());
+                if std::fs::remove_dir_all(entry.path()).is_ok() {
+                    removed += 1;
+                    freed = freed.saturating_add(i64::try_from(size).unwrap_or(i64::MAX));
+                }
+            }
+        }
+        self.db.with_write(|connection| {
+            connection.execute(
+                "DELETE FROM media_variants WHERE kind = 'hls' AND last_used_at < ?1",
+                [now.saturating_sub(max_age_secs)],
+            )?;
+            Ok(())
+        })?;
+        Ok((removed, freed))
+    }
+
     /// Reclaim transcode variants by age and then by total size.
     ///
     /// Thumbnails are intentionally excluded. Files touched within
@@ -1271,6 +1311,23 @@ fn rank_feed(candidates: Vec<FeedCandidate>, limit: usize) -> (Vec<FeedItem>, i6
         })
         .collect();
     (items, total)
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_dir() {
+                total = total.saturating_add(directory_size(&entry.path()));
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 #[cfg(test)]

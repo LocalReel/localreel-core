@@ -468,6 +468,7 @@ async fn serve() -> anyhow::Result<()> {
         storage.clone(),
     )
     .with_stream_base(format!("http://{stream_host}:{}", config.port))
+    .with_hls_dir(config.media.hls_dir.clone())
     .register(&mut registry);
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));
