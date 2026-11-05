@@ -100,6 +100,188 @@ pub fn extract(path: &Path, destination: &Path) -> Result<Manifest, PluginError>
     Ok(manifest)
 }
 
+/// Result of packing a plugin directory.
+#[derive(Debug, Clone)]
+pub struct PackReport {
+    pub manifest: Manifest,
+    pub path: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Build a `.lrplug` from a directory that contains `manifest.json`.
+///
+/// The archive is deterministic (sorted entries, fixed timestamps), so packing
+/// the same directory twice yields the same SHA-256. The manifest is validated
+/// before anything is written, symlinks and non-relative paths are rejected, and
+/// the finished package is opened again with [`inspect`] as a self-check.
+pub fn pack(source: &Path, output: &Path) -> Result<PackReport, PluginError> {
+    let source = source.canonicalize().map_err(|error| {
+        PluginError::Io(format!("cannot resolve {}: {error}", source.display()))
+    })?;
+    if !source.is_dir() {
+        return Err(PluginError::Io(format!(
+            "{} is not a directory",
+            source.display()
+        )));
+    }
+    let manifest_bytes = std::fs::read(source.join("manifest.json"))
+        .map_err(|_| PluginError::Missing("manifest.json".into()))?;
+    let manifest = Manifest::parse(&manifest_bytes)?;
+    if manifest_bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(PluginError::ManifestTooLarge);
+    }
+
+    let program = PathBuf::from(&manifest.entry.program);
+    let mut files = collect_package_files(&source)?;
+    if !files.iter().any(|path| path == &program) {
+        return Err(PluginError::Missing(manifest.entry.program.clone()));
+    }
+    files.sort();
+    if let Some(index) = files
+        .iter()
+        .position(|path| path == Path::new("manifest.json"))
+    {
+        let manifest_entry = files.remove(index);
+        files.insert(0, manifest_entry);
+    }
+    if files.len() > MAX_PACKAGE_ENTRIES {
+        return Err(PluginError::TooManyEntries);
+    }
+
+    let file_name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plugin.lrplug".to_string());
+    let temp = output.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write_result = write_package(&temp, &source, &files, &program);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    let size = std::fs::metadata(&temp)
+        .map_err(|error| PluginError::Io(error.to_string()))?
+        .len();
+    if size > MAX_PACKAGE_BYTES {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PluginError::PackageTooLarge);
+    }
+    if output.exists() {
+        std::fs::remove_file(output).map_err(|error| {
+            PluginError::Io(format!("cannot replace {}: {error}", output.display()))
+        })?;
+    }
+    std::fs::rename(&temp, output).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        PluginError::Io(format!("cannot write {}: {error}", output.display()))
+    })?;
+
+    let inspected = inspect(output)?;
+    if inspected.id != manifest.id || inspected.version != manifest.version {
+        return Err(PluginError::Archive(
+            "packed manifest does not round-trip".into(),
+        ));
+    }
+    let sha256 = sha256_file(output)?;
+    Ok(PackReport {
+        manifest,
+        path: output.to_path_buf(),
+        files: files.len(),
+        bytes: size,
+        sha256,
+    })
+}
+
+fn collect_package_files(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|error| PluginError::Io(error.to_string()))?;
+        if entry.path() == root {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            return Err(PluginError::UnsafeEntry(format!(
+                "symlink {}",
+                entry.path().display()
+            )));
+        }
+        if file_type.is_dir() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| PluginError::UnsafeEntry(entry.path().display().to_string()))?
+            .to_path_buf();
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(PluginError::UnsafeEntry(relative.display().to_string()));
+        }
+        files.push(relative);
+    }
+    if files.is_empty() {
+        return Err(PluginError::Missing("manifest.json".into()));
+    }
+    Ok(files)
+}
+
+fn write_package(
+    temp: &Path,
+    source: &Path,
+    files: &[PathBuf],
+    program: &Path,
+) -> Result<(), PluginError> {
+    let file = File::create(temp)
+        .map_err(|error| PluginError::Io(format!("cannot create {}: {error}", temp.display())))?;
+    let mut writer = zip::ZipWriter::new(file);
+    let mut total = 0u64;
+    for relative in files {
+        let bytes = std::fs::read(source.join(relative)).map_err(|error| {
+            PluginError::Io(format!("cannot read {}: {error}", relative.display()))
+        })?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_EXTRACTED_BYTES {
+            return Err(PluginError::ExtractedTooLarge);
+        }
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let mode = if relative == program || relative.starts_with("bin") {
+            0o755
+        } else {
+            0o644
+        };
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default())
+            .unix_permissions(mode);
+        writer
+            .start_file(name, options)
+            .map_err(|error| PluginError::Archive(error.to_string()))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|error| PluginError::Io(error.to_string()))?;
+    }
+    let file = writer
+        .finish()
+        .map_err(|error| PluginError::Archive(error.to_string()))?;
+    file.sync_all()
+        .map_err(|error| PluginError::Io(error.to_string()))?;
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, PluginError> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(path)
+        .map_err(|error| PluginError::Io(format!("cannot read {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|error| PluginError::Io(error.to_string()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn open(path: &Path) -> Result<ZipArchive<File>, PluginError> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| PluginError::Io(format!("cannot read {}: {error}", path.display())))?;
@@ -264,5 +446,56 @@ mod tests {
         writer.write_all(manifest_json("demo").as_bytes()).unwrap();
         writer.finish().unwrap();
         assert!(matches!(inspect(&archive), Err(PluginError::Missing(_))));
+    }
+
+    fn plugin_directory(root: &Path) -> PathBuf {
+        let dir = root.join("plugin");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest_json("demo")).unwrap();
+        std::fs::write(dir.join("bin/plugin"), b"#!/bin/sh\necho ready\n").unwrap();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/readme.txt"), b"hello").unwrap();
+        dir
+    }
+
+    #[test]
+    fn packs_a_plugin_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_directory(temp.path());
+        let output = temp.path().join("demo.lrplug");
+        let report = pack(&dir, &output).unwrap();
+        assert_eq!(report.manifest.id, "demo");
+        assert_eq!(report.files, 3);
+        assert_eq!(report.sha256.len(), 64);
+        assert!(output.is_file());
+
+        let manifest = inspect(&output).unwrap();
+        assert_eq!(manifest.id, "demo");
+        let extracted = temp.path().join("out");
+        extract(&output, &extracted).unwrap();
+        assert_eq!(
+            std::fs::read(extracted.join("data/readme.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn packing_the_same_directory_is_deterministic() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_directory(temp.path());
+        let first = pack(&dir, &temp.path().join("first.lrplug")).unwrap();
+        let second = pack(&dir, &temp.path().join("second.lrplug")).unwrap();
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(first.bytes, second.bytes);
+    }
+
+    #[test]
+    fn pack_rejects_a_missing_entry_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("plugin");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest_json("demo")).unwrap();
+        let error = pack(&dir, &temp.path().join("bad.lrplug")).unwrap_err();
+        assert!(matches!(error, PluginError::Missing(_)));
     }
 }

@@ -158,6 +158,23 @@ A storage provider may return URIs that are not local paths (for example
 The server's listen address is used for that endpoint; a bind on `0.0.0.0` is
 reached through `127.0.0.1`. Jobs that need remote media fail with a clear
 message when the server is not running (for example a one-off CLI command).
+## Packing a plugin
+
+```sh
+cargo run -p localreel-plugin --bin localreel-plugin-pack -- \
+  --dir path/to/plugin --out dist/webdav.lrplug
+```
+
+```text
+packed webdav 0.1.0 -> dist/webdav.lrplug (2 files, 2338397 bytes)
+sha256: e964cb071d1044272d2c8a41380b3240ea8f4eb311717ae89131f7f3bd6eeeea
+```
+
+The packer reads `manifest.json` first, validates it, requires the entry program
+to exist inside the directory, rejects symlinks and non-relative paths, and
+writes a deterministic archive: packing the same directory twice produces the
+same SHA-256. `--force` replaces an existing output file.
+
 ## Reference plugins
 
 Two sidecar plugins ship with the repository:
