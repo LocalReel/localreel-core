@@ -175,6 +175,14 @@ to exist inside the directory, rejects symlinks and non-relative paths, and
 writes a deterministic archive: packing the same directory twice produces the
 same SHA-256. `--force` replaces an existing output file.
 
+## Tooling
+
+The [localreel-plugin-cli](https://github.com/LocalReel/localreel-plugin-cli)
+repository scaffolds a plugin project, validates manifests and packs `.lrplug`
+files with a deterministic SHA-256. [localreel-plugin-strm](https://github.com/LocalReel/localreel-plugin-strm)
+is a complete provider built with it: it exposes `.strm` files (text files that
+contain a media URL) as remote media and proxies reads with HTTP Range.
+
 ## Reference plugins
 
 Two sidecar plugins ship with the repository:
