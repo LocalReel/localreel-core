@@ -51,6 +51,10 @@ pub struct Entry {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional interpreter used to run the program (for example `node` or
+    /// `python3`). When absent the program itself is executed.
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +122,22 @@ impl Manifest {
             ));
         }
         validate_relative_program(&self.entry.program)?;
+        if let Some(runtime) = &self.entry.runtime {
+            let valid = !runtime.is_empty()
+                && runtime.len() <= 64
+                && runtime
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric())
+                && runtime
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+            if !valid {
+                return Err(PluginError::Manifest(
+                    "entry runtime must be a bare command name (no path separators)".into(),
+                ));
+            }
+        }
         if self.entry.args.len() > 32 || self.entry.args.iter().any(|arg| arg.contains('\0')) {
             return Err(PluginError::Manifest(
                 "entry args are invalid (max 32, no NUL)".into(),
@@ -218,6 +238,7 @@ mod tests {
             entry: Entry {
                 program: "bin/webdav-plugin".into(),
                 args: vec!["--serve".into()],
+                runtime: None,
             },
             permissions: vec![PERMISSION_NETWORK.into()],
             description: None,
@@ -269,6 +290,25 @@ mod tests {
                 Manifest::parse(&serde_json::to_vec(&bad).unwrap()).is_err(),
                 "{id} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn accepts_an_interpreter_runtime() {
+        let mut value = manifest();
+        value.entry.program = "plugin.js".into();
+        value.entry.args.clear();
+        value.entry.runtime = Some("node".into());
+        let parsed = Manifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.entry.runtime.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn rejects_runtime_paths() {
+        for runtime in ["/usr/bin/node", "node\\plugin", "..", "node script"] {
+            let mut value = manifest();
+            value.entry.runtime = Some(runtime.into());
+            assert!(value.validate().is_err(), "{runtime} should be rejected");
         }
     }
 }

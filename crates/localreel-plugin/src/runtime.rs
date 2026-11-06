@@ -37,6 +37,21 @@ pub struct PluginRuntime {
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
+/// Build the command that starts a plugin.
+///
+/// A manifest may name an interpreter (`entry.runtime`); the entry program is
+/// then passed to it as the first argument. Without a runtime the program runs
+/// directly, which is the precompiled-binary case.
+fn launch_command(program: &Path, manifest: &Manifest) -> Command {
+    if let Some(runtime) = manifest.entry.runtime.as_deref() {
+        let mut command = Command::new(runtime);
+        command.arg(program);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
 impl PluginRuntime {
     /// Start `program` with the manifest's args and the runtime environment.
     pub fn start(
@@ -58,7 +73,7 @@ impl PluginRuntime {
         }
         let token = uuid::Uuid::new_v4().to_string();
 
-        let mut command = Command::new(program);
+        let mut command = launch_command(program, manifest);
         command
             .args(&manifest.entry.args)
             .env("LOCALREEL_PLUGIN_ID", &manifest.id)
@@ -208,4 +223,45 @@ impl Drop for PluginRuntime {
 fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Entry, Manifest, PluginKind, API_VERSION};
+
+    fn manifest(runtime: Option<&str>) -> Manifest {
+        Manifest {
+            id: "example".into(),
+            name: "Example".into(),
+            version: "0.1.0".into(),
+            api_version: API_VERSION.into(),
+            kind: PluginKind::Storage,
+            entry: Entry {
+                program: "plugin.js".into(),
+                args: vec!["--flag".into()],
+                runtime: runtime.map(str::to_string),
+            },
+            permissions: vec![],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn an_interpreter_receives_the_program() {
+        let command = launch_command(Path::new("pkg/plugin.js"), &manifest(Some("node")));
+        assert_eq!(command.get_program(), "node");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["pkg/plugin.js"]);
+    }
+
+    #[test]
+    fn a_binary_runs_directly() {
+        let command = launch_command(Path::new("pkg/plugin"), &manifest(None));
+        assert_eq!(command.get_program(), "pkg/plugin");
+        assert_eq!(command.get_args().count(), 0);
+    }
 }

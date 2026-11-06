@@ -55,6 +55,12 @@ Rules:
 - `kind` is `storage`.
 - `entry.program` is a relative path inside the package (no `..`, no drive
   prefix, no absolute path).
+- `entry.runtime` (optional) names an interpreter that runs the program, for
+  example `"node"` or `"python3"`. The host then starts
+  `<runtime> <program> <args...>`; without it the program itself is executed.
+  Runtime names are bare command names resolved through `PATH`; path separators
+  are rejected. This is how script plugins avoid shipping a launcher binary;
+  `localreel-plugin-cli new --lang node|python` generates such projects.
 - `permissions` may contain `network`; unknown permissions are rejected. The
   host does not grant capabilities — the list documents what the plugin does.
 - Unknown manifest fields are ignored, never interpreted.
