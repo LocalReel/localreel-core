@@ -132,7 +132,7 @@ pub fn migrate_legacy_state(
         };
 
         report.matched += 1;
-        let mut current = service.get_state(target.id)?;
+        let mut current = service.get_state(crate::account::OWNER_ID, target.id)?;
         let before_state = current.clone();
         let before_position = current.position;
         let after = merge_state(&mut current, &legacy_state, target.id);
@@ -423,8 +423,8 @@ mod tests {
                 )?;
             }
             connection.execute(
-                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
-                 VALUES (1, 0, 0, 50.0, 100.0, ?1)",
+                "INSERT INTO media_state (media_id, user_id, liked, favorite, position, duration, updated_at)
+                 VALUES (1, 1, 0, 0, 50.0, 100.0, ?1)",
                 [now],
             )?;
             Ok(())

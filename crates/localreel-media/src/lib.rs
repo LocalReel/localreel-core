@@ -4,6 +4,7 @@
 //! handlers that the kernel job worker executes. It must not know about HTTP,
 //! static file serving or the web UI.
 
+pub mod account;
 pub mod backup;
 pub mod jobs;
 pub mod legacy;
@@ -17,6 +18,7 @@ pub mod service;
 pub mod state_migration;
 pub mod storage;
 
+pub use account::{AccountService, CurrentUser, Role, Session, User, UserPatch};
 pub use backup::{
     export_backup, import_backup, parse_backup, read_backup, read_backup_with_limit, Backup,
     BackupImportReport, BackupState, BACKUP_VERSION, MAX_BACKUP_BYTES, MAX_BACKUP_RESTORE_BYTES,
@@ -29,7 +31,7 @@ pub use model::{
 };
 pub use restore::{restore_backup, RestoreReport};
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
-pub use service::MediaService;
+pub use service::{MediaPageQuery, MediaService};
 pub use state_migration::{
     episode_key, migrate_legacy_state, StateMigrationDetail, StateMigrationReport,
 };

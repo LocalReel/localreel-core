@@ -261,7 +261,7 @@ fn backup_export(out: PathBuf) -> anyhow::Result<()> {
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
-    let backup = localreel_media::export_backup(&db)?;
+    let backup = localreel_media::export_backup(&db, localreel_media::account::OWNER_ID)?;
     let bytes = serde_json::to_vec_pretty(&backup)?;
     if bytes.len() as u64 > localreel_media::MAX_BACKUP_BYTES {
         anyhow::bail!(
@@ -287,7 +287,8 @@ fn backup_import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     let db = open_database(&config)?;
     run_migrations(&db)?;
     let backup = localreel_media::read_backup(&from)?;
-    let report = localreel_media::import_backup(&db, &backup, dry_run)?;
+    let report =
+        localreel_media::import_backup(&db, localreel_media::account::OWNER_ID, &backup, dry_run)?;
     println!(
         "backup import ({}): sources={} added={} states={} imported={} unchanged={} missing={} warnings={}",
         if dry_run { "dry-run" } else { "write" },
@@ -322,11 +323,14 @@ fn restore(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     let mut progress = |_: f32, _: &str| {};
     let report = restore_backup(
         &db,
-        &backup,
-        &media_ops,
-        &config.media.thumbnail_dir,
-        dry_run,
-        &cancel,
+        localreel_media::restore::RestoreInput {
+            user_id: localreel_media::account::OWNER_ID,
+            backup: &backup,
+            media_ops: &media_ops,
+            thumbnail_dir: &config.media.thumbnail_dir,
+            dry_run,
+            cancel: &cancel,
+        },
         &mut progress,
     )?;
     println!(
@@ -521,6 +525,16 @@ async fn serve(
         plugin_runtimes.push(runtime);
     }
     let media = MediaService::with_storage(db.clone(), storage.clone());
+    let accounts = localreel_media::AccountService::new(db.clone());
+    if let Ok(removed) = accounts.purge_expired_sessions() {
+        if removed > 0 {
+            info!(removed, "removed expired sessions");
+        }
+    }
+    if accounts.setup_required().unwrap_or(false) {
+        println!("  First run: open the UI and set the owner password.");
+        println!();
+    }
     let media_ops = Arc::new(MediaOps::discover(
         config.media.ffmpeg.clone(),
         config.media.ffprobe.clone(),
@@ -639,7 +653,15 @@ async fn serve(
     }
 
     let open_ui = launch::should_open_ui(&config, no_open);
-    let state = AppState::new(config, db, events.clone(), jobs, media, ffmpeg_available);
+    let state = AppState::new(
+        config,
+        db,
+        events.clone(),
+        jobs,
+        media,
+        accounts,
+        ffmpeg_available,
+    );
     let app = localreel_api::router(state);
 
     info!("LocalReel listening on {url}");
@@ -658,12 +680,16 @@ async fn serve(
     }
 
     let shutdown_signal = shutdown.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_signal.store(true, Ordering::SeqCst);
-        })
-        .await?;
+    // Connect info carries the peer address to the login rate limiter.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal.store(true, Ordering::SeqCst);
+    })
+    .await?;
 
     // Give workers a short window to finish/release the current job.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

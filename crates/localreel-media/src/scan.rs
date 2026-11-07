@@ -698,7 +698,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let mut state = service.get_state(media_id).unwrap();
+        let mut state = service.get_state(1, media_id).unwrap();
         state.favorite = true;
         state.position = 12.0;
         service.save_state(&state).unwrap();

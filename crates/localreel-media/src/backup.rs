@@ -78,7 +78,7 @@ pub fn parse_backup_with_limit(bytes: &[u8], max_bytes: u64) -> Result<Backup> {
     Ok(backup)
 }
 
-pub fn export_backup(db: &Database) -> Result<Backup> {
+pub fn export_backup(db: &Database, user_id: i64) -> Result<Backup> {
     let service = MediaService::new(db.clone());
     let sources = service
         .list_sources()?
@@ -91,9 +91,10 @@ pub fn export_backup(db: &Database) -> Result<Backup> {
             "SELECT m.uid, m.uri, s.liked, s.favorite, s.position, s.duration
              FROM media_state s
              JOIN media m ON m.id = s.media_id
+             WHERE s.user_id = ?1
              ORDER BY m.id",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([user_id], |row| {
             Ok(BackupState {
                 uid: Some(row.get(0)?),
                 path: row.get(1)?,
@@ -120,7 +121,12 @@ pub fn export_backup(db: &Database) -> Result<Backup> {
     Ok(backup)
 }
 
-pub fn import_backup(db: &Database, backup: &Backup, dry_run: bool) -> Result<BackupImportReport> {
+pub fn import_backup(
+    db: &Database,
+    user_id: i64,
+    backup: &Backup,
+    dry_run: bool,
+) -> Result<BackupImportReport> {
     validate_backup(backup)?;
     let service = MediaService::new(db.clone());
     let mut report = BackupImportReport {
@@ -159,7 +165,7 @@ pub fn import_backup(db: &Database, backup: &Backup, dry_run: bool) -> Result<Ba
             report.missing += 1;
             continue;
         };
-        let mut current = service.get_state(media_id)?;
+        let mut current = service.get_state(user_id, media_id)?;
         let before = current.clone();
         current.media_id = media_id;
         current.liked |= state.liked;
@@ -269,6 +275,7 @@ mod tests {
             .unwrap();
         let media_id = insert_media(&db, source.id, "uid-1", "file:///videos/uid-1.mp4");
         let state = crate::model::MediaState {
+            user_id: crate::account::OWNER_ID,
             media_id,
             liked: true,
             favorite: true,
@@ -278,7 +285,7 @@ mod tests {
         };
         service.save_state(&state).unwrap();
 
-        let backup = export_backup(&db).unwrap();
+        let backup = export_backup(&db, crate::account::OWNER_ID).unwrap();
         assert_eq!(backup.version, BACKUP_VERSION);
         assert_eq!(backup.sources.len(), 1);
         assert_eq!(backup.states.len(), 1);
@@ -288,9 +295,9 @@ mod tests {
             .add_source(dir2.path().join("videos").to_str().unwrap())
             .unwrap();
         insert_media(&db2, source2.id, "uid-1", "file:///videos/uid-1.mp4");
-        let report = import_backup(&db2, &backup, false).unwrap();
+        let report = import_backup(&db2, crate::account::OWNER_ID, &backup, false).unwrap();
         assert_eq!(report.imported, 1);
-        let state = service2.get_state(1).unwrap();
+        let state = service2.get_state(crate::account::OWNER_ID, 1).unwrap();
         assert!(state.liked);
         assert!(state.favorite);
         assert_eq!(state.position, 42.0);
@@ -305,6 +312,7 @@ mod tests {
         let media_id = insert_media(&db, source.id, "uid-2", "file:///videos/uid-2.mp4");
         service
             .save_state(&crate::model::MediaState {
+                user_id: crate::account::OWNER_ID,
                 media_id,
                 liked: false,
                 favorite: false,
@@ -337,10 +345,12 @@ mod tests {
                 },
             ],
         };
-        let report = import_backup(&db, &backup, false).unwrap();
+        let report = import_backup(&db, crate::account::OWNER_ID, &backup, false).unwrap();
         assert_eq!(report.imported, 1);
         assert_eq!(report.missing, 1);
-        let state = service.get_state(media_id).unwrap();
+        let state = service
+            .get_state(crate::account::OWNER_ID, media_id)
+            .unwrap();
         assert!(state.liked);
         assert_eq!(state.position, 80.0);
     }

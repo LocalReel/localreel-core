@@ -15,6 +15,18 @@ use crate::model::{
 };
 use crate::storage::StorageRegistry;
 
+/// One page of the shared library, filtered for one account.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaPageQuery<'a> {
+    pub user_id: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub source_id: Option<i64>,
+    pub query: Option<&'a str>,
+    pub filter: MediaFilter,
+    pub include_archived_sources: bool,
+}
+
 /// First-party media service.
 ///
 /// Phase 0 only covers sources and read/state access. Scan/probe/thumbnail/
@@ -436,20 +448,26 @@ impl MediaService {
     }
 
     /// Paginated media list plus the total count, optionally filtered by source.
-    pub fn list_media_page(
-        &self,
-        limit: i64,
-        offset: i64,
-        source_id: Option<i64>,
-        query: Option<&str>,
-        filter: MediaFilter,
-        include_archived_sources: bool,
-    ) -> Result<(Vec<Media>, i64)> {
+    ///
+    /// `user_id` scopes the `Continue`/`Favorites` filters and the ordering to
+    /// one account; the media rows themselves are shared by the household.
+    pub fn list_media_page(&self, page: MediaPageQuery<'_>) -> Result<(Vec<Media>, i64)> {
+        let MediaPageQuery {
+            user_id,
+            limit,
+            offset,
+            source_id,
+            query,
+            filter,
+            include_archived_sources,
+        } = page;
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
         self.db.with_read(|connection| {
             let mut conditions = Vec::new();
-            let mut values: Vec<Value> = Vec::new();
+            // The join parameter comes before any condition parameter because
+            // the join appears before the WHERE clause in the SQL text.
+            let mut values: Vec<Value> = vec![user_id.into()];
 
             if let Some(source_id) = source_id {
                 conditions.push("m.source_id = ?");
@@ -479,7 +497,8 @@ impl MediaService {
             } else {
                 format!("WHERE {}", conditions.join(" AND "))
             };
-            let from = "FROM media m LEFT JOIN media_state s ON s.media_id = m.id";
+            let from =
+                "FROM media m LEFT JOIN media_state s ON s.media_id = m.id AND s.user_id = ?";
             let count_sql = format!("SELECT COUNT(*) {from} {where_clause}");
             let total: i64 =
                 connection.query_row(&count_sql, params_from_iter(values.iter()), |row| {
@@ -514,8 +533,8 @@ impl MediaService {
     /// Ranked feed: continue-watching first, then unwatched episodes in series
     /// order, then already-watched items. Extras and missing files never enter
     /// the feed. Returns `(items, total)` where `total` is the candidate count
-    /// before the limit.
-    pub fn feed(&self, limit: i64) -> Result<(Vec<FeedItem>, i64)> {
+    /// before the limit. Ranking is per account.
+    pub fn feed(&self, user_id: i64, limit: i64) -> Result<(Vec<FeedItem>, i64)> {
         let limit = limit.clamp(1, 200) as usize;
         self.db.with_read(|connection| {
             let mut statement = connection.prepare(
@@ -529,12 +548,12 @@ impl MediaService {
                         m.created_at, m.thumbnail_path
                  FROM media m
                  JOIN sources src ON src.id = m.source_id
-                 LEFT JOIN media_state s ON s.media_id = m.id
+                 LEFT JOIN media_state s ON s.media_id = m.id AND s.user_id = ?1
                  WHERE src.archived_at IS NULL
                    AND m.missing_at IS NULL
                    AND m.is_extra = 0",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([user_id], |row| {
                 Ok(FeedCandidate {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -932,15 +951,16 @@ impl MediaService {
         })
     }
 
-    pub fn get_state(&self, media_id: i64) -> Result<MediaState> {
+    pub fn get_state(&self, user_id: i64, media_id: i64) -> Result<MediaState> {
         self.db.with_read(|connection| {
             let state = connection
                 .query_row(
                     "SELECT media_id, liked, favorite, position, duration, updated_at
-                     FROM media_state WHERE media_id = ?1",
-                    [media_id],
+                     FROM media_state WHERE media_id = ?1 AND user_id = ?2",
+                    params![media_id, user_id],
                     |row| {
                         Ok(MediaState {
+                            user_id,
                             media_id: row.get(0)?,
                             liked: row.get::<_, i64>(1)? != 0,
                             favorite: row.get::<_, i64>(2)? != 0,
@@ -952,6 +972,7 @@ impl MediaService {
                 )
                 .optional()?;
             Ok(state.unwrap_or(MediaState {
+                user_id,
                 media_id,
                 liked: false,
                 favorite: false,
@@ -962,16 +983,16 @@ impl MediaService {
         })
     }
 
-    /// Upsert the full state object. Callers merge partial patches before
-    /// calling this; doing the merge in one writer transaction avoids the
-    /// lost-update race in the previous implementation.
+    /// Upsert the full state object for the state's own user. Callers merge
+    /// partial patches before calling this; doing the merge in one writer
+    /// transaction avoids the lost-update race in the previous implementation.
     pub fn save_state(&self, state: &MediaState) -> Result<MediaState> {
         let now = now_secs();
         self.db.with_write(|connection| {
             connection.execute(
-                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(media_id) DO UPDATE SET
+                "INSERT INTO media_state (media_id, user_id, liked, favorite, position, duration, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(media_id, user_id) DO UPDATE SET
                      liked = excluded.liked,
                      favorite = excluded.favorite,
                      position = excluded.position,
@@ -979,6 +1000,7 @@ impl MediaService {
                      updated_at = excluded.updated_at",
                 params![
                     state.media_id,
+                    state.user_id,
                     state.liked as i64,
                     state.favorite as i64,
                     state.position,
@@ -1000,6 +1022,7 @@ impl MediaService {
     /// one of the two updates.
     pub fn patch_state(
         &self,
+        user_id: i64,
         media_id: i64,
         liked: Option<bool>,
         favorite: Option<bool>,
@@ -1026,8 +1049,8 @@ impl MediaService {
             let existing = transaction
                 .query_row(
                     "SELECT liked, favorite, position, duration
-                     FROM media_state WHERE media_id = ?1",
-                    [media_id],
+                     FROM media_state WHERE media_id = ?1 AND user_id = ?2",
+                    params![media_id, user_id],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)? != 0,
@@ -1058,9 +1081,9 @@ impl MediaService {
                 ));
             }
             transaction.execute(
-                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(media_id) DO UPDATE SET
+                "INSERT INTO media_state (media_id, user_id, liked, favorite, position, duration, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(media_id, user_id) DO UPDATE SET
                      liked = excluded.liked,
                      favorite = excluded.favorite,
                      position = excluded.position,
@@ -1068,6 +1091,7 @@ impl MediaService {
                      updated_at = excluded.updated_at",
                 params![
                     media_id,
+                    user_id,
                     liked_value as i64,
                     favorite_value as i64,
                     position_value,
@@ -1077,6 +1101,7 @@ impl MediaService {
             )?;
             transaction.commit()?;
             Ok(MediaState {
+                user_id,
                 media_id,
                 liked: liked_value,
                 favorite: favorite_value,
@@ -1560,6 +1585,7 @@ mod tests {
         let media = service.list_media(10, 0).unwrap().pop().unwrap();
         service
             .save_state(&MediaState {
+                user_id: 1,
                 media_id: media.id,
                 liked: true,
                 favorite: true,
@@ -1588,7 +1614,7 @@ mod tests {
         let media = service.get_media(media.id).unwrap().unwrap();
         assert!(media.uri.contains("/new/"));
         assert!(media.canonical_path.contains("new"));
-        let state = service.get_state(media.id).unwrap();
+        let state = service.get_state(1, media.id).unwrap();
         assert!(state.liked);
         assert!(state.favorite);
         assert_eq!(state.position, 42.0);
@@ -1627,7 +1653,15 @@ mod tests {
         discover_source(&service.db, &source).unwrap();
         assert_eq!(
             service
-                .list_media_page(10, 0, None, None, MediaFilter::All, false)
+                .list_media_page(MediaPageQuery {
+                    user_id: 1,
+                    limit: 10,
+                    offset: 0,
+                    source_id: None,
+                    query: None,
+                    filter: MediaFilter::All,
+                    include_archived_sources: false,
+                })
                 .unwrap()
                 .1,
             1
@@ -1635,12 +1669,28 @@ mod tests {
 
         service.set_source_archived(source.id, true).unwrap();
         let (items, total) = service
-            .list_media_page(10, 0, None, None, MediaFilter::All, false)
+            .list_media_page(MediaPageQuery {
+                user_id: 1,
+                limit: 10,
+                offset: 0,
+                source_id: None,
+                query: None,
+                filter: MediaFilter::All,
+                include_archived_sources: false,
+            })
             .unwrap();
         assert!(items.is_empty());
         assert_eq!(total, 0);
         let (items, total) = service
-            .list_media_page(10, 0, None, None, MediaFilter::All, true)
+            .list_media_page(MediaPageQuery {
+                user_id: 1,
+                limit: 10,
+                offset: 0,
+                source_id: None,
+                query: None,
+                filter: MediaFilter::All,
+                include_archived_sources: true,
+            })
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(total, 1);
@@ -1649,7 +1699,7 @@ mod tests {
     #[test]
     fn state_defaults_to_zero() {
         let (_dir, service) = setup();
-        let state = service.get_state(42).unwrap();
+        let state = service.get_state(1, 42).unwrap();
         assert_eq!(state.media_id, 42);
         assert!(!state.liked);
         assert_eq!(state.position, 0.0);
@@ -1727,29 +1777,29 @@ mod tests {
         let id = insert_media(&service, source.id, "state-patch");
 
         let liked = service
-            .patch_state(id, Some(true), None, None, None)
+            .patch_state(1, id, Some(true), None, None, None)
             .unwrap();
         assert!(liked.liked);
 
         // A progress save must not clear the like, and a like must not reset
         // the position: the merge happens inside one write transaction.
         let progressed = service
-            .patch_state(id, None, None, Some(42.0), Some(600.0))
+            .patch_state(1, id, None, None, Some(42.0), Some(600.0))
             .unwrap();
         assert!(progressed.liked, "progress save must keep the like");
         assert_eq!(progressed.position, 42.0);
 
         let favorited = service
-            .patch_state(id, Some(true), Some(true), None, None)
+            .patch_state(1, id, Some(true), Some(true), None, None)
             .unwrap();
         assert!(favorited.favorite);
         assert_eq!(favorited.position, 42.0);
 
         assert!(service
-            .patch_state(id, None, None, Some(9999.0), None)
+            .patch_state(1, id, None, None, Some(9999.0), None)
             .is_err());
         assert!(service
-            .patch_state(id, None, None, Some(f64::NAN), None)
+            .patch_state(1, id, None, None, Some(f64::NAN), None)
             .is_err());
     }
 }

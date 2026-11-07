@@ -249,9 +249,9 @@ pub fn import_legacy(db: &Database, legacy_path: &Path, dry_run: bool) -> Result
                 continue;
             };
             transaction.execute(
-                "INSERT INTO media_state (media_id, liked, favorite, position, duration, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(media_id) DO UPDATE SET
+                "INSERT INTO media_state (media_id, user_id, liked, favorite, position, duration, updated_at)
+                 VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(media_id, user_id) DO UPDATE SET
                      liked = excluded.liked,
                      favorite = excluded.favorite,
                      position = excluded.position,

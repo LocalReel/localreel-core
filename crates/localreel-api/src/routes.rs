@@ -12,7 +12,7 @@ use axum::{
         Html, IntoResponse, Response,
     },
     routing::{get, patch, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -24,10 +24,11 @@ use localreel_kernel::storage::{MediaUri, Storage};
 use localreel_kernel::time::now_secs;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
 use localreel_media::{
-    BackupImportReport, CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media,
-    MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
+    BackupImportReport, CacheGcReport, CacheStats, CurrentUser, DeleteSourceReport, FeedItem,
+    Media, MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
 
+use crate::auth;
 use crate::error::ApiError;
 use crate::guard::{loopback_guard, security_headers};
 use crate::state::AppState;
@@ -40,24 +41,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     let embedded = crate::web::is_embedded();
     let web_dir = state.config.resolved_web_dir();
 
-    let mut router = Router::new()
+    // Reachable without a session: the launcher's health probe and the sign-in
+    // endpoints themselves.
+    let public_api = Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/admin/health", get(admin_health))
-        .route("/api/v1/admin/cache", get(cache_stats))
-        .route("/api/v1/admin/cache/gc", post(run_cache_gc))
-        .route("/api/v1/backup", get(download_backup).post(upload_backup))
-        .route("/api/v1/backup/restore", post(enqueue_restore))
-        .route("/api/v1/backup/restore/upload", post(upload_restore_file))
-        .route("/api/v1/scan-runs", get(list_scan_runs))
-        .route("/api/v1/scan-issues", get(list_scan_issues))
-        .route("/api/v1/events", get(events))
-        .route("/api/v1/sources", get(list_sources).post(add_source))
-        .route(
-            "/api/v1/sources/:id",
-            patch(patch_source).delete(delete_source),
-        )
-        .route("/api/v1/sources/:id/scan", post(scan_source))
-        .route("/api/v1/sources/:id/remap", post(remap_source))
+        .route("/api/v1/auth/status", get(auth::status))
+        .route("/api/v1/auth/setup", post(auth::setup))
+        .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/logout", post(auth::logout));
+
+    // Any signed-in account: the shared library plus that account's own state.
+    let user_api = Router::new()
+        .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/feed", get(feed))
         .route("/api/v1/search", get(search_media))
@@ -68,12 +63,51 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/media/:id/stream",
             get(stream_media).head(head_media),
         )
-        .route("/api/v1/jobs", get(list_jobs))
-        .route("/api/v1/jobs/:id", get(get_job))
-        .route("/api/v1/jobs/:id/cancel", post(cancel_job))
+        .route("/api/v1/events", get(events))
         .nest_service("/thumbnails", thumbnails)
         .nest_service("/transcodes", transcodes)
         .route("/hls/*path", get(serve_hls));
+
+    // Administrators only: library structure, jobs, backups and accounts.
+    let admin_api = Router::new()
+        .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/cache", get(cache_stats))
+        .route("/api/v1/admin/cache/gc", post(run_cache_gc))
+        .route("/api/v1/backup", get(download_backup).post(upload_backup))
+        .route("/api/v1/backup/restore", post(enqueue_restore))
+        .route("/api/v1/backup/restore/upload", post(upload_restore_file))
+        .route("/api/v1/scan-runs", get(list_scan_runs))
+        .route("/api/v1/scan-issues", get(list_scan_issues))
+        .route("/api/v1/sources", get(list_sources).post(add_source))
+        .route(
+            "/api/v1/sources/:id",
+            patch(patch_source).delete(delete_source),
+        )
+        .route("/api/v1/sources/:id/scan", post(scan_source))
+        .route("/api/v1/sources/:id/remap", post(remap_source))
+        .route("/api/v1/jobs", get(list_jobs))
+        .route("/api/v1/jobs/:id", get(get_job))
+        .route("/api/v1/jobs/:id/cancel", post(cancel_job))
+        .route(
+            "/api/v1/users",
+            get(auth::list_users).post(auth::create_user),
+        )
+        .route(
+            "/api/v1/users/:id",
+            patch(auth::update_user).delete(auth::delete_user),
+        )
+        .route_layer(axum::middleware::from_fn(auth::require_admin));
+
+    let api =
+        public_api
+            .merge(user_api)
+            .merge(admin_api)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::authenticate,
+            ));
+
+    let mut router = Router::new().merge(api);
 
     if embedded {
         router = router
@@ -253,8 +287,11 @@ async fn admin_health(
     })))
 }
 
-async fn download_backup(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    let backup = localreel_media::export_backup(&state.db)?;
+async fn download_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Response, ApiError> {
+    let backup = localreel_media::export_backup(&state.db, current.user.id)?;
     let body = serde_json::to_vec_pretty(&backup)
         .map_err(|error| ApiError::internal(format!("failed to encode backup: {error}")))?;
     Response::builder()
@@ -275,12 +312,14 @@ struct BackupImportQuery {
 
 async fn upload_backup(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Query(query): Query<BackupImportQuery>,
     body: Bytes,
 ) -> Result<Json<BackupImportReport>, ApiError> {
     let backup = localreel_media::parse_backup(&body)?;
     Ok(Json(localreel_media::import_backup(
         &state.db,
+        current.user.id,
         &backup,
         query.dry_run.unwrap_or(false),
     )?))
@@ -288,10 +327,11 @@ async fn upload_backup(
 
 async fn enqueue_restore(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup = localreel_media::parse_backup(&body)?;
-    let payload = serde_json::json!({ "backup": backup }).to_string();
+    let payload = serde_json::json!({ "backup": backup, "user_id": current.user.id }).to_string();
     let job_id =
         state
             .jobs
@@ -301,6 +341,7 @@ async fn enqueue_restore(
 
 async fn upload_restore_file(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     body: Body,
 ) -> Result<Response, ApiError> {
     let upload_dir = state.config.data_dir.join("backup-uploads");
@@ -351,7 +392,11 @@ async fn upload_restore_file(
         return Err(ApiError::bad_request("empty backup upload"));
     }
 
-    let payload = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+    let payload = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "user_id": current.user.id,
+    })
+    .to_string();
     match state.jobs.enqueue(
         "restore_backup_file",
         &payload,
@@ -571,29 +616,34 @@ struct FeedPage {
 /// episodes in series order, then already-watched items.
 async fn feed(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<FeedPage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let (items, total) = state.media.feed(limit)?;
+    let (items, total) = state.media.feed(current.user.id, limit)?;
     Ok(Json(FeedPage { items, total }))
 }
 
 async fn list_media(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<MediaPage>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0).max(0);
     let filter = MediaFilter::parse(query.filter.as_deref().unwrap_or("all"))
         .ok_or_else(|| ApiError::bad_request("filter must be all, favorites or continue"))?;
-    let (items, total) = state.media.list_media_page(
-        limit,
-        offset,
-        query.source_id,
-        query.q.as_deref(),
-        filter,
-        query.include_archived.unwrap_or(false),
-    )?;
+    let (items, total) = state
+        .media
+        .list_media_page(localreel_media::MediaPageQuery {
+            user_id: current.user.id,
+            limit,
+            offset,
+            source_id: query.source_id,
+            query: query.q.as_deref(),
+            filter,
+            include_archived_sources: query.include_archived.unwrap_or(false),
+        })?;
     let next_cursor = if offset + (items.len() as i64) < total {
         Some(offset + items.len() as i64)
     } else {
@@ -608,9 +658,10 @@ async fn list_media(
 
 async fn search_media(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<MediaPage>, ApiError> {
-    list_media(State(state), Query(query)).await
+    list_media(State(state), Extension(current), Query(query)).await
 }
 
 async fn get_media(
@@ -626,9 +677,10 @@ async fn get_media(
 
 async fn get_state(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Path(id): Path<i64>,
 ) -> Result<Json<MediaState>, ApiError> {
-    Ok(Json(state.media.get_state(id)?))
+    Ok(Json(state.media.get_state(current.user.id, id)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,12 +693,14 @@ struct StatePatch {
 
 async fn put_state(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Path(id): Path<i64>,
     Json(patch): Json<StatePatch>,
 ) -> Result<Json<MediaState>, ApiError> {
     // The service merges the patch inside one write transaction: progress saves
     // and like/favorite toggles arrive concurrently from the player.
     let saved = state.media.patch_state(
+        current.user.id,
         id,
         patch.liked,
         patch.favorite,
@@ -1202,7 +1256,8 @@ mod tests {
         let events = EventBus::new(16);
         let jobs = JobQueue::new(db.clone(), events.clone());
         let media = MediaService::new(db.clone());
-        AppState::new(Config::default(), db, events, jobs, media, false)
+        let accounts = localreel_media::AccountService::new(db.clone());
+        AppState::new(Config::default(), db, events, jobs, media, accounts, false)
     }
 
     fn request(uri: &str) -> Request<Body> {
@@ -1210,6 +1265,44 @@ mod tests {
             .uri(uri)
             .header("host", "127.0.0.1:3001")
             .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A state with a configured owner and one live session.
+    fn signed_in(dir: &std::path::Path) -> (Arc<AppState>, String, String) {
+        let state = state(dir);
+        let owner = state
+            .accounts
+            .setup_owner("owner", "correct horse")
+            .unwrap();
+        let session = state.accounts.create_session(owner.id).unwrap();
+        (state, session.id, session.csrf)
+    }
+
+    fn request_as(uri: &str, session: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn request_json(
+        method: &str,
+        uri: &str,
+        session: &str,
+        csrf: &str,
+        body: String,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .header("x-localreel-csrf", csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
             .unwrap()
     }
 
@@ -1249,10 +1342,11 @@ mod tests {
     #[tokio::test]
     async fn backup_download_and_upload_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let app = router(state(dir.path()));
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
         let response = app
             .clone()
-            .oneshot(request("/api/v1/backup"))
+            .oneshot(request_as("/api/v1/backup", &session))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1266,20 +1360,154 @@ mod tests {
         let backup: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(backup["version"], 2);
 
-        let request = Request::builder()
-            .method("POST")
-            .uri("/api/v1/backup")
-            .header("host", "127.0.0.1:3001")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/backup",
+                &session,
+                &csrf,
+                String::from_utf8(body.to_vec()).unwrap(),
+            ))
+            .await
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(report["states"], 0);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_api_requests_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        for uri in [
+            "/api/v1/media",
+            "/api/v1/feed",
+            "/api/v1/sources",
+            "/api/v1/users",
+            "/api/v1/jobs",
+        ] {
+            let response = app.clone().oneshot(request(uri)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must require a session"
+            );
+        }
+        // The launcher probe and the sign-in endpoints stay public.
+        let response = app
+            .clone()
+            .oneshot(request("/api/v1/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(request("/api/v1/auth/status")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn state_changing_requests_need_the_csrf_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/sources/1")
+                    .header("host", "127.0.0.1:3001")
+                    .header("cookie", format!("localreel_session={session}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archived":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn regular_accounts_cannot_reach_admin_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _session, _csrf) = signed_in(dir.path());
+        let guest = state
+            .accounts
+            .create_user("guest", "guest password", localreel_media::Role::User)
+            .unwrap();
+        let guest_session = state.accounts.create_session(guest.id).unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/sources", &guest_session.id))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request_as("/api/v1/media", &guest_session.id))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn per_user_state_is_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, owner_session, owner_csrf) = signed_in(dir.path());
+        let guest = state
+            .accounts
+            .create_user("guest", "guest password", localreel_media::Role::User)
+            .unwrap();
+        let guest_session = state.accounts.create_session(guest.id).unwrap();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        state
+            .media
+            .add_source(source_dir.to_str().unwrap())
+            .unwrap();
+        let media_id = state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media (uid, source_id, uri, canonical_path, filename, created_at, updated_at)
+                     VALUES ('uid-1', 1, 'file:///videos/a.mp4', 'videos/a.mp4', 'a.mp4', 0, 0)",
+                    [],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "PUT",
+                &format!("/api/v1/media/{media_id}/state"),
+                &owner_session,
+                &owner_csrf,
+                r#"{"favorite":true,"position":42.0,"duration":100.0}"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The guest sees their own (empty) state, not the owner's.
+        let response = app
+            .oneshot(request_as(
+                &format!("/api/v1/media/{media_id}/state"),
+                &guest_session.id,
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let state_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state_json["favorite"], false);
+        assert_eq!(state_json["position"], 0.0);
     }
 
     #[tokio::test]
@@ -1335,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn archive_source_hides_it_and_blocks_scans() {
         let dir = tempfile::tempdir().unwrap();
-        let app_state = state(dir.path());
+        let (app_state, session, csrf) = signed_in(dir.path());
         let source_dir = dir.path().join("videos");
         std::fs::create_dir_all(&source_dir).unwrap();
         let source = app_state
@@ -1344,14 +1572,14 @@ mod tests {
             .unwrap();
         let app = router(app_state);
 
-        let patch = |body: &'static str| {
-            Request::builder()
-                .method("PATCH")
-                .uri(format!("/api/v1/sources/{}", source.id))
-                .header("host", "127.0.0.1:3001")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap()
+        let patch = |body: &str| {
+            request_json(
+                "PATCH",
+                &format!("/api/v1/sources/{}", source.id),
+                &session,
+                &csrf,
+                body.to_string(),
+            )
         };
 
         let response = app
@@ -1368,7 +1596,7 @@ mod tests {
 
         let response = app
             .clone()
-            .oneshot(request("/api/v1/sources"))
+            .oneshot(request_as("/api/v1/sources", &session))
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1379,7 +1607,10 @@ mod tests {
 
         let response = app
             .clone()
-            .oneshot(request("/api/v1/sources?include_archived=true"))
+            .oneshot(request_as(
+                "/api/v1/sources?include_archived=true",
+                &session,
+            ))
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1390,14 +1621,13 @@ mod tests {
 
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/sources/{}/scan", source.id))
-                    .header("host", "127.0.0.1:3001")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request_json(
+                "POST",
+                &format!("/api/v1/sources/{}/scan", source.id),
+                &session,
+                &csrf,
+                String::new(),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);

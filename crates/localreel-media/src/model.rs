@@ -87,6 +87,8 @@ pub struct FeedItem {
 /// Per-media user state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaState {
+    /// Account this progress belongs to. State is per user; the library is not.
+    pub user_id: i64,
     pub media_id: i64,
     pub liked: bool,
     pub favorite: bool,

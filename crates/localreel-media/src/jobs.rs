@@ -542,6 +542,9 @@ impl JobHandler for CacheGcHandler {
 #[derive(Debug, Serialize, Deserialize)]
 struct RestorePayload {
     backup: Backup,
+    /// Account whose playback state the restore replays.
+    #[serde(default = "default_restore_user")]
+    user_id: i64,
 }
 
 struct RestoreBackupHandler(Arc<Shared>);
@@ -559,11 +562,14 @@ impl JobHandler for RestoreBackupHandler {
         };
         let report = restore_backup(
             &self.0.db,
-            &payload.backup,
-            &self.0.media_ops,
-            &self.0.thumbnail_dir,
-            false,
-            &cancel,
+            crate::restore::RestoreInput {
+                user_id: payload.user_id,
+                backup: &payload.backup,
+                media_ops: &self.0.media_ops,
+                thumbnail_dir: &self.0.thumbnail_dir,
+                dry_run: false,
+                cancel: &cancel,
+            },
             &mut progress,
         )?;
         JobOutcome::json(report)
@@ -573,6 +579,14 @@ impl JobHandler for RestoreBackupHandler {
 #[derive(Debug, Serialize, Deserialize)]
 struct RestoreFilePayload {
     path: String,
+    /// Account whose playback state the restore replays.
+    #[serde(default = "default_restore_user")]
+    user_id: i64,
+}
+
+/// Restores enqueued before accounts existed replay into the owner account.
+fn default_restore_user() -> i64 {
+    crate::account::OWNER_ID
 }
 
 struct RestoreBackupFileHandler(Arc<Shared>);
@@ -593,11 +607,14 @@ impl JobHandler for RestoreBackupFileHandler {
             };
             let report = restore_backup(
                 &self.0.db,
-                &backup,
-                &self.0.media_ops,
-                &self.0.thumbnail_dir,
-                false,
-                &cancel,
+                crate::restore::RestoreInput {
+                    user_id: payload.user_id,
+                    backup: &backup,
+                    media_ops: &self.0.media_ops,
+                    thumbnail_dir: &self.0.thumbnail_dir,
+                    dry_run: false,
+                    cancel: &cancel,
+                },
                 &mut progress,
             )?;
             JobOutcome::json(report)
