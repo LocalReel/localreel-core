@@ -1,5 +1,6 @@
 mod launch;
 mod logging;
+mod tray;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,9 @@ enum Command {
         /// Do not open the web UI in a browser.
         #[arg(long)]
         no_open: bool,
+        /// Show a notification-area icon and hide this console (desktop only).
+        #[arg(long)]
+        tray: bool,
         /// Bind this port instead of the configured one.
         #[arg(long, value_name = "PORT")]
         port: Option<u16>,
@@ -129,14 +133,16 @@ async fn main() -> anyhow::Result<()> {
 async fn dispatch(cli: Cli, mode: RunMode) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve {
         no_open: false,
+        tray: false,
         port: None,
         host: None,
     }) {
         Command::Serve {
             no_open,
+            tray,
             port,
             host,
-        } => serve(mode, no_open, port, host).await,
+        } => serve(mode, no_open, tray, port, host).await,
         Command::Migrate => migrate(),
         Command::Doctor => doctor(),
         Command::Scan { source_id } => scan(source_id),
@@ -446,6 +452,7 @@ fn prune_backup_uploads(data_dir: &std::path::Path) {
 async fn serve(
     mode: RunMode,
     no_open: bool,
+    tray_icon: bool,
     port: Option<u16>,
     host: Option<String>,
 ) -> anyhow::Result<()> {
@@ -651,6 +658,36 @@ async fn serve(
     }
 
     let open_ui = launch::should_open_ui(&config, no_open);
+
+    // The tray is the desktop persona's way to stop the server without the
+    // console. It is only installed when asked for, and the console is only
+    // hidden once the icon really exists.
+    let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let tray_handle: Option<tray::Tray> = if tray_icon && config.mode.is_desktop() {
+        let tray_url = url.clone();
+        tray::spawn(tray_url, move || {
+            let _ = quit_tx.send(());
+        })
+    } else {
+        None
+    };
+    let tray_active = tray_handle.is_some();
+    if tray_active {
+        let hidden = tray::hide_console();
+        info!(
+            "tray icon installed; console {}",
+            if hidden { "hidden" } else { "kept" }
+        );
+        if hidden {
+            println!("  Tray:    right-click the notification-area icon to open or quit");
+        } else {
+            println!("  Tray:    right-click the notification-area icon to open or quit");
+            println!("  Stop:    close this window, or press Ctrl+C");
+        }
+    } else if tray_icon {
+        println!("  Tray:    not available on this platform or in server mode");
+    }
+
     let state = AppState::new(
         config,
         db,
@@ -678,16 +715,30 @@ async fn serve(
     }
 
     let shutdown_signal = shutdown.clone();
+    let tray_shutdown = async move {
+        if tray_active {
+            let _ = quit_rx.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     // Connect info carries the peer address to the login rate limiter.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = tray_shutdown => {}
+        }
         shutdown_signal.store(true, Ordering::SeqCst);
     })
     .await?;
+
+    if let Some(mut tray) = tray_handle {
+        tray.close();
+    }
 
     // Give workers a short window to finish/release the current job.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
