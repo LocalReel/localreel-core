@@ -951,6 +951,26 @@ impl MediaService {
         })
     }
 
+    /// Look a media row up by its public uid.
+    ///
+    /// The HLS routes are uid-based (`/hls/<uid>/index.m3u8`) and need the id to
+    /// keep the playback session alive.
+    pub fn get_media_by_uid(&self, uid: &str) -> Result<Option<Media>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                            duration, width, height, file_size, modified_at, video_codec,
+                            audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                            updated_at
+                     FROM media WHERE uid = ?1",
+                    [uid],
+                    row_to_media,
+                )
+                .optional()?)
+        })
+    }
+
     pub fn get_state(&self, user_id: i64, media_id: i64) -> Result<MediaState> {
         self.db.with_read(|connection| {
             let state = connection

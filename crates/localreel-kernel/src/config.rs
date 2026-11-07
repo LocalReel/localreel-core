@@ -127,6 +127,14 @@ pub struct MediaConfig {
     pub hls_dir: PathBuf,
     pub cache_max_bytes: u64,
     pub cache_max_age: Duration,
+    /// How many ffmpeg jobs (transcode/HLS packaging) may run at once.
+    ///
+    /// One CPU and one memory budget is what a NAS actually has; letting every
+    /// viewer start their own encode is how a media server becomes the reason
+    /// the household network is slow.
+    pub max_concurrent_transcodes: usize,
+    /// A playback session with no request for this long is reclaimed.
+    pub idle_session_secs: u64,
 }
 
 impl Default for Config {
@@ -165,6 +173,8 @@ impl Default for Config {
                 hls_dir: data_dir.join("hls"),
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
+                max_concurrent_transcodes: 2,
+                idle_session_secs: 900,
             },
             scan: ScanConfig { watch: true },
             plugins: Vec::new(),
@@ -313,6 +323,12 @@ impl Config {
         if let Some(value) = file.media.cache_max_age_hours {
             self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
         }
+        if let Some(value) = file.media.max_concurrent_transcodes {
+            self.media.max_concurrent_transcodes = value;
+        }
+        if let Some(value) = file.media.idle_session_secs {
+            self.media.idle_session_secs = value;
+        }
         if let Some(value) = file.scan.watch {
             self.scan.watch = value;
         }
@@ -389,6 +405,14 @@ impl Config {
         if let Some(value) = env_bool("LOCALREEL_WATCH")? {
             self.scan.watch = value;
         }
+        if let Some(value) = env_u64("LOCALREEL_MAX_CONCURRENT_TRANSCODES")? {
+            self.media.max_concurrent_transcodes = usize::try_from(value).map_err(|_| {
+                KernelError::Config("LOCALREEL_MAX_CONCURRENT_TRANSCODES is too large".into())
+            })?;
+        }
+        if let Some(value) = env_u64("LOCALREEL_IDLE_SESSION_SECS")? {
+            self.media.idle_session_secs = value;
+        }
         Ok(())
     }
 
@@ -413,6 +437,16 @@ impl Config {
         if self.media.ffmpeg.as_os_str().is_empty() || self.media.ffprobe.as_os_str().is_empty() {
             return Err(KernelError::Config(
                 "ffmpeg and ffprobe paths must not be empty".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.media.max_concurrent_transcodes) {
+            return Err(KernelError::Config(
+                "max concurrent transcodes must be between 1 and 64".into(),
+            ));
+        }
+        if self.media.idle_session_secs == 0 {
+            return Err(KernelError::Config(
+                "idle session seconds must be greater than 0".into(),
             ));
         }
         if !self.allow_remote && !is_loopback_host(&self.host) {
@@ -541,6 +575,8 @@ struct MediaFile {
     hls_dir: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
     cache_max_age_hours: Option<u64>,
+    max_concurrent_transcodes: Option<usize>,
+    idle_session_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -710,6 +746,31 @@ mod tests {
         assert!(config.validate().is_err());
         config.allow_remote = true;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn transcode_budget_defaults_and_overrides() {
+        let config = Config::default();
+        assert_eq!(config.media.max_concurrent_transcodes, 2);
+        assert_eq!(config.media.idle_session_secs, 900);
+
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+            [media]
+            max_concurrent_transcodes = 1
+            idle_session_secs = 120
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(parsed).unwrap();
+        assert_eq!(config.media.max_concurrent_transcodes, 1);
+        assert_eq!(config.media.idle_session_secs, 120);
+
+        // A zero budget would deadlock every transcode.
+        let mut invalid = Config::default();
+        invalid.media.max_concurrent_transcodes = 0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

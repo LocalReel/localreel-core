@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod backup;
+pub mod gate;
 pub mod jobs;
 pub mod legacy;
 pub mod migrations;
@@ -25,6 +26,7 @@ pub use backup::{
     BackupImportReport, BackupState, BackupUser, BACKUP_VERSION, MAX_BACKUP_BYTES,
     MAX_BACKUP_RESTORE_BYTES, MAX_BACKUP_USERS, MIN_BACKUP_FORMAT_VERSION,
 };
+pub use gate::{memory_pressure, ReapReport, TranscodeGate, TranscodeStatus};
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
 pub use model::{

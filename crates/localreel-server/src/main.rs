@@ -616,6 +616,18 @@ async fn serve(
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // One ffmpeg budget for the whole process. The workers draw from it, the API
+    // reports it and the reaper cancels work nobody is watching.
+    let transcodes = Arc::new(localreel_media::TranscodeGate::new(
+        config.media.max_concurrent_transcodes,
+        Duration::from_secs(config.media.idle_session_secs),
+    ));
+    info!(
+        limit = transcodes.limit(),
+        idle_session_secs = config.media.idle_session_secs,
+        "transcode budget configured"
+    );
+
     // Recover jobs left `running` by a previous process (crash, kill, reboot).
     // Workers only claim `queued` rows, so without a reclaimer such a row would
     // stay stuck until the lease expires and then forever.
@@ -626,6 +638,7 @@ async fn serve(
     }
 
     let mut workers = Vec::new();
+    let transcode_capacity: Arc<dyn localreel_kernel::jobs::JobCapacity> = transcodes.clone();
     for index in 0..config.jobs.workers {
         workers.push(
             JobWorker::new(
@@ -635,8 +648,35 @@ async fn serve(
                 config.jobs.lease,
                 config.jobs.poll_interval,
             )
+            .with_capacity(transcode_capacity.clone())
             .spawn_with_shutdown(shutdown.clone()),
         );
+    }
+
+    // Reclaim playback sessions that stopped being used. The interval is short
+    // so a cancelled encode frees the budget quickly, but every pass is a cheap
+    // in-memory scan when nothing is idle.
+    {
+        let reaper_gate = transcodes.clone();
+        let reaper_jobs = jobs.clone();
+        let reaper_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                if reaper_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let report = reaper_gate.reap_idle(&reaper_jobs);
+                if report.sessions > 0 {
+                    info!(
+                        sessions = report.sessions,
+                        canceled = report.canceled,
+                        "reclaimed idle playback sessions"
+                    );
+                }
+            }
+        });
     }
 
     // Keep reclaiming: a job whose worker died while its lease was still valid
@@ -726,15 +766,16 @@ async fn serve(
         println!("  Tray:    not available on this platform or in server mode");
     }
 
-    let state = AppState::new(
+    let state = AppState::new(localreel_api::state::AppStateParts {
         config,
         db,
-        events.clone(),
+        events: events.clone(),
         jobs,
         media,
         accounts,
+        transcodes,
         ffmpeg_available,
-    );
+    });
     let app = localreel_api::router(state.clone());
 
     // Subscribe to every enabled local source before the first request can

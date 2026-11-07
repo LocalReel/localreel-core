@@ -6,6 +6,9 @@ use std::time::Duration;
 /// Error recorded when a job is resolved because its worker disappeared.
 const INTERRUPTED: &str = "interrupted: the server stopped while this job was running";
 
+/// Shown on a queued job that is waiting for a capacity slot.
+pub const WAITING_FOR_SLOT: &str = "waiting for a transcode slot";
+
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -155,22 +158,48 @@ impl JobQueue {
     /// Uses `BEGIN IMMEDIATE` so two workers cannot both select the same row
     /// and then lose the upgrade to a write lock (the vtx prototype's bug).
     pub fn claim(&self, worker_id: &str, lease_secs: i64) -> Result<Option<JobRecord>> {
+        self.claim_skipping(worker_id, lease_secs, &[])
+    }
+
+    /// Claim the next job whose kind is not in `skip`.
+    ///
+    /// The worker names the kinds that currently have no capacity slot, so a
+    /// saturated transcode queue cannot starve the scans and probes behind it.
+    pub fn claim_skipping(
+        &self,
+        worker_id: &str,
+        lease_secs: i64,
+        skip: &[String],
+    ) -> Result<Option<JobRecord>> {
         let job = self.db.with_write(|connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_secs();
 
+            let mut sql = format!(
+                "SELECT {JOB_COLUMNS} FROM sys_jobs
+                 WHERE status = 'queued' AND available_at <= ?1"
+            );
+            if !skip.is_empty() {
+                sql.push_str(" AND kind NOT IN (");
+                for index in 0..skip.len() {
+                    if index > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push('?');
+                    sql.push_str(&(index + 2).to_string());
+                }
+                sql.push(')');
+            }
+            sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
+
+            let mut values: Vec<&dyn rusqlite::ToSql> = vec![&now];
+            for kind in skip {
+                values.push(kind);
+            }
+
             let job = transaction
-                .query_row(
-                    &format!(
-                        "SELECT {JOB_COLUMNS} FROM sys_jobs
-                         WHERE status = 'queued' AND available_at <= ?1
-                         ORDER BY priority DESC, created_at ASC
-                         LIMIT 1"
-                    ),
-                    [now],
-                    row_to_job,
-                )
+                .query_row(&sql, rusqlite::params_from_iter(values), row_to_job)
                 .optional()?;
 
             let Some(mut job) = job else {
@@ -471,6 +500,82 @@ impl JobQueue {
         Ok(released)
     }
 
+    /// Return a just-claimed job to the queue without emitting an event.
+    ///
+    /// Used when the job was claimed only to learn its kind and no capacity slot
+    /// is free: it must stay visible as `queued`, and the claim must not consume
+    /// an attempt.
+    pub fn defer(&self, id: &str, worker_id: &str, message: Option<&str>) -> Result<bool> {
+        let now = now_secs();
+        let updated = self.db.with_write(|connection| {
+            Ok(connection.execute(
+                "UPDATE sys_jobs
+                 SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL,
+                     available_at = ?1, started_at = NULL,
+                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                     message = COALESCE(?2, message)
+                 WHERE id = ?3 AND status = 'running' AND lease_owner = ?4",
+                params![now, message, id, worker_id],
+            )?)
+        })?;
+        self.forget_cancel_flag(id);
+        Ok(updated > 0)
+    }
+
+    /// Number of jobs of the given kinds that are queued or running.
+    ///
+    /// Used by the health endpoint to report how much work is waiting for a
+    /// capacity slot without scanning the job list.
+    pub fn count_active(&self, kinds: &[&str]) -> Result<i64> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        self.db.with_read(|connection| {
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM sys_jobs WHERE status IN ('queued', 'running') AND kind IN (",
+            );
+            for index in 0..kinds.len() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                sql.push_str(&(index + 1).to_string());
+            }
+            sql.push(')');
+            let values: Vec<&dyn rusqlite::ToSql> = kinds
+                .iter()
+                .map(|kind| kind as &dyn rusqlite::ToSql)
+                .collect();
+            Ok(connection.query_row(&sql, rusqlite::params_from_iter(values), |row| row.get(0))?)
+        })
+    }
+
+    /// Label queued jobs of the given kinds, for example while they wait for a
+    /// transcode slot. Returns the number of rows that changed.
+    pub fn set_queued_message(&self, kinds: &[String], message: &str) -> Result<usize> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        self.db.with_write(|connection| {
+            let mut sql = String::from(
+                "UPDATE sys_jobs SET message = ?1 WHERE status = 'queued' AND kind IN (",
+            );
+            for index in 0..kinds.len() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                sql.push_str(&(index + 2).to_string());
+            }
+            sql.push(')');
+            let mut values: Vec<&dyn rusqlite::ToSql> = vec![&message];
+            for kind in kinds {
+                values.push(kind);
+            }
+            Ok(connection.execute(&sql, rusqlite::params_from_iter(values))?)
+        })
+    }
+
     /// Renew a lease. Returns false when the worker no longer owns the job.
     pub fn renew_lease(&self, id: &str, worker_id: &str, lease_secs: i64) -> Result<bool> {
         let updated = self.db.with_write(|connection| {
@@ -680,6 +785,47 @@ impl JobRegistry {
     }
 }
 
+/// A capacity slot held for the duration of one job.
+///
+/// The slot releases itself on drop, so a panicking or cancelled handler cannot
+/// leak the machine's transcode budget.
+pub struct Admission(Option<Box<dyn FnOnce() + Send>>);
+
+impl Admission {
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+
+    /// An admission for a kind that has no limit.
+    pub fn unlimited() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+/// Keeps expensive job kinds inside a budget.
+///
+/// The worker asks [`JobCapacity::saturated`] which kinds have no free slot and
+/// leaves those jobs queued, then asks [`JobCapacity::admit`] for the slot it is
+/// about to use. A module that owns a resource (the media crate's transcode
+/// gate) implements this; the kernel stays unaware of what the resource is.
+pub trait JobCapacity: Send + Sync {
+    /// Take a slot for `kind`, or `None` when another job must finish first.
+    fn admit(&self, kind: &str) -> Option<Admission>;
+
+    /// Kinds that cannot be admitted right now. Empty means "anything goes".
+    fn saturated(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// Worker loop. One task per configured worker; handlers run on blocking
 /// threads so scans and ffmpeg never occupy an async executor thread.
 pub struct JobWorker {
@@ -688,6 +834,7 @@ pub struct JobWorker {
     worker_id: String,
     lease: Duration,
     poll: Duration,
+    capacity: Option<Arc<dyn JobCapacity>>,
 }
 
 impl JobWorker {
@@ -704,7 +851,14 @@ impl JobWorker {
             worker_id: worker_id.into(),
             lease,
             poll,
+            capacity: None,
         }
+    }
+
+    /// Install a budget for expensive job kinds.
+    pub fn with_capacity(mut self, capacity: Arc<dyn JobCapacity>) -> Self {
+        self.capacity = Some(capacity);
+        self
     }
 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
@@ -721,21 +875,58 @@ impl JobWorker {
     }
 
     async fn run(self, shutdown: Arc<AtomicBool>) {
+        // Kinds the budget has no slot for. Recomputed each pass so a freed slot
+        // is picked up immediately, and labelled once per transition so a queued
+        // transcode says why it is waiting.
+        let mut blocked: Vec<String> = Vec::new();
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
+            let saturated = match self.capacity.as_ref() {
+                Some(capacity) => capacity.saturated(),
+                None => Vec::new(),
+            };
+            if saturated != blocked {
+                if !saturated.is_empty() {
+                    if let Err(error) = self.queue.set_queued_message(&saturated, WAITING_FOR_SLOT)
+                    {
+                        warn!("failed to label jobs waiting for a slot: {error}");
+                    }
+                }
+                blocked = saturated;
+            }
+
             match self
                 .queue
-                .claim(&self.worker_id, self.lease.as_secs() as i64)
+                .claim_skipping(&self.worker_id, self.lease.as_secs() as i64, &blocked)
             {
                 Ok(Some(job)) => {
                     if shutdown.load(Ordering::Relaxed) {
                         let _ = self.queue.release(&job.id, &self.worker_id);
                         break;
                     }
+                    // Taking the slot after the claim keeps the job `queued`
+                    // while the budget is full; the `None` arm only loses a race.
+                    let admission = match self
+                        .capacity
+                        .as_ref()
+                        .map(|capacity| capacity.admit(&job.kind))
+                    {
+                        None => None,
+                        Some(Some(admission)) => Some(admission),
+                        Some(None) => {
+                            let _ =
+                                self.queue
+                                    .defer(&job.id, &self.worker_id, Some(WAITING_FOR_SLOT));
+                            tokio::time::sleep(self.poll).await;
+                            continue;
+                        }
+                    };
                     self.execute(job).await;
+                    // The slot is held for exactly as long as the handler runs.
+                    drop(admission);
                     if shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -1058,6 +1249,230 @@ mod tests {
         fn run(&self, context: &JobContext) -> Result<JobOutcome> {
             context.report_progress(0.5, Some("halfway"));
             JobOutcome::json(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// A budget that admits `limit` jobs of one kind at a time.
+    struct LimitGate {
+        kind: &'static str,
+        remaining: Arc<Mutex<usize>>,
+    }
+
+    impl LimitGate {
+        fn new(kind: &'static str, limit: usize) -> Self {
+            Self {
+                kind,
+                remaining: Arc::new(Mutex::new(limit)),
+            }
+        }
+    }
+
+    impl JobCapacity for LimitGate {
+        fn admit(&self, kind: &str) -> Option<Admission> {
+            if kind != self.kind {
+                return Some(Admission::unlimited());
+            }
+            let mut remaining = self.remaining.lock().unwrap();
+            if *remaining == 0 {
+                return None;
+            }
+            *remaining -= 1;
+            drop(remaining);
+            let shared = Arc::clone(&self.remaining);
+            Some(Admission::new(move || {
+                *shared.lock().unwrap() += 1;
+            }))
+        }
+
+        fn saturated(&self) -> Vec<String> {
+            if *self.remaining.lock().unwrap() == 0 {
+                vec![self.kind.to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn claim_skipping_leaves_the_named_kinds_queued() {
+        let (_dir, queue) = setup();
+        let blocked = queue.enqueue("transcode", "{}", None, 3).unwrap();
+        let other = queue.enqueue("probe", "{}", None, 3).unwrap();
+
+        let skip = vec!["transcode".to_string()];
+        let claimed = queue.claim_skipping("worker-1", 60, &skip).unwrap();
+        assert_eq!(
+            claimed.as_ref().map(|job| job.id.as_str()),
+            Some(other.as_str())
+        );
+        // The skipped job is untouched and still claimable once the budget frees.
+        assert_eq!(queue.get(&blocked).unwrap().unwrap().status, status::QUEUED);
+        assert_eq!(
+            queue.claim("worker-2", 60).unwrap().map(|job| job.id),
+            Some(blocked)
+        );
+    }
+
+    #[test]
+    fn defer_requeues_without_consuming_an_attempt() {
+        let (_dir, queue) = setup();
+        let id = queue.enqueue("transcode", "{}", None, 3).unwrap();
+        assert!(queue.claim("worker-1", 60).unwrap().is_some());
+
+        assert!(queue
+            .defer(&id, "worker-1", Some(WAITING_FOR_SLOT))
+            .unwrap());
+        let job = queue.get(&id).unwrap().unwrap();
+        assert_eq!(job.status, status::QUEUED);
+        assert_eq!(job.attempts, 0, "deferring must not burn a retry");
+        assert_eq!(job.message.as_deref(), Some(WAITING_FOR_SLOT));
+        assert!(job.lease_owner.is_none());
+    }
+
+    #[test]
+    fn a_saturated_budget_labels_the_waiting_jobs() {
+        let (_dir, queue) = setup();
+        queue.enqueue("transcode", "{}", None, 3).unwrap();
+        let changed = queue
+            .set_queued_message(&["transcode".to_string()], WAITING_FOR_SLOT)
+            .unwrap();
+        assert_eq!(changed, 1);
+        let job = queue.list_recent(10).unwrap().remove(0);
+        assert_eq!(job.message.as_deref(), Some(WAITING_FOR_SLOT));
+    }
+
+    struct BlockingHandler {
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl JobHandler for BlockingHandler {
+        fn kind(&self) -> &'static str {
+            "transcode"
+        }
+
+        fn run(&self, _context: &JobContext) -> Result<JobOutcome> {
+            let _ = self.started.send(());
+            let receiver = self.release.lock().unwrap();
+            let _ = receiver.recv_timeout(Duration::from_secs(10));
+            Ok(JobOutcome::empty())
+        }
+    }
+
+    struct CountingHandler {
+        kind: &'static str,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl JobHandler for CountingHandler {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn run(&self, _context: &JobContext) -> Result<JobOutcome> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(JobOutcome::empty())
+        }
+    }
+
+    async fn wait_for(mut check: impl FnMut() -> bool, seconds: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        check()
+    }
+
+    /// The whole point of the budget: a saturated kind stays `queued` and never
+    /// enters its handler, while unrelated work keeps flowing through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_saturated_kind_waits_while_other_kinds_run() {
+        let (_dir, queue) = setup();
+        let gate = Arc::new(LimitGate::new("transcode", 1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut registry = JobRegistry::new();
+        registry.register(BlockingHandler {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        registry.register(CountingHandler {
+            kind: "probe",
+            runs: probes.clone(),
+        });
+
+        // Two workers: one may sit inside a transcode, the other must still be
+        // able to pick up unrelated work.
+        let registry = Arc::new(registry);
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            handles.push(
+                JobWorker::new(
+                    queue.clone(),
+                    registry.clone(),
+                    format!("worker-{index}"),
+                    Duration::from_secs(5),
+                    Duration::from_millis(10),
+                )
+                .with_capacity(gate.clone())
+                .spawn(),
+            );
+        }
+
+        let first = queue.enqueue("transcode", "{}", None, 3).unwrap();
+        let second = queue.enqueue("transcode", "{}", None, 3).unwrap();
+        let probe = queue.enqueue("probe", "{}", None, 3).unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a transcode must start");
+
+        // One slot, so exactly one transcode runs and the other stays queued.
+        assert!(
+            wait_for(
+                || [&first, &second]
+                    .iter()
+                    .filter(|id| queue.get(id).unwrap().unwrap().status == status::RUNNING)
+                    .count()
+                    == 1,
+                5
+            )
+            .await,
+            "exactly one transcode may run at a time"
+        );
+
+        // A different kind is not blocked by the transcode budget.
+        assert!(
+            wait_for(
+                || queue.get(&probe).unwrap().unwrap().status == status::SUCCEEDED,
+                5
+            )
+            .await,
+            "an unrelated job must not starve behind a saturated budget"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // Releasing the slot lets the waiting transcode run.
+        release_tx.send(()).unwrap();
+        assert!(
+            wait_for(
+                || {
+                    let first_state = queue.get(&first).unwrap().unwrap().status;
+                    let second_state = queue.get(&second).unwrap().unwrap().status;
+                    first_state.as_str() != status::QUEUED
+                        && second_state.as_str() != status::QUEUED
+                },
+                5
+            )
+            .await,
+            "the queued transcode must start once the slot is free"
+        );
+        for handle in handles {
+            handle.abort();
         }
     }
 

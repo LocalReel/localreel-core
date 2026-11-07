@@ -282,6 +282,10 @@ async fn admin_health(
     let database = state.db.health_check().is_ok();
     let media_count = state.media.media_count().unwrap_or(0);
     let recent_jobs = state.jobs.list_recent(20)?;
+    let queued_transcodes = state
+        .jobs
+        .count_active(localreel_media::gate::LIMITED_KINDS)
+        .unwrap_or(0);
     Ok(Json(serde_json::json!({
         "name": "LocalReel",
         "status": if database { "ok" } else { "degraded" },
@@ -294,6 +298,9 @@ async fn admin_health(
         "thumbnail_dir": state.config.media.thumbnail_dir,
         "transcode_dir": state.config.media.transcode_dir,
         "watchers": state.watchers.status(),
+        "transcodes": state
+            .transcodes
+            .status(usize::try_from(queued_transcodes).unwrap_or(0)),
         "jobs": recent_jobs,
     })))
 }
@@ -785,6 +792,9 @@ async fn prepare_playback(
         .media
         .get_media(id)?
         .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    // Any playback request keeps this media's session alive; the reaper cancels
+    // work nobody has asked about for `idle_session_secs`.
+    state.transcodes.touch(media.id);
     if media.missing_at.is_some() {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -851,12 +861,22 @@ async fn prepare_playback(
         "preset": preset_name,
     })
     .to_string();
+    // Starting an encode on a machine that is out of memory only makes it
+    // slower: say so instead of piling another ffmpeg onto the box.
+    if localreel_media::memory_pressure() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "not enough free memory to start a transcode right now",
+        ));
+    }
     let job_id = state.jobs.enqueue(
         "transcode",
         &payload,
         Some(&format!("transcode:{}:{preset_name}", media.id)),
         2,
     )?;
+    state.transcodes.attach_job(media.id, "transcode", &job_id);
     Ok((
         StatusCode::ACCEPTED,
         Json(PlaybackResponse {
@@ -887,12 +907,22 @@ fn prepare_hls_playback(
     }
 
     let payload = serde_json::json!({ "media_id": media.id }).to_string();
+    if localreel_media::memory_pressure() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "not enough free memory to package this stream right now",
+        ));
+    }
     let job_id = state.jobs.enqueue(
         "hls_package",
         &payload,
         Some(&format!("hls:{}", media.id)),
         2,
     )?;
+    state
+        .transcodes
+        .attach_job(media.id, "hls_package", &job_id);
     Ok((
         StatusCode::ACCEPTED,
         Json(PlaybackResponse {
@@ -920,6 +950,13 @@ async fn serve_hls(
         return Err(ApiError::not_found("hls file not found"));
     }
     let file = state.config.media.hls_dir.join(relative);
+    // Segments are served while the player plays; keep the session alive so the
+    // reaper does not cancel a package someone is actively watching.
+    if let Some(uid) = path.split('/').next() {
+        if let Ok(Some(media)) = state.media.get_media_by_uid(uid) {
+            state.transcodes.touch(media.id);
+        }
+    }
     let bytes = std::fs::read(&file).map_err(|_| ApiError::not_found("hls file not found"))?;
     let mime = match file.extension().and_then(|extension| extension.to_str()) {
         Some("m3u8") => "application/vnd.apple.mpegurl",
@@ -1010,6 +1047,9 @@ async fn serve_media(
     head_only: bool,
 ) -> Result<Response, ApiError> {
     let media = resolve_media(&state, id).await?;
+
+    // Streaming is the strongest "still watching" signal there is.
+    state.transcodes.touch(id);
 
     let last_modified = http_date(media.modified);
     let if_none_match = headers
@@ -1268,7 +1308,20 @@ mod tests {
         let jobs = JobQueue::new(db.clone(), events.clone());
         let media = MediaService::new(db.clone());
         let accounts = localreel_media::AccountService::new(db.clone());
-        AppState::new(Config::default(), db, events, jobs, media, accounts, false)
+        let transcodes = Arc::new(localreel_media::TranscodeGate::new(
+            2,
+            std::time::Duration::from_secs(900),
+        ));
+        AppState::new(crate::state::AppStateParts {
+            config: Config::default(),
+            db,
+            events,
+            jobs,
+            media,
+            accounts,
+            transcodes,
+            ffmpeg_available: false,
+        })
     }
 
     fn request(uri: &str) -> Request<Body> {
@@ -1371,6 +1424,11 @@ mod tests {
         assert_eq!(health["watchers"]["enabled"], true);
         assert_eq!(health["watchers"]["active"], 0);
         assert_eq!(health["watchers"]["skipped"], serde_json::json!([]));
+        // The transcode budget is reported even when nothing is running.
+        assert_eq!(health["transcodes"]["limit"], 2);
+        assert_eq!(health["transcodes"]["running"], 0);
+        assert_eq!(health["transcodes"]["queued"], 0);
+        assert_eq!(health["transcodes"]["sessions"], 0);
 
         // Adding a local source subscribes to it immediately.
         let response = app

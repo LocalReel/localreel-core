@@ -19,25 +19,44 @@ pub struct AppState {
     pub accounts: AccountService,
     pub login_limiter: LoginLimiter,
     /// Filesystem subscriptions for the enabled local sources.
-    pub watchers: std::sync::Arc<localreel_media::WatcherManager>,
+    pub watchers: Arc<localreel_media::WatcherManager>,
+    /// The single ffmpeg budget (transcode / HLS packaging).
+    pub transcodes: Arc<localreel_media::TranscodeGate>,
     pub ffmpeg_available: bool,
     pub started_at: i64,
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
     /// selects on it together with Ctrl+C.
-    pub shutdown: std::sync::Arc<tokio::sync::Notify>,
+    pub shutdown: Arc<tokio::sync::Notify>,
+}
+
+/// The pieces the server assembles before it starts serving.
+///
+/// A parts struct instead of a long positional constructor: the list grows with
+/// every subsystem, and a wrong order would compile.
+pub struct AppStateParts {
+    pub config: Config,
+    pub db: Database,
+    pub events: EventBus,
+    pub jobs: JobQueue,
+    pub media: MediaService,
+    pub accounts: AccountService,
+    pub transcodes: Arc<localreel_media::TranscodeGate>,
+    pub ffmpeg_available: bool,
 }
 
 impl AppState {
-    pub fn new(
-        config: Config,
-        db: Database,
-        events: EventBus,
-        jobs: JobQueue,
-        media: MediaService,
-        accounts: AccountService,
-        ffmpeg_available: bool,
-    ) -> Arc<Self> {
-        let watchers = std::sync::Arc::new(localreel_media::WatcherManager::new(
+    pub fn new(parts: AppStateParts) -> Arc<Self> {
+        let AppStateParts {
+            config,
+            db,
+            events,
+            jobs,
+            media,
+            accounts,
+            transcodes,
+            ffmpeg_available,
+        } = parts;
+        let watchers = Arc::new(localreel_media::WatcherManager::new(
             media.clone(),
             jobs.clone(),
             config.scan.watch,
@@ -51,9 +70,10 @@ impl AppState {
             accounts,
             login_limiter: LoginLimiter::new(),
             watchers,
+            transcodes,
             ffmpeg_available,
             started_at: now_secs(),
-            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
