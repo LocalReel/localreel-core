@@ -861,7 +861,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "localreel-api"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-format"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-kernel"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-media"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "localreel-format",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-plugin"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "localreel-kernel",
  "rusqlite",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-plugin-webdav"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "base64",
  "httpdate",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "localreel-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
