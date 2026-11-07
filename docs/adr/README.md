@@ -18,6 +18,7 @@ from the module boundaries.
 | 010 | [Playback transport](010-playback-transport.md) |
 | 011 | [Two personas, one binary](011-personas.md) |
 | 012 | [Persistent state locations](012-state-locations.md) |
+| 013 | [Accounts and per-user state](013-accounts.md) |
 
-Status: all **Accepted** on 2026-11-01 unless noted otherwise (011 and 012 on
+Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–013 on
 2026-11-07).

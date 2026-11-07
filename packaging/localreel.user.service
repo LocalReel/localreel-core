@@ -1,0 +1,15 @@
+[Unit]
+Description=LocalReel media server (user session)
+Documentation=https://github.com/LocalReel/LocalReel
+
+[Service]
+Type=simple
+# The service manager persona: fixed port, no browser.
+Environment=LOCALREEL_MODE=server
+Environment=RUST_LOG=info
+ExecStart=%h/.local/bin/localreel serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

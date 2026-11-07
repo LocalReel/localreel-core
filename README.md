@@ -23,8 +23,15 @@ persistent job queue.
   crash recovery.
 - **State and backup** — per-file playback position, likes and favourites;
   versioned backup export/import; legacy import from a LocalReel v1 database.
-- **Local by design** — binds loopback only by default, single user, no
-  authentication layer.
+- **Accounts** — one owner account that manages the household, plus viewer
+  accounts; watch progress, likes and favourites are per account; passwords
+  are Argon2id hashes, sessions live in the database and writes carry a CSRF
+  token.
+- **Two personas** — `localreel serve` decides whether it was started by a
+  person (opens the web UI, heals a busy port) or by a service manager
+  (fixed port, no window); `--mode` and `LOCALREEL_MODE` override it.
+- **Local by design** — binds loopback only by default; a non-loopback bind
+  needs an explicit opt-in, and every request then needs a signed-in account.
 
 ## Workspace
 
@@ -120,7 +127,13 @@ LocalReel 的服务器组件：一个 Rust 单文件程序，索引本地媒体�
   支持租约、重试、进度、取消与崩溃恢复。
 - **播放状态与备份**：按文件保存进度、喜欢与收藏；支持版本化备份导入导出，以及
   从 LocalReel v1 数据库导入。
-- **本地优先**：默认只监听回环地址，单用户，无鉴权层。
+- **账户**：一个所有者账户管理家庭里的其他账户；观看进度、喜欢与收藏按账户分开；
+  密码用 Argon2id 哈希，会话存数据库，写操作需带 CSRF 令牌。
+- **两种角色**：`localreel serve` 自行判断是「人启动的」（自动打开界面、端口被占
+  时自动顺延）还是「服务管理器启动的」（固定端口、不开窗口）；可用 `--mode` 与
+  `LOCALREEL_MODE` 覆盖。
+- **本地优先**：默认只监听回环地址；绑定非回环地址需要显式开启，且此后每个请求都
+  需要已登录的账户。
 
 构建与测试：`cargo fmt --all -- --check`、`cargo clippy --workspace
 --all-targets -- -D warnings`、`cargo test --workspace`。

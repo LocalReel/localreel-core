@@ -151,7 +151,7 @@ pub async fn list_users(State(state): State<Arc<AppState>>) -> Result<Json<Vec<U
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateUserRequest>,
-) -> Result<Json<User>, ApiError> {
+) -> Result<(StatusCode, Json<User>), ApiError> {
     let role = match body.role.as_deref() {
         None => Role::User,
         Some("admin") => Role::Admin,
@@ -165,7 +165,7 @@ pub async fn create_user(
     let user = state
         .accounts
         .create_user(&body.username, &body.password, role)?;
-    Ok(Json(user))
+    Ok((StatusCode::CREATED, Json(user)))
 }
 
 pub async fn update_user(

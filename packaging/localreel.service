@@ -1,0 +1,38 @@
+[Unit]
+Description=LocalReel media server
+Documentation=https://github.com/LocalReel/LocalReel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The service manager persona: fixed port, no browser, logs to the journal.
+Environment=LOCALREEL_MODE=server
+Environment=RUST_LOG=info
+Environment=LOCALREEL_DATA_DIR=/var/lib/localreel
+Environment=LOCALREEL_LOG_DIR=/var/log/localreel
+ExecStart=/usr/local/bin/localreel serve
+Restart=on-failure
+RestartSec=3
+StateDirectory=localreel
+LogsDirectory=localreel
+
+# Hardening. The server only needs to read media directories and write its own
+# state; everything else stays read-only or unavailable.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ffmpeg may use hardware encoders through /dev/dri; add the service user to the
+# `render`/`video` group instead of loosening the sandbox.
+
+[Install]
+WantedBy=multi-user.target
