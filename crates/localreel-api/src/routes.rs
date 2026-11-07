@@ -2036,6 +2036,74 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn status_hands_the_csrf_token_back_to_a_reloaded_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/auth/status", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(
+            status["csrf"].as_str(),
+            Some(csrf.as_str()),
+            "a reload keeps the cookie but needs the token back"
+        );
+
+        // Without a session there is no token to hand out.
+        let anonymous = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/status")
+                    .header("host", "127.0.0.1:3001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(anonymous.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["authenticated"], false);
+        assert!(status.get("csrf").is_none(), "no session, no token");
+    }
+
+    #[tokio::test]
+    async fn a_write_without_the_csrf_header_is_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        // The session cookie alone must not authorize a write: that is the
+        // whole point of the token.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sources")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/json")
+                    .header("cookie", format!("localreel_session={session}"))
+                    .body(Body::from(
+                        serde_json::json!({ "uri": dir.path().to_string_lossy() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     /// The admin health endpoint drives the "watching / not watching" badge.
     #[tokio::test]
     async fn admin_health_reports_the_watchers() {

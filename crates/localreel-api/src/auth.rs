@@ -34,12 +34,22 @@ pub const CSRF_HEADER: &str = "x-localreel-csrf";
 /// a sidecar has no browser session and never should have one.
 const PUBLIC_PATHS: &[&str] = &["/api/v1/health", "/api/v1/auth/", "/api/v1/plugin-proxy"];
 
+/// The page's bootstrap answer: who is signed in, and whether first-run setup
+/// is still needed.
+///
+/// `csrf` is the token for the session the request already carries. A browser
+/// that reloads keeps its cookie but loses the token it held in memory, and
+/// without this it could no longer add a source until it logged in again. The
+/// token is not a secret from the page: it only proves the request came from
+/// this origin, which is exactly what a cross-origin caller cannot do.
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub setup_required: bool,
     pub authenticated: bool,
     pub user: Option<User>,
     pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csrf: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,12 +67,15 @@ pub struct SessionResponse {
 /// Login and first-run setup.
 pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let setup_required = state.accounts.setup_required().unwrap_or(false);
-    let user = current_user(&state, &headers);
+    let current = current_user(&state, &headers);
+    let csrf = current.as_ref().map(|session| session.csrf.clone());
+    let user = current.map(|session| session.user);
     Json(StatusResponse {
         setup_required,
         authenticated: user.is_some(),
-        user: user.map(|current| current.user),
+        user,
         mode: state.config.mode.as_str(),
+        csrf,
     })
     .into_response()
 }
