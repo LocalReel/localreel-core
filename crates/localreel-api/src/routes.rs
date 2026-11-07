@@ -287,11 +287,8 @@ async fn admin_health(
     })))
 }
 
-async fn download_backup(
-    State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
-) -> Result<Response, ApiError> {
-    let backup = localreel_media::export_backup(&state.db, current.user.id)?;
+async fn download_backup(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let backup = localreel_media::export_backup(&state.db)?;
     let body = serde_json::to_vec_pretty(&backup)
         .map_err(|error| ApiError::internal(format!("failed to encode backup: {error}")))?;
     Response::builder()
@@ -312,14 +309,12 @@ struct BackupImportQuery {
 
 async fn upload_backup(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
     Query(query): Query<BackupImportQuery>,
     body: Bytes,
 ) -> Result<Json<BackupImportReport>, ApiError> {
     let backup = localreel_media::parse_backup(&body)?;
     Ok(Json(localreel_media::import_backup(
         &state.db,
-        current.user.id,
         &backup,
         query.dry_run.unwrap_or(false),
     )?))
@@ -327,11 +322,10 @@ async fn upload_backup(
 
 async fn enqueue_restore(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup = localreel_media::parse_backup(&body)?;
-    let payload = serde_json::json!({ "backup": backup, "user_id": current.user.id }).to_string();
+    let payload = serde_json::json!({ "backup": backup }).to_string();
     let job_id =
         state
             .jobs
@@ -341,7 +335,6 @@ async fn enqueue_restore(
 
 async fn upload_restore_file(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
     body: Body,
 ) -> Result<Response, ApiError> {
     let upload_dir = state.config.data_dir.join("backup-uploads");
@@ -392,11 +385,7 @@ async fn upload_restore_file(
         return Err(ApiError::bad_request("empty backup upload"));
     }
 
-    let payload = serde_json::json!({
-        "path": path.to_string_lossy(),
-        "user_id": current.user.id,
-    })
-    .to_string();
+    let payload = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
     match state.jobs.enqueue(
         "restore_backup_file",
         &payload,
@@ -1358,7 +1347,7 @@ mod tests {
             .await
             .unwrap();
         let backup: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(backup["version"], 2);
+        assert_eq!(backup["version"], localreel_media::BACKUP_VERSION);
 
         let response = app
             .oneshot(request_json(

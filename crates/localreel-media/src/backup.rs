@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use localreel_kernel::db::Database;
@@ -5,11 +6,13 @@ use localreel_kernel::error::{KernelError, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+use crate::account::{AccountService, Role, OWNER_ID};
 use crate::service::MediaService;
 
 pub use localreel_format::{
-    artifact_dir_name, artifact_file_name, ArtifactKind, Backup, BackupState, FormatError,
-    BACKUP_FORMAT_VERSION, MAX_BACKUP_SOURCES, MAX_BACKUP_STATES,
+    artifact_dir_name, artifact_file_name, ArtifactKind, Backup, BackupState, BackupUser,
+    FormatError, BACKUP_FORMAT_VERSION, MAX_BACKUP_SOURCES, MAX_BACKUP_STATES, MAX_BACKUP_USERS,
+    MIN_BACKUP_FORMAT_VERSION,
 };
 
 /// Backup format version (shared with the format crate).
@@ -30,6 +33,8 @@ pub struct BackupImportReport {
     pub dry_run: bool,
     pub sources: usize,
     pub sources_added: usize,
+    pub users: usize,
+    pub users_created: usize,
     pub states: usize,
     pub imported: usize,
     pub unchanged: usize,
@@ -78,7 +83,9 @@ pub fn parse_backup_with_limit(bytes: &[u8], max_bytes: u64) -> Result<Backup> {
     Ok(backup)
 }
 
-pub fn export_backup(db: &Database, user_id: i64) -> Result<Backup> {
+/// Export the whole household: sources, accounts (without password hashes) and
+/// every account's playback state.
+pub fn export_backup(db: &Database) -> Result<Backup> {
     let service = MediaService::new(db.clone());
     let sources = service
         .list_sources()?
@@ -86,22 +93,32 @@ pub fn export_backup(db: &Database, user_id: i64) -> Result<Backup> {
         .map(|source| source.uri)
         .collect::<Vec<_>>();
 
+    let users = AccountService::new(db.clone())
+        .list_users()?
+        .into_iter()
+        .map(|user| BackupUser {
+            username: user.username,
+            role: user.role.as_str().to_string(),
+        })
+        .collect::<Vec<_>>();
+
     let states = db.with_read(|connection| {
         let mut statement = connection.prepare(
-            "SELECT m.uid, m.uri, s.liked, s.favorite, s.position, s.duration
+            "SELECT m.uid, m.uri, u.username, s.liked, s.favorite, s.position, s.duration
              FROM media_state s
              JOIN media m ON m.id = s.media_id
-             WHERE s.user_id = ?1
-             ORDER BY m.id",
+             JOIN users u ON u.id = s.user_id
+             ORDER BY m.id, u.id",
         )?;
-        let rows = statement.query_map([user_id], |row| {
+        let rows = statement.query_map([], |row| {
             Ok(BackupState {
                 uid: Some(row.get(0)?),
                 path: row.get(1)?,
-                liked: row.get::<_, i64>(2)? != 0,
-                favorite: row.get::<_, i64>(3)? != 0,
-                position: row.get(4)?,
-                duration: row.get(5)?,
+                user: Some(row.get(2)?),
+                liked: row.get::<_, i64>(3)? != 0,
+                favorite: row.get::<_, i64>(4)? != 0,
+                position: row.get(5)?,
+                duration: row.get(6)?,
             })
         })?;
         let mut states = Vec::new();
@@ -115,24 +132,23 @@ pub fn export_backup(db: &Database, user_id: i64) -> Result<Backup> {
         version: BACKUP_VERSION,
         created_at: Some(localreel_kernel::time::now_secs()),
         sources,
+        users,
         states,
     };
     validate_backup(&backup)?;
     Ok(backup)
 }
 
-pub fn import_backup(
-    db: &Database,
-    user_id: i64,
-    backup: &Backup,
-    dry_run: bool,
-) -> Result<BackupImportReport> {
+pub fn import_backup(db: &Database, backup: &Backup, dry_run: bool) -> Result<BackupImportReport> {
     validate_backup(backup)?;
     let service = MediaService::new(db.clone());
+    let accounts = AccountService::new(db.clone());
     let mut report = BackupImportReport {
         dry_run,
         sources: backup.sources.len(),
         sources_added: 0,
+        users: backup.users.len(),
+        users_created: 0,
         states: backup.states.len(),
         imported: 0,
         unchanged: 0,
@@ -159,11 +175,58 @@ pub fn import_backup(
         }
     }
 
+    // Accounts first: every state names its owner. A restored account starts
+    // without a password, so nobody can sign in until an administrator sets one.
+    let mut user_ids: HashMap<String, i64> = accounts
+        .list_users()?
+        .into_iter()
+        .map(|user| (user.username.to_ascii_lowercase(), user.id))
+        .collect();
+
+    for restored in &backup.users {
+        let key = restored.username.to_ascii_lowercase();
+        if user_ids.contains_key(&key) {
+            continue;
+        }
+        if dry_run {
+            report.users_created += 1;
+            continue;
+        }
+        let role = if restored.role.eq_ignore_ascii_case("admin") {
+            Role::Admin
+        } else {
+            Role::User
+        };
+        match accounts.create_user_without_password(&restored.username, role) {
+            Ok(created) => {
+                user_ids.insert(key, created.id);
+                report.users_created += 1;
+            }
+            Err(error) => report.warnings.push(format!(
+                "account '{}' was not created: {error}",
+                restored.username
+            )),
+        }
+    }
+
     for state in &backup.states {
         let target_id = find_target(db, state)?;
         let Some(media_id) = target_id else {
             report.missing += 1;
             continue;
+        };
+        let user_id = match state.user.as_deref() {
+            Some(username) => match user_ids.get(&username.to_ascii_lowercase()) {
+                Some(id) => *id,
+                None => {
+                    report.warnings.push(format!(
+                        "state for '{username}' replayed into the owner account: that account is not in this backup"
+                    ));
+                    OWNER_ID
+                }
+            },
+            // Version 2 backups had one implicit user.
+            None => OWNER_ID,
         };
         let mut current = service.get_state(user_id, media_id)?;
         let before = current.clone();
@@ -285,7 +348,7 @@ mod tests {
         };
         service.save_state(&state).unwrap();
 
-        let backup = export_backup(&db, crate::account::OWNER_ID).unwrap();
+        let backup = export_backup(&db).unwrap();
         assert_eq!(backup.version, BACKUP_VERSION);
         assert_eq!(backup.sources.len(), 1);
         assert_eq!(backup.states.len(), 1);
@@ -295,7 +358,7 @@ mod tests {
             .add_source(dir2.path().join("videos").to_str().unwrap())
             .unwrap();
         insert_media(&db2, source2.id, "uid-1", "file:///videos/uid-1.mp4");
-        let report = import_backup(&db2, crate::account::OWNER_ID, &backup, false).unwrap();
+        let report = import_backup(&db2, &backup, false).unwrap();
         assert_eq!(report.imported, 1);
         let state = service2.get_state(crate::account::OWNER_ID, 1).unwrap();
         assert!(state.liked);
@@ -326,9 +389,11 @@ mod tests {
             version: BACKUP_VERSION,
             created_at: None,
             sources: Vec::new(),
+            users: Vec::new(),
             states: vec![
                 BackupState {
                     uid: Some("uid-2".into()),
+                    user: None,
                     path: "file:///videos/uid-2.mp4".into(),
                     liked: true,
                     favorite: false,
@@ -337,6 +402,7 @@ mod tests {
                 },
                 BackupState {
                     uid: Some("missing".into()),
+                    user: None,
                     path: "file:///missing.mp4".into(),
                     liked: false,
                     favorite: false,
@@ -345,7 +411,7 @@ mod tests {
                 },
             ],
         };
-        let report = import_backup(&db, crate::account::OWNER_ID, &backup, false).unwrap();
+        let report = import_backup(&db, &backup, false).unwrap();
         assert_eq!(report.imported, 1);
         assert_eq!(report.missing, 1);
         let state = service
@@ -353,6 +419,92 @@ mod tests {
             .unwrap();
         assert!(state.liked);
         assert_eq!(state.position, 80.0);
+    }
+
+    #[test]
+    fn household_backup_keeps_each_accounts_state() {
+        let (dir, db, service) = setup();
+        let accounts = crate::account::AccountService::new(db.clone());
+        let guest = accounts
+            .create_user("guest", "guest password", crate::account::Role::User)
+            .unwrap();
+        let source = service
+            .add_source(dir.path().join("videos").to_str().unwrap())
+            .unwrap();
+        let media_id = insert_media(&db, source.id, "uid-m", "file:///videos/uid-m.mp4");
+        for (user_id, position, favorite) in [
+            (crate::account::OWNER_ID, 10.0, false),
+            (guest.id, 50.0, true),
+        ] {
+            service
+                .save_state(&crate::model::MediaState {
+                    user_id,
+                    media_id,
+                    liked: false,
+                    favorite,
+                    position,
+                    duration: 100.0,
+                    updated_at: 0,
+                })
+                .unwrap();
+        }
+
+        let backup = export_backup(&db).unwrap();
+        assert_eq!(backup.users.len(), 2, "owner + guest");
+        assert_eq!(backup.states.len(), 2, "one state per account");
+        assert!(backup.users.iter().all(|user| !user.username.is_empty()));
+        assert_eq!(backup.version, BACKUP_VERSION);
+
+        let (dir2, db2, service2) = setup();
+        let source2 = service2
+            .add_source(dir2.path().join("videos").to_str().unwrap())
+            .unwrap();
+        insert_media(&db2, source2.id, "uid-m", "file:///videos/uid-m.mp4");
+        let report = import_backup(&db2, &backup, false).unwrap();
+        assert_eq!(report.users_created, 1, "only the guest is new");
+        assert_eq!(report.imported, 2);
+
+        let restored = crate::account::AccountService::new(db2.clone())
+            .list_users()
+            .unwrap();
+        let restored_guest = restored
+            .iter()
+            .find(|user| user.username == "guest")
+            .expect("guest restored");
+        // The restored account cannot sign in until an administrator sets a password.
+        assert!(crate::account::AccountService::new(db2.clone())
+            .authenticate("guest", "guest password")
+            .unwrap()
+            .is_none());
+        let owner_state = service2.get_state(crate::account::OWNER_ID, 1).unwrap();
+        let guest_state = service2.get_state(restored_guest.id, 1).unwrap();
+        assert_eq!(owner_state.position, 10.0);
+        assert!(!owner_state.favorite);
+        assert_eq!(guest_state.position, 50.0);
+        assert!(guest_state.favorite);
+    }
+
+    #[test]
+    fn version_2_backups_replay_into_the_owner() {
+        let (dir, db, service) = setup();
+        let source = service
+            .add_source(dir.path().join("videos").to_str().unwrap())
+            .unwrap();
+        insert_media(&db, source.id, "uid-v2", "file:///videos/uid-v2.mp4");
+        let backup: Backup = serde_json::from_str(
+            r#"{
+                "version": 2,
+                "sources": [],
+                "states": [
+                    {"uid": "uid-v2", "path": "file:///videos/uid-v2.mp4", "position": 30.0, "duration": 60.0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let report = import_backup(&db, &backup, false).unwrap();
+        assert_eq!(report.imported, 1);
+        let state = service.get_state(crate::account::OWNER_ID, 1).unwrap();
+        assert_eq!(state.position, 30.0);
     }
 
     #[test]

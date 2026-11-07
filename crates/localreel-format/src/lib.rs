@@ -4,7 +4,7 @@
 //! `localreel-core` reads and writes, so migrations and the operator CLI can
 //! share one definition:
 //!
-//! * [`Backup`] — the portable user-state export (`version = 2`).
+//! * [`Backup`] — the portable household export (`version = 3`).
 //! * [`ArtifactKind`] / [`artifact_file_name`] — deterministic names for
 //!   generated thumbnails, transcodes and HLS packages.
 //!
@@ -14,7 +14,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Current backup format version.
-pub const BACKUP_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 added accounts: the backup names every account and tags each state
+/// with its owner. Version 2 files (one implicit user) are still accepted on
+/// import and replay into the owner account.
+pub const BACKUP_FORMAT_VERSION: u32 = 3;
+
+/// Oldest backup version this build can import.
+pub const MIN_BACKUP_FORMAT_VERSION: u32 = 2;
 
 /// Maximum number of sources accepted in one backup.
 pub const MAX_BACKUP_SOURCES: usize = 256;
@@ -22,7 +29,10 @@ pub const MAX_BACKUP_SOURCES: usize = 256;
 /// Maximum number of playback states accepted in one backup.
 pub const MAX_BACKUP_STATES: usize = 100_000;
 
-/// Portable backup of sources and per-media user state.
+/// Maximum number of accounts accepted in one backup.
+pub const MAX_BACKUP_USERS: usize = 1_000;
+
+/// Portable backup of sources, accounts and per-media user state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Backup {
     pub version: u32,
@@ -30,6 +40,10 @@ pub struct Backup {
     pub created_at: Option<i64>,
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Accounts in the backup. Password hashes are never exported: a restored
+    /// account starts without a password and an administrator sets one.
+    #[serde(default)]
+    pub users: Vec<BackupUser>,
     #[serde(default)]
     pub states: Vec<BackupState>,
 }
@@ -40,12 +54,13 @@ impl Backup {
             version: BACKUP_FORMAT_VERSION,
             created_at: Some(now_secs()),
             sources: Vec::new(),
+            users: Vec::new(),
             states: Vec::new(),
         }
     }
 
     pub fn validate(&self) -> Result<(), FormatError> {
-        if self.version != BACKUP_FORMAT_VERSION {
+        if !(MIN_BACKUP_FORMAT_VERSION..=BACKUP_FORMAT_VERSION).contains(&self.version) {
             return Err(FormatError::UnsupportedBackupVersion(self.version));
         }
         if self.sources.len() > MAX_BACKUP_SOURCES {
@@ -54,9 +69,17 @@ impl Backup {
         if self.states.len() > MAX_BACKUP_STATES {
             return Err(FormatError::TooManyStates(self.states.len()));
         }
+        if self.users.len() > MAX_BACKUP_USERS {
+            return Err(FormatError::TooManyUsers(self.users.len()));
+        }
         for source in &self.sources {
             if source.trim().is_empty() {
                 return Err(FormatError::EmptySource);
+            }
+        }
+        for user in &self.users {
+            if user.username.trim().is_empty() {
+                return Err(FormatError::EmptyUsername);
             }
         }
         for state in &self.states {
@@ -80,12 +103,28 @@ impl Default for Backup {
     }
 }
 
+/// One account in a backup. Never carries a password hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupUser {
+    pub username: String,
+    #[serde(default = "default_role")]
+    pub role: String,
+}
+
+fn default_role() -> String {
+    "user".to_string()
+}
+
 /// User state for one media item, keyed by `uid` when available and by the
 /// canonical locator otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupState {
     #[serde(default)]
     pub uid: Option<String>,
+    /// Account the state belongs to. Absent in version 2 backups, which replay
+    /// into the owner account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     pub path: String,
     #[serde(default)]
     pub liked: bool,
@@ -189,7 +228,9 @@ pub enum FormatError {
     UnsupportedBackupVersion(u32),
     TooManySources(usize),
     TooManyStates(usize),
+    TooManyUsers(usize),
     EmptySource,
+    EmptyUsername,
     EmptyStatePath,
     InvalidPosition,
     InvalidDuration,
@@ -198,19 +239,21 @@ pub enum FormatError {
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FormatError::UnsupportedBackupVersion(v) => {
-                write!(
-                    f,
-                    "unsupported backup version {v} (expected {BACKUP_FORMAT_VERSION})"
-                )
-            }
+            FormatError::UnsupportedBackupVersion(v) => write!(
+                f,
+                "unsupported backup version {v} (this build reads {MIN_BACKUP_FORMAT_VERSION}-{BACKUP_FORMAT_VERSION})"
+            ),
             FormatError::TooManySources(n) => {
                 write!(f, "too many sources: {n} (max {MAX_BACKUP_SOURCES})")
             }
             FormatError::TooManyStates(n) => {
                 write!(f, "too many states: {n} (max {MAX_BACKUP_STATES})")
             }
+            FormatError::TooManyUsers(n) => {
+                write!(f, "too many accounts: {n} (max {MAX_BACKUP_USERS})")
+            }
             FormatError::EmptySource => write!(f, "source must not be empty"),
+            FormatError::EmptyUsername => write!(f, "account username must not be empty"),
             FormatError::EmptyStatePath => write!(f, "state path must not be empty"),
             FormatError::InvalidPosition => write!(f, "position must be finite and non-negative"),
             FormatError::InvalidDuration => write!(f, "duration must be finite and non-negative"),
@@ -228,8 +271,13 @@ mod tests {
     fn backup_roundtrip() {
         let mut backup = Backup::new();
         backup.sources.push("file:///D:/Videos".into());
+        backup.users.push(BackupUser {
+            username: "owner".into(),
+            role: "admin".into(),
+        });
         backup.states.push(BackupState {
             uid: Some("a1".into()),
+            user: Some("owner".into()),
             path: "file:///D:/Videos/ep01.mp4".into(),
             liked: true,
             favorite: false,
@@ -243,13 +291,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_newer_backup_version() {
+    fn version_2_backups_still_validate() {
+        let backup: Backup = serde_json::from_str(
+            r#"{
+                "version": 2,
+                "sources": ["file:///D:/Videos"],
+                "states": [
+                    {"uid": "a1", "path": "file:///D:/Videos/a.mp4", "position": 5.0, "duration": 10.0}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(backup.validate().is_ok());
+        assert!(backup.users.is_empty());
+        assert_eq!(backup.states[0].user, None);
+    }
+
+    #[test]
+    fn rejects_older_and_newer_backup_versions() {
         let mut backup = Backup::new();
+        backup.version = MIN_BACKUP_FORMAT_VERSION - 1;
+        assert!(backup.validate().is_err());
         backup.version = BACKUP_FORMAT_VERSION + 1;
         assert_eq!(
             backup.validate(),
             Err(FormatError::UnsupportedBackupVersion(backup.version))
         );
+    }
+
+    #[test]
+    fn rejects_empty_usernames() {
+        let mut backup = Backup::new();
+        backup.users.push(BackupUser {
+            username: "  ".into(),
+            role: "user".into(),
+        });
+        assert_eq!(backup.validate(), Err(FormatError::EmptyUsername));
     }
 
     #[test]
@@ -267,6 +344,7 @@ mod tests {
         let mut backup = Backup::new();
         backup.states.push(BackupState {
             uid: None,
+            user: None,
             path: "x".into(),
             liked: false,
             favorite: false,

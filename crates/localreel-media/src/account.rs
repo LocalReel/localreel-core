@@ -323,6 +323,30 @@ impl AccountService {
             .ok_or_else(|| KernelError::NotFound(format!("user {id}")))
     }
 
+    /// Create an account that cannot sign in yet.
+    ///
+    /// Used when importing a backup: password hashes are never exported, so a
+    /// restored account needs an administrator to set one first.
+    pub fn create_user_without_password(&self, username: &str, role: Role) -> Result<User> {
+        let username = validate_username(username)?;
+        let now = now_secs();
+        let id = self.db.with_write(|connection| {
+            if username_taken(connection, &username, None)? {
+                return Err(KernelError::Conflict(format!(
+                    "user '{username}' already exists"
+                )));
+            }
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, enabled, created_at, updated_at)
+                 VALUES (?1, '', ?2, 1, ?3, ?3)",
+                params![username, role.as_str(), now],
+            )?;
+            Ok(connection.last_insert_rowid())
+        })?;
+        self.get_user(id)?
+            .ok_or_else(|| KernelError::NotFound(format!("user {id}")))
+    }
+
     /// Apply administrator changes to an account.
     ///
     /// The owner account cannot be demoted or disabled: someone must always be

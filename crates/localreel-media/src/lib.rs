@@ -21,7 +21,8 @@ pub mod storage;
 pub use account::{AccountService, CurrentUser, Role, Session, User, UserPatch};
 pub use backup::{
     export_backup, import_backup, parse_backup, read_backup, read_backup_with_limit, Backup,
-    BackupImportReport, BackupState, BACKUP_VERSION, MAX_BACKUP_BYTES, MAX_BACKUP_RESTORE_BYTES,
+    BackupImportReport, BackupState, BackupUser, BACKUP_VERSION, MAX_BACKUP_BYTES,
+    MAX_BACKUP_RESTORE_BYTES, MAX_BACKUP_USERS, MIN_BACKUP_FORMAT_VERSION,
 };
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};

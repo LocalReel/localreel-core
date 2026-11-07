@@ -31,8 +31,6 @@ pub struct RestoreReport {
 
 /// Everything a restore needs besides the database and the progress sink.
 pub struct RestoreInput<'a> {
-    /// Account whose playback state the restore replays.
-    pub user_id: i64,
     pub backup: &'a Backup,
     pub media_ops: &'a MediaOps,
     pub thumbnail_dir: &'a Path,
@@ -46,7 +44,6 @@ pub fn restore_backup(
     progress: &mut dyn FnMut(f32, &str),
 ) -> Result<RestoreReport> {
     let RestoreInput {
-        user_id,
         backup,
         media_ops,
         thumbnail_dir,
@@ -66,7 +63,7 @@ pub fn restore_backup(
     }
 
     progress(0.01, "importing sources");
-    let first = import_backup(db, user_id, backup, dry_run)?;
+    let first = import_backup(db, backup, dry_run)?;
     report.sources_added = first.sources_added;
     report.warnings.extend(first.warnings);
     if dry_run {
@@ -213,7 +210,7 @@ pub fn restore_backup(
         return Ok(report);
     }
     progress(0.9, "replaying states");
-    let second = import_backup(db, user_id, backup, false)?;
+    let second = import_backup(db, backup, false)?;
     report.states_imported = second.imported;
     report.missing = second.missing;
     report.warnings.extend(second.warnings);

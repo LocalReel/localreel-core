@@ -261,7 +261,7 @@ fn backup_export(out: PathBuf) -> anyhow::Result<()> {
     config.ensure_dirs()?;
     let db = open_database(&config)?;
     run_migrations(&db)?;
-    let backup = localreel_media::export_backup(&db, localreel_media::account::OWNER_ID)?;
+    let backup = localreel_media::export_backup(&db)?;
     let bytes = serde_json::to_vec_pretty(&backup)?;
     if bytes.len() as u64 > localreel_media::MAX_BACKUP_BYTES {
         anyhow::bail!(
@@ -287,8 +287,7 @@ fn backup_import(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     let db = open_database(&config)?;
     run_migrations(&db)?;
     let backup = localreel_media::read_backup(&from)?;
-    let report =
-        localreel_media::import_backup(&db, localreel_media::account::OWNER_ID, &backup, dry_run)?;
+    let report = localreel_media::import_backup(&db, &backup, dry_run)?;
     println!(
         "backup import ({}): sources={} added={} states={} imported={} unchanged={} missing={} warnings={}",
         if dry_run { "dry-run" } else { "write" },
@@ -324,7 +323,6 @@ fn restore(from: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     let report = restore_backup(
         &db,
         localreel_media::restore::RestoreInput {
-            user_id: localreel_media::account::OWNER_ID,
             backup: &backup,
             media_ops: &media_ops,
             thumbnail_dir: &config.media.thumbnail_dir,
