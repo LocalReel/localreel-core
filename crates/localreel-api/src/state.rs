@@ -22,7 +22,9 @@ pub struct AppState {
     pub watchers: Arc<localreel_media::WatcherManager>,
     /// The single ffmpeg budget (transcode / HLS packaging).
     pub transcodes: Arc<localreel_media::TranscodeGate>,
-    pub ffmpeg_available: bool,
+    /// What the installed ffmpeg/ffprobe pair can do (`full`, `probe-only`,
+    /// `missing`), so the UI can explain what is degraded instead of guessing.
+    pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
     pub started_at: i64,
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
     /// selects on it together with Ctrl+C.
@@ -41,7 +43,7 @@ pub struct AppStateParts {
     pub media: MediaService,
     pub accounts: AccountService,
     pub transcodes: Arc<localreel_media::TranscodeGate>,
-    pub ffmpeg_available: bool,
+    pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
 }
 
 impl AppState {
@@ -54,7 +56,7 @@ impl AppState {
             media,
             accounts,
             transcodes,
-            ffmpeg_available,
+            ffmpeg_capability,
         } = parts;
         let watchers = Arc::new(localreel_media::WatcherManager::new(
             media.clone(),
@@ -71,7 +73,7 @@ impl AppState {
             login_limiter: LoginLimiter::new(),
             watchers,
             transcodes,
-            ffmpeg_available,
+            ffmpeg_capability,
             started_at: now_secs(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         })

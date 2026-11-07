@@ -239,13 +239,21 @@ fn doctor() -> anyhow::Result<()> {
     println!(
         "  ffmpeg:    {} ({})",
         media_ops.ffmpeg_path().display(),
-        yes_no(media_ops.available())
+        media_ops.capability().as_str()
     );
     println!("  ffprobe:   {}", media_ops.ffprobe_path().display());
-    if !media_ops.available() {
-        println!(
-            "  hint:      put ffmpeg/ffprobe on PATH, next to localreel.exe, or set LOCALREEL_FFMPEG_DIR"
-        );
+    match media_ops.capability() {
+        localreel_kernel::media_ops::FfmpegCapability::Full => {}
+        localreel_kernel::media_ops::FfmpegCapability::ProbeOnly => {
+            println!(
+                "  hint:      probe-only install: scanning works, thumbnails/transcoding/HLS do not"
+            );
+        }
+        localreel_kernel::media_ops::FfmpegCapability::Missing => {
+            println!(
+                "  hint:      put ffmpeg/ffprobe on PATH, next to localreel.exe, or set LOCALREEL_FFMPEG_DIR"
+            );
+        }
     }
     let web = if localreel_api::web::is_embedded() {
         "embedded".to_string()
@@ -583,15 +591,22 @@ async fn serve(
         config.media.thumbnail_timeout,
         config.media.transcode_timeout,
     ));
-    let ffmpeg_available = media_ops.available();
-    if !ffmpeg_available {
+    let ffmpeg_capability = media_ops.capability();
+    if !ffmpeg_capability.can_probe() {
         tracing::warn!(
-            "ffmpeg/ffprobe not available; scanning metadata and transcoding are disabled"
+            "ffprobe is not available; scanning cannot read metadata and no encoding is possible"
         );
         println!("  ffmpeg not found: metadata, thumbnails and transcoding are disabled.");
         println!(
             "  Install ffmpeg on PATH, place it in ffmpeg/bin next to the program, or set LOCALREEL_FFMPEG."
         );
+        println!();
+    } else if !ffmpeg_capability.can_transcode() {
+        tracing::warn!(
+            "probe-only install: scanning works, but thumbnails, transcoding and HLS packaging are disabled"
+        );
+        println!("  ffprobe only: scanning works, thumbnails/transcoding are disabled.");
+        println!("  Add ffmpeg.exe next to ffprobe.exe to enable them.");
         println!();
     }
 
@@ -774,7 +789,7 @@ async fn serve(
         media,
         accounts,
         transcodes,
-        ffmpeg_available,
+        ffmpeg_capability,
     });
     let app = localreel_api::router(state.clone());
 
@@ -849,12 +864,4 @@ async fn serve(
         let _ = tokio::time::timeout_at(deadline, worker).await;
     }
     Ok(())
-}
-
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
 }

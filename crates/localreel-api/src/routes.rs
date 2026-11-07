@@ -248,6 +248,9 @@ struct HealthResponse {
     mode: &'static str,
     database: bool,
     ffmpeg: bool,
+    /// `full`, `probe-only` or `missing`; `ffmpeg` stays the "can transcode"
+    /// boolean so existing launchers keep working.
+    ffmpeg_capability: &'static str,
     media_count: i64,
     uptime_seconds: i64,
 }
@@ -261,7 +264,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         version: localreel_kernel::VERSION,
         mode: state.config.mode.as_str(),
         database,
-        ffmpeg: state.ffmpeg_available,
+        ffmpeg: state.ffmpeg_capability.can_transcode(),
+        ffmpeg_capability: state.ffmpeg_capability.as_str(),
         media_count,
         uptime_seconds: (now_secs() - state.started_at).max(0),
     })
@@ -292,7 +296,8 @@ async fn admin_health(
         "version": localreel_kernel::VERSION,
         "mode": state.config.mode.as_str(),
         "database": database,
-        "ffmpeg": state.ffmpeg_available,
+        "ffmpeg": state.ffmpeg_capability.can_transcode(),
+        "ffmpeg_capability": state.ffmpeg_capability.as_str(),
         "media_count": media_count,
         "data_dir": state.config.data_dir,
         "thumbnail_dir": state.config.media.thumbnail_dir,
@@ -1320,7 +1325,7 @@ mod tests {
             media,
             accounts,
             transcodes,
-            ffmpeg_available: false,
+            ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
         })
     }
 

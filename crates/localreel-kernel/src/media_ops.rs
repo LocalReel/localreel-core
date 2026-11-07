@@ -13,6 +13,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{KernelError, Result};
 
+/// What the installed ffmpeg/ffprobe pair can do.
+///
+/// A full ffmpeg build is ~100 MB, which is a real cost on a Windows first
+/// install or a small NAS. Probing only needs `ffprobe`, so a "probe-only"
+/// install is a supported configuration: the library is catalogued, posters are
+/// generated, and nothing encodes until a full ffmpeg appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FfmpegCapability {
+    /// ffmpeg and ffprobe: probing, thumbnails, transcodes and HLS.
+    Full,
+    /// ffprobe only: the library can be scanned and catalogued, nothing encodes.
+    ProbeOnly,
+    /// Neither binary is usable.
+    Missing,
+}
+
+impl FfmpegCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ProbeOnly => "probe-only",
+            Self::Missing => "missing",
+        }
+    }
+
+    /// Whether thumbnails, transcodes and HLS packaging are possible.
+    pub const fn can_transcode(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Whether a file can be probed (scan metadata, thumbnails aside).
+    pub const fn can_probe(self) -> bool {
+        matches!(self, Self::Full | Self::ProbeOnly)
+    }
+}
+
 /// Metadata extracted from `ffprobe`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeResult {
@@ -150,7 +187,15 @@ impl MediaOps {
     }
 
     pub fn available(&self) -> bool {
-        command_available(&self.ffmpeg) && command_available(&self.ffprobe)
+        self.capability().can_transcode()
+    }
+
+    /// What the resolved binaries can actually do.
+    pub fn capability(&self) -> FfmpegCapability {
+        capability_from(
+            command_available(&self.ffmpeg),
+            command_available(&self.ffprobe),
+        )
     }
 
     pub fn probe(&self, input: &MediaInput, cancel: &AtomicBool) -> Result<ProbeResult> {
@@ -811,6 +856,19 @@ fn binary_command(binary: &Path) -> Command {
     Command::new(binary)
 }
 
+/// Decide the capability from the two availability probes.
+///
+/// Pure so the decision (and its table) can be tested without binaries.
+fn capability_from(ffmpeg: bool, ffprobe: bool) -> FfmpegCapability {
+    match (ffmpeg, ffprobe) {
+        (true, true) => FfmpegCapability::Full,
+        (false, true) => FfmpegCapability::ProbeOnly,
+        // ffprobe is what makes the library readable; ffmpeg alone cannot probe,
+        // so the pair is meaningless without it.
+        _ => FfmpegCapability::Missing,
+    }
+}
+
 fn command_available(binary: &Path) -> bool {
     binary_command(binary)
         .arg("-version")
@@ -879,6 +937,22 @@ mod tests {
         assert_eq!(probe.video_codec.as_deref(), Some("h264"));
         assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
         assert_eq!(probe.bitrate, Some(123));
+    }
+
+    #[test]
+    fn capability_depends_on_the_binaries_that_exist() {
+        assert_eq!(capability_from(true, true), FfmpegCapability::Full);
+        assert_eq!(capability_from(false, true), FfmpegCapability::ProbeOnly);
+        // ffmpeg without ffprobe cannot catalogue anything.
+        assert_eq!(capability_from(true, false), FfmpegCapability::Missing);
+        assert_eq!(capability_from(false, false), FfmpegCapability::Missing);
+
+        assert!(FfmpegCapability::Full.can_probe());
+        assert!(FfmpegCapability::Full.can_transcode());
+        assert!(FfmpegCapability::ProbeOnly.can_probe());
+        assert!(!FfmpegCapability::ProbeOnly.can_transcode());
+        assert!(!FfmpegCapability::Missing.can_probe());
+        assert_eq!(FfmpegCapability::ProbeOnly.as_str(), "probe-only");
     }
 
     #[test]
