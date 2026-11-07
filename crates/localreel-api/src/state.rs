@@ -20,6 +20,9 @@ pub struct AppState {
     pub login_limiter: LoginLimiter,
     pub ffmpeg_available: bool,
     pub started_at: i64,
+    /// Signalled by the admin shutdown endpoint and the tray icon; the server
+    /// selects on it together with Ctrl+C.
+    pub shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -42,6 +45,7 @@ impl AppState {
             login_limiter: LoginLimiter::new(),
             ffmpeg_available,
             started_at: now_secs(),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 }

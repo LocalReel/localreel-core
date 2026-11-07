@@ -697,7 +697,7 @@ async fn serve(
         accounts,
         ffmpeg_available,
     );
-    let app = localreel_api::router(state);
+    let app = localreel_api::router(state.clone());
 
     info!("LocalReel listening on {url}");
     events.publish(Event::ServerStarted {
@@ -715,6 +715,7 @@ async fn serve(
     }
 
     let shutdown_signal = shutdown.clone();
+    let shutdown_notify = state.shutdown.clone();
     let tray_shutdown = async move {
         if tray_active {
             let _ = quit_rx.recv().await;
@@ -731,6 +732,9 @@ async fn serve(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = tray_shutdown => {}
+            _ = shutdown_notify.notified() => {
+                info!("shutdown requested from the admin page");
+            }
         }
         shutdown_signal.store(true, Ordering::SeqCst);
     })

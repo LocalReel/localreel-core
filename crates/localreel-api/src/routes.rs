@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // Administrators only: library structure, jobs, backups and accounts.
     let admin_api = Router::new()
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
@@ -264,6 +265,15 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         media_count,
         uptime_seconds: (now_secs() - state.started_at).max(0),
     })
+}
+
+/// Ask the process to stop. Administrators only: this is the desktop escape
+/// hatch on platforms without a tray icon, and it uses the same graceful path
+/// as Ctrl+C, so in-flight requests still finish.
+async fn shutdown_server(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // The server logs the shutdown itself; this only raises the signal.
+    state.shutdown.notify_one();
+    Json(serde_json::json!({ "status": "shutting-down" }))
 }
 
 async fn admin_health(
@@ -1440,6 +1450,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn only_an_administrator_can_stop_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, owner_session, owner_csrf) = signed_in(dir.path());
+        let notify = state.shutdown.clone();
+        let app = router(state.clone());
+
+        let guest = state
+            .accounts
+            .create_user("guest", "guest password", localreel_media::Role::User)
+            .unwrap();
+        let guest_session = state.accounts.create_session(guest.id).unwrap();
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/admin/shutdown",
+                &guest_session.id,
+                &guest_session.csrf,
+                "{}".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let signalled = notify.notified();
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/admin/shutdown",
+                &owner_session,
+                &owner_csrf,
+                "{}".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_millis(500), signalled)
+            .await
+            .expect("the shutdown signal was not raised");
     }
 
     #[tokio::test]
