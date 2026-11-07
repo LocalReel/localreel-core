@@ -6,6 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Runs as the dedicated system account created by the package.
+User=localreel
+Group=localreel
 # The service manager persona: fixed port, no browser, logs to the journal.
 Environment=LOCALREEL_MODE=server
 Environment=RUST_LOG=info

@@ -34,6 +34,8 @@ ENV LOCALREEL_HOST=0.0.0.0 \
     LOCALREEL_ALLOW_REMOTE=1 \
     LOCALREEL_PORT=3001 \
     LOCALREEL_DATA_DIR=/data \
+    LOCALREEL_LOG_DIR=/data/logs \
+    LOCALREEL_MODE=server \
     RUST_LOG=info
 USER localreel
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
