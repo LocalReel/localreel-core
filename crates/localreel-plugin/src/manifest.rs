@@ -19,10 +19,18 @@ pub const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_ENTRIES: usize = 4096;
 
-/// Permission a storage plugin needs to reach a remote server. The host does not
-/// grant it as a capability; it documents why the plugin opens sockets.
+/// Permission a storage plugin needs to reach a remote server. Without it the
+/// host proxy refuses to fetch anything on the plugin's behalf.
 pub const PERMISSION_NETWORK: &str = "network";
-pub const ALLOWED_PERMISSIONS: &[&str] = &[PERMISSION_NETWORK];
+
+/// Permission to read the media under the plugin's declared source roots.
+///
+/// Every storage plugin needs it; declaring it is what makes the installation
+/// prompt meaningful — the host can say what a plugin will be able to do before
+/// it runs.
+pub const PERMISSION_STORAGE_READ: &str = "storage:read";
+
+pub const ALLOWED_PERMISSIONS: &[&str] = &[PERMISSION_STORAGE_READ, PERMISSION_NETWORK];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -156,7 +164,29 @@ impl Manifest {
                 )));
             }
         }
+        // A storage plugin that cannot read its roots cannot do its job, but
+        // the permission is implied by the kind: a package written before the
+        // permission existed keeps loading. `network` is never implied.
         Ok(())
+    }
+
+    /// The permissions that actually apply to this plugin.
+    ///
+    /// A storage plugin always has read access to its declared roots — that is
+    /// what the permission means — so the host reports it even when an older
+    /// manifest only listed `network`. The installer prompt and the admin page
+    /// show this list, not the raw one.
+    pub fn effective_permissions(&self) -> Vec<String> {
+        let mut permissions: Vec<String> = Vec::new();
+        if self.kind == PluginKind::Storage {
+            permissions.push(PERMISSION_STORAGE_READ.to_string());
+        }
+        for permission in &self.permissions {
+            if !permissions.contains(permission) {
+                permissions.push(permission.clone());
+            }
+        }
+        permissions
     }
 
     pub fn has_permission(&self, permission: &str) -> bool {
@@ -250,6 +280,48 @@ mod tests {
         let parsed = Manifest::parse(&serde_json::to_vec(&manifest()).unwrap()).unwrap();
         assert_eq!(parsed.id, "webdav");
         assert!(parsed.has_permission(PERMISSION_NETWORK));
+        // The kind implies read access; the raw list stays as declared so the
+        // manifest round-trips.
+        assert!(!parsed.has_permission(PERMISSION_STORAGE_READ));
+        assert_eq!(
+            parsed.effective_permissions(),
+            vec![
+                PERMISSION_STORAGE_READ.to_string(),
+                PERMISSION_NETWORK.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_permissions_do_not_duplicate_a_declared_one() {
+        let mut value = manifest();
+        value.permissions = vec![PERMISSION_STORAGE_READ.into(), PERMISSION_NETWORK.into()];
+        let parsed = Manifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            parsed.effective_permissions(),
+            vec![
+                PERMISSION_STORAGE_READ.to_string(),
+                PERMISSION_NETWORK.to_string()
+            ]
+        );
+        // Declaring only the baseline is fine too.
+        value.permissions = vec![PERMISSION_STORAGE_READ.into()];
+        let parsed = Manifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            parsed.effective_permissions(),
+            vec![PERMISSION_STORAGE_READ.to_string()]
+        );
+        assert!(!parsed.has_permission(PERMISSION_NETWORK));
+    }
+
+    #[test]
+    fn rejects_duplicate_permissions() {
+        let mut value = manifest();
+        value.permissions = vec![PERMISSION_NETWORK.into(), PERMISSION_NETWORK.into()];
+        assert!(matches!(
+            Manifest::parse(&serde_json::to_vec(&value).unwrap()),
+            Err(PluginError::Manifest(_))
+        ));
     }
 
     #[test]

@@ -67,6 +67,10 @@ fn sidecar_serves_stat_list_walk_and_ranges() {
             &executable,
             &extracted,
             &json!({ "root": library.to_str().unwrap() }),
+            &localreel_plugin::PluginSandbox {
+                working_dir: Some(install.clone()),
+                roots: vec![library.to_string_lossy().into_owned()],
+            },
         )
         .unwrap(),
     );

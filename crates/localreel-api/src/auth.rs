@@ -28,7 +28,11 @@ pub const CSRF_HEADER: &str = "x-localreel-csrf";
 
 /// Paths that work without a session: the health probe (launchers use it) and
 /// the auth endpoints themselves (the login page needs them).
-const PUBLIC_PATHS: &[&str] = &["/api/v1/health", "/api/v1/auth/"];
+/// Paths reachable without a session.
+///
+/// The plugin proxy authenticates with the plugin's own token header instead:
+/// a sidecar has no browser session and never should have one.
+const PUBLIC_PATHS: &[&str] = &["/api/v1/health", "/api/v1/auth/", "/api/v1/plugin-proxy"];
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {

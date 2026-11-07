@@ -19,6 +19,7 @@ from the module boundaries.
 | 011 | [Two personas, one binary](011-personas.md) |
 | 012 | [Persistent state locations](012-state-locations.md) |
 | 013 | [Accounts and per-user state](013-accounts.md) |
+| 014 | [Plugin permissions are enforced](014-plugin-permissions.md) |
 
-Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–013 on
+Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–014 on
 2026-11-07).

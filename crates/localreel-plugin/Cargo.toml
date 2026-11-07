@@ -17,6 +17,8 @@ walkdir.workspace = true
 thiserror.workspace = true
 zip.workspace = true
 tracing.workspace = true
+rusqlite.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

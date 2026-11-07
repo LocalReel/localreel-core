@@ -555,30 +555,45 @@ async fn serve(
     let jobs = JobQueue::new(db.clone(), events.clone());
 
     // Start configured sidecar plugins before anything resolves a source.
+    // The plugin audit table has its own migration stream.
+    migrations::apply(&db, "plugin", localreel_plugin::audit::migrations())?;
     let storage = Arc::new(localreel_media::StorageRegistry::new());
+    let mut plugin_host = localreel_plugin::PluginHost::new(db.clone());
     let mut plugin_runtimes = Vec::new();
+    let source_index = localreel_media::MediaService::new(db.clone());
     for plugin in config.plugins.iter().filter(|plugin| plugin.enabled) {
-        let manifest = localreel_plugin::inspect(&plugin.package)
+        let inspected = localreel_plugin::inspect(&plugin.package)
             .with_context(|| format!("plugin package {}", plugin.package.display()))?;
-        let install = config
-            .data_dir
-            .join("plugins")
-            .join(&manifest.id)
-            .join(&manifest.version);
+        let install_root = config.data_dir.join("plugins").join(&inspected.id);
+        let install = install_root.join(&inspected.version);
         let manifest = localreel_plugin::extract(&plugin.package, &install)?;
         let program = install.join(&manifest.entry.program);
+        // Hand the plugin only the roots it is responsible for; everything else
+        // in the library is not its business.
+        let roots: Vec<String> = source_index
+            .list_sources_with_archived(false)?
+            .into_iter()
+            .filter(|source| source.kind == manifest.id)
+            .map(|source| source.uri)
+            .collect();
         let runtime = Arc::new(localreel_plugin::PluginRuntime::start(
             &program,
             &manifest,
             &plugin.config,
+            &localreel_plugin::PluginSandbox {
+                working_dir: Some(install_root),
+                roots,
+            },
         )?);
         storage.register(
             manifest.id.clone(),
             Arc::new(localreel_plugin::PluginStorage::new(runtime.clone())),
         );
         info!(id = %manifest.id, version = %manifest.version, "plugin started");
+        plugin_host.register(runtime.clone());
         plugin_runtimes.push(runtime);
     }
+    let plugin_host = Arc::new(plugin_host);
     let media = MediaService::with_storage(db.clone(), storage.clone());
     let accounts = localreel_media::AccountService::new(db.clone());
     if let Ok(removed) = accounts.purge_expired_sessions() {
@@ -813,6 +828,7 @@ async fn serve(
         media,
         accounts,
         transcodes,
+        plugins: plugin_host,
         ffmpeg_capability,
         hwaccel,
     });

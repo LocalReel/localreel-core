@@ -6,6 +6,8 @@
 //! plugins implement the [`localreel_kernel::storage::Storage`] contract through
 //! [`PluginStorage`].
 
+pub mod audit;
+pub mod host;
 pub mod http;
 pub mod manifest;
 pub mod package;
@@ -13,7 +15,11 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 
-pub use manifest::{Manifest, PluginError, PluginKind, API_VERSION};
+pub use audit::{AuditEntry, AuditLog};
+pub use host::{PluginHost, PluginSummary, ProxyResponse};
+pub use manifest::{
+    Manifest, PluginError, PluginKind, API_VERSION, PERMISSION_NETWORK, PERMISSION_STORAGE_READ,
+};
 pub use package::{extract, inspect};
-pub use runtime::PluginRuntime;
+pub use runtime::{PluginRuntime, PluginSandbox};
 pub use storage::PluginStorage;

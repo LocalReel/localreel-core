@@ -61,8 +61,45 @@ Rules:
   Runtime names are bare command names resolved through `PATH`; path separators
   are rejected. This is how script plugins avoid shipping a launcher binary;
   `localreel-plugin-cli new --lang node|python` generates such projects.
-- `permissions` may contain `network`; unknown permissions are rejected. The
-  host does not grant capabilities — the list documents what the plugin does.
+- `permissions` may contain `storage:read` and `network`; unknown or duplicate
+  entries are rejected. A `storage` plugin always has `storage:read` — it is
+  implied by the kind, so a package that predates the permission keeps loading
+  and `effective_permissions()` reports it anyway. `network` is never implied.
+
+## Permissions
+
+The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it
+does is make the declaration matter:
+
+| Permission | Effect |
+|---|---|
+| `storage:read` | Baseline for `kind = "storage"`. The plugin is handed its own source roots through `LOCALREEL_PLUGIN_ROOTS` and nothing else. |
+| `network` | The host proxy (`POST /api/v1/plugin-proxy`) fetches URLs on the plugin's behalf. Without it the call is refused with `403` and recorded as `network.denied`. |
+
+Enforcement, concretely:
+
+- **Environment.** The sidecar is started with `env_clear()`. It inherits only
+  `PATH`, `HOME`/`USERPROFILE`, `LANG`, `LC_ALL`, `TEMP`/`TMP`, and on Windows
+  `SYSTEMROOT`/`WINDIR`. `LOCALREEL_DATA_DIR`, `LOCALREEL_CONFIG` and
+  `LOCALREEL_LOG_DIR` are **not** passed: a plugin that could read them would not
+  need a permission to reach the library.
+- **Working directory.** `<data>/plugins/<id>/`, so relative writes stay in the
+  plugin's own directory.
+- **Roots.** `LOCALREEL_PLUGIN_ROOTS` is a JSON array of the source URIs this
+  plugin owns (the rows in `sources` whose `kind` equals the plugin id). It is
+  the only library location the plugin is told about.
+- **Proxy.** `POST /api/v1/plugin-proxy` with
+  `{"url": "https://..."}` and an `x-localreel-plugin: <LOCALREEL_PLUGIN_TOKEN>`
+  header. The host checks the token, checks `network`, fetches with a 30 s
+  timeout and a 32 MiB cap, and returns the response. `4xx`/`5xx` from the
+  target are passed through.
+- **Audit.** `start`, `network.allowed` and `network.denied` are written to
+  `plugin_audit` (`GET /api/v1/plugins/audit`), and the admin page lists both the
+  effective permissions and the recent activity.
+
+A plugin can still open its own sockets: the host cannot stop that without an
+OS-level sandbox, and claiming otherwise would be dishonest. What it can
+guarantee is that every sanctioned request is attributable.
 - Unknown manifest fields are ignored, never interpreted.
 
 ## Lifecycle

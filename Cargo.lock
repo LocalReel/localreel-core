@@ -868,6 +868,7 @@ dependencies = [
  "httpdate",
  "localreel-kernel",
  "localreel-media",
+ "localreel-plugin",
  "mime_guess",
  "serde",
  "serde_json",
@@ -929,12 +930,14 @@ name = "localreel-plugin"
 version = "0.4.2"
 dependencies = [
  "localreel-kernel",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tracing",
+ "ureq",
  "uuid",
  "walkdir",
  "zip",

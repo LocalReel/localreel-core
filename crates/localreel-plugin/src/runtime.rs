@@ -37,6 +37,34 @@ pub struct PluginRuntime {
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
+/// Variables a plugin may inherit.
+///
+/// Everything else stays behind. `LOCALREEL_DATA_DIR`, `LOCALREEL_CONFIG` and
+/// `LOCALREEL_LOG_DIR` point straight at the host's database and configuration:
+/// a plugin that can read them does not need a permission to reach the library,
+/// which would make the whole permission model decorative.
+const INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "LANG",
+    "LC_ALL",
+    "TEMP",
+    "TMP",
+    // Windows needs these to load some runtimes at all.
+    "SYSTEMROOT",
+    "WINDIR",
+];
+
+/// What the host gives a plugin besides its own program.
+#[derive(Debug, Clone, Default)]
+pub struct PluginSandbox {
+    /// Working directory, normally `<data>/plugins/<id>/`.
+    pub working_dir: Option<std::path::PathBuf>,
+    /// Source roots this plugin is responsible for, as URIs.
+    pub roots: Vec<String>,
+}
+
 /// Build the command that starts a plugin.
 ///
 /// A manifest may name an interpreter (`entry.runtime`); the entry program is
@@ -52,12 +80,45 @@ fn launch_command(program: &Path, manifest: &Manifest) -> Command {
     }
 }
 
+/// The command, with a cleared environment and only the whitelist injected.
+///
+/// `env_clear` is the whole point: `Command` otherwise inherits the host's
+/// environment, and the host's environment names its database.
+fn sandboxed_command(
+    program: &Path,
+    manifest: &Manifest,
+    token: &str,
+    config: &str,
+    sandbox: &PluginSandbox,
+) -> Command {
+    let mut command = launch_command(program, manifest);
+    command.args(&manifest.entry.args).env_clear();
+    for key in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("LOCALREEL_PLUGIN_ID", &manifest.id)
+        .env("LOCALREEL_PLUGIN_TOKEN", token)
+        .env("LOCALREEL_PLUGIN_CONFIG", config)
+        .env(
+            "LOCALREEL_PLUGIN_ROOTS",
+            serde_json::to_string(&sandbox.roots).unwrap_or_else(|_| "[]".to_string()),
+        );
+    if let Some(dir) = &sandbox.working_dir {
+        command.current_dir(dir);
+    }
+    command
+}
+
 impl PluginRuntime {
     /// Start `program` with the manifest's args and the runtime environment.
     pub fn start(
         program: &Path,
         manifest: &Manifest,
         config: &serde_json::Value,
+        sandbox: &PluginSandbox,
     ) -> Result<Self, PluginError> {
         manifest.validate()?;
         if !program.is_file() {
@@ -73,12 +134,8 @@ impl PluginRuntime {
         }
         let token = uuid::Uuid::new_v4().to_string();
 
-        let mut command = launch_command(program, manifest);
+        let mut command = sandboxed_command(program, manifest, &token, &config, sandbox);
         command
-            .args(&manifest.entry.args)
-            .env("LOCALREEL_PLUGIN_ID", &manifest.id)
-            .env("LOCALREEL_PLUGIN_TOKEN", &token)
-            .env("LOCALREEL_PLUGIN_CONFIG", &config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -174,6 +231,11 @@ impl PluginRuntime {
         &self.manifest
     }
 
+    /// The token the plugin must present to the host (proxy, callbacks).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub fn address(&self) -> SocketAddr {
         self.address
     }
@@ -263,5 +325,69 @@ mod tests {
         let command = launch_command(Path::new("pkg/plugin"), &manifest(None));
         assert_eq!(command.get_program(), "pkg/plugin");
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn the_plugin_environment_is_only_the_whitelist() {
+        let sandbox = PluginSandbox {
+            working_dir: Some(std::path::PathBuf::from("data/plugins/example")),
+            roots: vec!["https://nas/dav".to_string()],
+        };
+        let command = sandboxed_command(
+            Path::new("pkg/plugin.js"),
+            &manifest(Some("node")),
+            "token",
+            "{}",
+            &sandbox,
+        );
+
+        let keys: Vec<String> = command
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in &keys {
+            assert!(
+                INHERITED_ENV.contains(&key.as_str()) || key.starts_with("LOCALREEL_PLUGIN_"),
+                "{key} must never reach a plugin"
+            );
+        }
+        // The host's own locations are the ones that matter.
+        assert!(!keys.contains(&"LOCALREEL_DATA_DIR".to_string()));
+        assert!(!keys.contains(&"LOCALREEL_CONFIG".to_string()));
+        assert!(!keys.contains(&"LOCALREEL_LOG_DIR".to_string()));
+
+        // The three documented variables are still there, plus the roots.
+        assert!(keys.contains(&"LOCALREEL_PLUGIN_ID".to_string()));
+        assert!(keys.contains(&"LOCALREEL_PLUGIN_TOKEN".to_string()));
+        assert!(keys.contains(&"LOCALREEL_PLUGIN_CONFIG".to_string()));
+        assert!(keys.contains(&"LOCALREEL_PLUGIN_ROOTS".to_string()));
+
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("data/plugins/example"))
+        );
+    }
+
+    #[test]
+    fn roots_are_passed_as_json() {
+        let sandbox = PluginSandbox {
+            working_dir: None,
+            roots: vec!["/library".to_string(), "https://nas/dav".to_string()],
+        };
+        let command = sandboxed_command(
+            Path::new("pkg/plugin"),
+            &manifest(None),
+            "token",
+            "{}",
+            &sandbox,
+        );
+        let roots = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("LOCALREEL_PLUGIN_ROOTS"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+            .expect("roots are always present");
+        let parsed: Vec<String> = serde_json::from_str(&roots).unwrap();
+        assert_eq!(parsed, vec!["/library", "https://nas/dav"]);
     }
 }

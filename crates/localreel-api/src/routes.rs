@@ -49,7 +49,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/status", get(auth::status))
         .route("/api/v1/auth/setup", post(auth::setup))
         .route("/api/v1/auth/login", post(auth::login))
-        .route("/api/v1/auth/logout", post(auth::logout));
+        .route("/api/v1/auth/logout", post(auth::logout))
+        // Plugins have no browser session; this one authenticates with the
+        // token the host gave the sidecar when it started it.
+        .route("/api/v1/plugin-proxy", post(plugin_proxy));
 
     // Any signed-in account: the shared library plus that account's own state.
     let user_api = Router::new()
@@ -78,6 +81,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
+        .route("/api/v1/plugins", get(list_plugins))
+        .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
         .route("/api/v1/backup/restore", post(enqueue_restore))
         .route("/api/v1/backup/restore/upload", post(upload_restore_file))
@@ -282,6 +287,69 @@ async fn shutdown_server(State(state): State<Arc<AppState>>) -> Json<serde_json:
     // The server logs the shutdown itself; this only raises the signal.
     state.shutdown.notify_one();
     Json(serde_json::json!({ "status": "shutting-down" }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyRequest {
+    url: String,
+}
+
+/// Outbound HTTP on behalf of a plugin.
+///
+/// The only sanctioned way for a sidecar to reach the network: it must present
+/// the token the host gave it, it must have declared `network`, and every call
+/// is audited. A plugin without the permission gets 403 and an audit row.
+async fn plugin_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ProxyRequest>,
+) -> Result<Response, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    let proxied = state.plugins.proxy(token, &payload.url)?;
+    let status = StatusCode::from_u16(proxied.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = proxied.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(proxied.body))
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+/// Installed plugins with the permissions that actually apply to them.
+async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "plugins": state.plugins.summaries() }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    plugin: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Recent plugin audit entries, newest first.
+async fn plugin_audit(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let entries = state
+        .plugins
+        .audit()
+        .map(|audit| audit.recent(query.plugin.as_deref(), limit))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
 async fn admin_health(
@@ -1414,6 +1482,7 @@ mod tests {
             media,
             accounts,
             transcodes,
+            plugins: Arc::new(localreel_plugin::PluginHost::default()),
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
             hwaccel: localreel_kernel::media_ops::HwAccel::None,
         })
@@ -1743,6 +1812,68 @@ mod tests {
         assert!(text.contains("/previews/previewme.jpg#xywh=0,0,160,90"));
         // Ten minutes at six seconds per tile: one hundred cues.
         assert_eq!(text.matches("-->").count(), 100);
+    }
+
+    #[tokio::test]
+    async fn the_plugin_proxy_requires_a_plugin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+
+        // No token at all: the request never reaches the proxy.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-proxy")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"url":"https://example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A token no running plugin owns is a permission error, not a fetch.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-proxy")
+                    .header("host", "127.0.0.1:3001")
+                    .header("x-localreel-plugin", "not-a-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"url":"https://example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_admin_plugin_list_is_empty_without_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        for (uri, key) in [
+            ("/api/v1/plugins", "plugins"),
+            ("/api/v1/plugins/audit", "entries"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_as(uri, &session))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value[key], serde_json::json!([]), "{uri}");
+        }
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.

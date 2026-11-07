@@ -22,6 +22,8 @@ pub struct AppState {
     pub watchers: Arc<localreel_media::WatcherManager>,
     /// The single ffmpeg budget (transcode / HLS packaging).
     pub transcodes: Arc<localreel_media::TranscodeGate>,
+    /// The sidecar plugins this process started.
+    pub plugins: Arc<localreel_plugin::PluginHost>,
     /// What the installed ffmpeg/ffprobe pair can do (`full`, `probe-only`,
     /// `missing`), so the UI can explain what is degraded instead of guessing.
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
@@ -45,6 +47,7 @@ pub struct AppStateParts {
     pub media: MediaService,
     pub accounts: AccountService,
     pub transcodes: Arc<localreel_media::TranscodeGate>,
+    pub plugins: Arc<localreel_plugin::PluginHost>,
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
     pub hwaccel: localreel_kernel::media_ops::HwAccel,
 }
@@ -59,6 +62,7 @@ impl AppState {
             media,
             accounts,
             transcodes,
+            plugins,
             ffmpeg_capability,
             hwaccel,
         } = parts;
@@ -77,6 +81,7 @@ impl AppState {
             login_limiter: LoginLimiter::new(),
             watchers,
             transcodes,
+            plugins,
             ffmpeg_capability,
             hwaccel,
             started_at: now_secs(),
