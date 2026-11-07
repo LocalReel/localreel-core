@@ -1,14 +1,17 @@
+mod launch;
+mod logging;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 
 use anyhow::Context;
 use localreel_api::AppState;
-use localreel_kernel::config::Config;
+use localreel_kernel::config::{Config, RunMode};
 use localreel_kernel::db::Database;
 use localreel_kernel::events::{Event, EventBus};
 use localreel_kernel::jobs::{JobQueue, JobRegistry, JobWorker};
@@ -21,6 +24,10 @@ use localreel_media::{
 #[derive(Debug, Parser)]
 #[command(name = "localreel", version, about = "Local-first media server")]
 struct Cli {
+    /// Force a persona instead of detecting it: `desktop` opens the UI and
+    /// heals a busy port, `server` stays headless on a fixed port.
+    #[arg(long, global = true, value_name = "MODE")]
+    mode: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -28,7 +35,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the HTTP server (default).
-    Serve,
+    Serve {
+        /// Do not open the web UI in a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Bind this port instead of the configured one.
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+        /// Bind this host instead of the configured one.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+    },
     /// Apply database migrations and exit.
     Migrate,
     /// Print configuration and environment checks.
@@ -88,16 +105,38 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve().await,
+    let explicit = match cli.mode.as_deref() {
+        Some(raw) => Some(raw.parse::<RunMode>()?),
+        None => None,
+    };
+    let mode = launch::decide(explicit, &launch::Signals::detect());
+    logging::init(&localreel_kernel::config::default_log_dir());
+
+    let result = dispatch(cli, mode).await;
+    if let Err(error) = &result {
+        // A double-clicked window must not vanish before it can be read.
+        eprintln!();
+        eprintln!("LocalReel could not start:");
+        eprintln!("  {error:#}");
+        if launch::is_interactive() {
+            launch::pause_before_exit();
+        }
+    }
+    result
+}
+
+async fn dispatch(cli: Cli, mode: RunMode) -> anyhow::Result<()> {
+    match cli.command.unwrap_or(Command::Serve {
+        no_open: false,
+        port: None,
+        host: None,
+    }) {
+        Command::Serve {
+            no_open,
+            port,
+            host,
+        } => serve(mode, no_open, port, host).await,
         Command::Migrate => migrate(),
         Command::Doctor => doctor(),
         Command::Scan { source_id } => scan(source_id),
@@ -150,6 +189,8 @@ fn doctor() -> anyhow::Result<()> {
         config.media.transcode_timeout,
     );
     println!("LocalReel doctor");
+    println!("  version:   {}", localreel_kernel::VERSION);
+    println!("  mode:      {} ({})", config.mode, config.mode_source);
     println!(
         "  config:    {}",
         source
@@ -159,6 +200,7 @@ fn doctor() -> anyhow::Result<()> {
     );
     println!("  host:      {}:{}", config.host, config.port);
     println!("  data dir:  {}", config.data_dir.display());
+    println!("  log dir:   {}", config.log_dir.display());
     println!("  database:  {} (ok)", config.db_path.display());
     println!(
         "  ffmpeg:    {} ({})",
@@ -399,12 +441,53 @@ fn prune_backup_uploads(data_dir: &std::path::Path) {
     }
 }
 
-async fn serve() -> anyhow::Result<()> {
-    let (config, source) = Config::load_with_source()?;
+async fn serve(
+    mode: RunMode,
+    no_open: bool,
+    port: Option<u16>,
+    host: Option<String>,
+) -> anyhow::Result<()> {
+    let (mut config, source) = Config::load_with_mode(Some(mode))?;
+    if let Some(port) = port {
+        config.port = port;
+    }
+    if let Some(host) = host {
+        config.host = host;
+    }
+    config.validate()?;
+    config.ensure_dirs()?;
+
     if let Some(path) = &source {
         info!("loaded configuration from {}", path.display());
     }
-    config.ensure_dirs()?;
+
+    // Desktop: a second double click means "show me the app", not "fail".
+    if config.mode.is_desktop() {
+        if let Some(running) = launch::probe(&config.host, config.port) {
+            let url = launch::web_url(&config.host, config.port);
+            println!();
+            println!("LocalReel {} is already running.", running.version);
+            println!("  Open: {url}");
+            if launch::should_open_ui(&config, no_open) {
+                if let Err(error) = launch::open_browser(&url) {
+                    eprintln!("  Open the address above (no browser could be started: {error}).");
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // Bind before the expensive setup so a busy port fails fast and visibly.
+    let requested_port = config.port;
+    let (listener, bound_port) =
+        launch::bind_listener(&config.host, requested_port, config.mode).await?;
+    config.port = bound_port;
+    if bound_port != requested_port {
+        println!("Port {requested_port} is busy; using {bound_port} instead.");
+    }
+    let url = launch::web_url(&config.host, bound_port);
+    launch::print_banner(&config, &url, localreel_kernel::VERSION);
+
     prune_backup_uploads(&config.data_dir);
     let db = open_database(&config)?;
     run_migrations(&db)?;
@@ -450,6 +533,11 @@ async fn serve() -> anyhow::Result<()> {
         tracing::warn!(
             "ffmpeg/ffprobe not available; scanning metadata and transcoding are disabled"
         );
+        println!("  ffmpeg not found: metadata, thumbnails and transcoding are disabled.");
+        println!(
+            "  Install ffmpeg on PATH, place it in ffmpeg/bin next to the program, or set LOCALREEL_FFMPEG."
+        );
+        println!();
     }
 
     // Kernel workers are generic; the media crate registers the domain handlers.
@@ -550,16 +638,24 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    let listen_host = config.host.clone();
-    let listen_port = config.port;
+    let open_ui = launch::should_open_ui(&config, no_open);
     let state = AppState::new(config, db, events.clone(), jobs, media, ffmpeg_available);
     let app = localreel_api::router(state);
 
-    let listener = tokio::net::TcpListener::bind((listen_host.as_str(), listen_port)).await?;
-    info!("LocalReel listening on http://{}", listener.local_addr()?);
+    info!("LocalReel listening on {url}");
     events.publish(Event::ServerStarted {
         version: localreel_kernel::VERSION.to_string(),
     });
+
+    if open_ui {
+        let url = url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if let Err(error) = launch::open_browser(&url) {
+                warn!("could not open a browser: {error}");
+            }
+        });
+    }
 
     let shutdown_signal = shutdown.clone();
     axum::serve(listener, app)

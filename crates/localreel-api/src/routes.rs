@@ -205,8 +205,12 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
+    /// Stable identifier, so launchers can tell LocalReel apart from anything
+    /// else that happens to listen on the configured port.
+    name: &'static str,
     status: &'static str,
     version: &'static str,
+    mode: &'static str,
     database: bool,
     ffmpeg: bool,
     media_count: i64,
@@ -217,8 +221,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let database = state.db.health_check().is_ok();
     let media_count = state.media.media_count().unwrap_or(0);
     Json(HealthResponse {
+        name: "LocalReel",
         status: if database { "ok" } else { "degraded" },
         version: localreel_kernel::VERSION,
+        mode: state.config.mode.as_str(),
         database,
         ffmpeg: state.ffmpeg_available,
         media_count,
@@ -233,8 +239,10 @@ async fn admin_health(
     let media_count = state.media.media_count().unwrap_or(0);
     let recent_jobs = state.jobs.list_recent(20)?;
     Ok(Json(serde_json::json!({
+        "name": "LocalReel",
         "status": if database { "ok" } else { "degraded" },
         "version": localreel_kernel::VERSION,
+        "mode": state.config.mode.as_str(),
         "database": database,
         "ffmpeg": state.ffmpeg_available,
         "media_count": media_count,

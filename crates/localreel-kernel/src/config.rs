@@ -1,11 +1,58 @@
 use std::env;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::error::{KernelError, Result};
+use crate::paths::{self, Dirs, Env, Os};
+
+/// How this process should present itself.
+///
+/// The desktop and server personas share one binary; only the launch
+/// behaviour, the security defaults and the directory layout differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// Started by a person: open the UI, heal a busy port, stay visible.
+    Desktop,
+    /// Started by a service manager or container: fixed port, no UI popup.
+    Server,
+}
+
+impl RunMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RunMode::Desktop => "desktop",
+            RunMode::Server => "server",
+        }
+    }
+
+    pub const fn is_desktop(self) -> bool {
+        matches!(self, RunMode::Desktop)
+    }
+}
+
+impl std::fmt::Display for RunMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RunMode {
+    type Err = KernelError;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "desktop" => Ok(RunMode::Desktop),
+            "server" => Ok(RunMode::Server),
+            other => Err(KernelError::Config(format!(
+                "invalid mode '{other}': expected 'desktop' or 'server'"
+            ))),
+        }
+    }
+}
 
 /// Full server configuration.
 ///
@@ -15,8 +62,14 @@ use crate::error::{KernelError, Result};
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// `desktop` opens the UI and heals a busy port; `server` stays strict.
+    pub mode: RunMode,
+    /// Where the persona came from: `--mode`, `LOCALREEL_MODE` or `detected`.
+    pub mode_source: &'static str,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
+    /// Where rolling log files are written.
+    pub log_dir: PathBuf,
     pub web_dir: Option<PathBuf>,
     /// Must be explicitly enabled to bind beyond loopback. The default is
     /// local-only, matching the trust model of the previous LocalReel app.
@@ -65,11 +118,19 @@ pub struct MediaConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let data_dir = PathBuf::from("data");
+        let dirs = platform_dirs();
+        let data_dir = dirs
+            .as_ref()
+            .map(|dirs| dirs.data.clone())
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let log_dir = default_log_dir();
         Self {
             host: "127.0.0.1".to_string(),
             port: 3001,
+            mode: RunMode::Desktop,
+            mode_source: "detected",
             db_path: data_dir.join("localreel.db"),
+            log_dir,
             web_dir: None,
             allow_remote: false,
             data_dir: data_dir.clone(),
@@ -101,9 +162,20 @@ impl Config {
     /// Load defaults + optional config file + environment overrides, validate,
     /// and return the file that was used (if any).
     pub fn load_with_source() -> Result<(Self, Option<PathBuf>)> {
-        let mut config = Self::default();
-        let source_path = find_config_file()?;
+        Self::load_with_mode(None)
+    }
 
+    /// Load configuration for a specific persona.
+    ///
+    /// `mode` comes from the command line when the operator passed `--mode`;
+    /// otherwise the `LOCALREEL_MODE` variable or the built-in default applies.
+    pub fn load_with_mode(mode: Option<RunMode>) -> Result<(Self, Option<PathBuf>)> {
+        let mut config = Self::default();
+        let platform_data = config.data_dir.clone();
+        let dirs = platform_dirs();
+        let source_path = find_config_file(&platform_data, dirs.as_ref())?;
+
+        let mut explicit_data = false;
         if let Some(path) = &source_path {
             let text = std::fs::read_to_string(path).map_err(|error| {
                 KernelError::Config(format!(
@@ -114,10 +186,34 @@ impl Config {
             let parsed: ConfigFile = toml::from_str(&text).map_err(|error| {
                 KernelError::Config(format!("invalid config file {}: {error}", path.display()))
             })?;
+            explicit_data = parsed.data.dir.is_some();
             config.apply_file(parsed)?;
         }
 
+        let mode_from_env = env::var_os("LOCALREEL_MODE").is_some();
         config.apply_env()?;
+        if let Some(mode) = mode {
+            config.mode = mode;
+            config.mode_source = "--mode";
+        } else if mode_from_env {
+            config.mode_source = "LOCALREEL_MODE";
+        }
+        explicit_data |= env::var_os("LOCALREEL_DATA_DIR").is_some();
+
+        // A layout from before platform directories existed keeps working:
+        // adopt `<exe dir>/data` or `<cwd>/data` when no explicit data dir was
+        // configured and the platform location is still empty.
+        if !explicit_data {
+            if let Some(legacy) = adopt_legacy_data_dir(&platform_data) {
+                tracing::warn!(
+                    path = %legacy.display(),
+                    "using a legacy data directory next to the install; set \
+                     LOCALREEL_DATA_DIR to silence this"
+                );
+                config.set_data_dir(legacy);
+            }
+        }
+
         config.validate()?;
         Ok((config, source_path))
     }
@@ -125,6 +221,15 @@ impl Config {
     /// Convenience wrapper for callers that do not need the config origin.
     pub fn load() -> Result<Self> {
         Self::load_with_source().map(|(config, _)| config)
+    }
+
+    /// Point the data directory (and everything derived from it) at `dir`.
+    pub fn set_data_dir(&mut self, dir: PathBuf) {
+        self.db_path = dir.join("localreel.db");
+        self.media.thumbnail_dir = dir.join("thumbnails");
+        self.media.transcode_dir = dir.join("transcodes");
+        self.media.hls_dir = dir.join("hls");
+        self.data_dir = dir;
     }
 
     fn apply_file(&mut self, file: ConfigFile) -> Result<()> {
@@ -142,11 +247,7 @@ impl Config {
         }
 
         if let Some(dir) = file.data.dir {
-            self.data_dir = dir;
-            self.db_path = self.data_dir.join("localreel.db");
-            self.media.thumbnail_dir = self.data_dir.join("thumbnails");
-            self.media.transcode_dir = self.data_dir.join("transcodes");
-            self.media.hls_dir = self.data_dir.join("hls");
+            self.set_data_dir(dir);
         }
         if let Some(db) = file.data.db {
             self.db_path = db;
@@ -221,11 +322,13 @@ impl Config {
                 .map_err(|_| KernelError::Config("LOCALREEL_PORT must be <= 65535".into()))?;
         }
         if let Some(value) = env_string("LOCALREEL_DATA_DIR") {
-            self.data_dir = PathBuf::from(value);
-            self.db_path = self.data_dir.join("localreel.db");
-            self.media.thumbnail_dir = self.data_dir.join("thumbnails");
-            self.media.transcode_dir = self.data_dir.join("transcodes");
-            self.media.hls_dir = self.data_dir.join("hls");
+            self.set_data_dir(PathBuf::from(value));
+        }
+        if let Some(value) = env_string("LOCALREEL_LOG_DIR") {
+            self.log_dir = PathBuf::from(value);
+        }
+        if let Some(value) = env_string("LOCALREEL_MODE") {
+            self.mode = value.parse()?;
         }
         if let Some(value) = env_string("LOCALREEL_DB") {
             self.db_path = PathBuf::from(value);
@@ -269,7 +372,8 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Reject configurations that cannot work.
+    pub fn validate(&self) -> Result<()> {
         if self.port == 0 {
             return Err(KernelError::Config("port must not be 0".into()));
         }
@@ -314,6 +418,7 @@ impl Config {
             &self.media.thumbnail_dir,
             &self.media.transcode_dir,
             &self.media.hls_dir,
+            &self.log_dir,
         ] {
             std::fs::create_dir_all(dir).map_err(|error| {
                 KernelError::Config(format!(
@@ -416,7 +521,21 @@ struct MediaFile {
     cache_max_age_hours: Option<u64>,
 }
 
-fn find_config_file() -> Result<Option<PathBuf>> {
+/// Platform log directory, independent of the configuration file.
+///
+/// The server initialises logging before it loads the configuration (so load
+/// warnings are captured), which makes this the authoritative source until a
+/// config file can override `data.dir`.
+pub fn default_log_dir() -> PathBuf {
+    if let Some(value) = env_string("LOCALREEL_LOG_DIR") {
+        return PathBuf::from(value);
+    }
+    platform_dirs()
+        .map(|dirs| dirs.log)
+        .unwrap_or_else(|| PathBuf::from("data").join("logs"))
+}
+
+fn find_config_file(data_dir: &Path, dirs: Option<&Dirs>) -> Result<Option<PathBuf>> {
     if let Some(raw) = env_string("LOCALREEL_CONFIG") {
         let path = PathBuf::from(raw);
         if !path.is_file() {
@@ -427,12 +546,46 @@ fn find_config_file() -> Result<Option<PathBuf>> {
         }
         return Ok(Some(path));
     }
-    let default = Path::new("localreel.toml");
-    if default.is_file() {
-        Ok(Some(default.to_path_buf()))
-    } else {
-        Ok(None)
+
+    // Platform config directory first, then the data directory (containers keep
+    // everything under /data), then the working directory for old checkouts.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dirs) = dirs {
+        candidates.push(dirs.config.join("localreel.toml"));
     }
+    candidates.push(data_dir.join("localreel.toml"));
+    candidates.push(PathBuf::from("localreel.toml"));
+
+    Ok(candidates.into_iter().find(|path| path.is_file()))
+}
+
+/// Platform directories for this process, when the environment names them.
+fn platform_dirs() -> Option<Dirs> {
+    Dirs::resolve(Os::current(), &Env::from_process())
+}
+
+/// A `data/` directory written before platform directories existed.
+///
+/// Only consulted when the platform location is still empty and the operator
+/// did not configure a data directory, so existing libraries are not orphaned.
+fn adopt_legacy_data_dir(platform_data: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = paths::exe_dir() {
+        candidates.push(dir.join("data"));
+    }
+    if let Some(dir) = paths::current_dir() {
+        candidates.push(dir.join("data"));
+    }
+    adopt_from(platform_data, candidates)
+}
+
+fn adopt_from(platform_data: &Path, candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    if platform_data.join("localreel.db").is_file() {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir != platform_data && dir.join("localreel.db").is_file())
 }
 
 fn default_worker_count() -> usize {
@@ -576,5 +729,82 @@ mod tests {
     fn invalid_config_file_is_rejected() {
         let parsed: std::result::Result<ConfigFile, _> = toml::from_str("server = 3");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn run_mode_parses_case_insensitively() {
+        assert_eq!("desktop".parse::<RunMode>().unwrap(), RunMode::Desktop);
+        assert_eq!(" SERVER ".parse::<RunMode>().unwrap(), RunMode::Server);
+        assert!("headless".parse::<RunMode>().is_err());
+    }
+
+    #[test]
+    fn server_mode_is_not_desktop() {
+        assert!(RunMode::Desktop.is_desktop());
+        assert!(!RunMode::Server.is_desktop());
+        assert_eq!(RunMode::Server.as_str(), "server");
+    }
+
+    #[test]
+    fn set_data_dir_moves_derived_directories() {
+        let mut config = Config::default();
+        config.set_data_dir(PathBuf::from("/tmp/library"));
+        assert_eq!(config.db_path, PathBuf::from("/tmp/library/localreel.db"));
+        assert_eq!(
+            config.media.thumbnail_dir,
+            PathBuf::from("/tmp/library/thumbnails")
+        );
+        assert_eq!(
+            config.media.transcode_dir,
+            PathBuf::from("/tmp/library/transcodes")
+        );
+        assert_eq!(config.media.hls_dir, PathBuf::from("/tmp/library/hls"));
+    }
+
+    #[test]
+    fn defaults_never_live_in_the_working_directory() {
+        // The platform directory is used when the environment names one; the
+        // relative fallback only exists for environments without a home.
+        let config = Config::default();
+        let relative = config.data_dir == Path::new("data");
+        assert_eq!(relative, platform_dirs().is_none());
+    }
+
+    #[test]
+    fn config_file_is_found_in_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(&path, "[server]\nport = 4321\n").unwrap();
+        let found = find_config_file(dir.path(), None).unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn legacy_data_directory_is_not_adopted_when_platform_db_exists() {
+        let platform = tempfile::tempdir().unwrap();
+        std::fs::write(platform.path().join("localreel.db"), b"").unwrap();
+        assert!(adopt_legacy_data_dir(platform.path()).is_none());
+    }
+
+    #[test]
+    fn adoption_prefers_the_first_directory_with_a_database() {
+        let platform = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let populated = tempfile::tempdir().unwrap();
+        std::fs::write(populated.path().join("localreel.db"), b"").unwrap();
+
+        let candidates = vec![empty.path().to_path_buf(), populated.path().to_path_buf()];
+        assert_eq!(
+            adopt_from(platform.path(), candidates),
+            Some(populated.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn adoption_ignores_the_platform_directory_itself() {
+        let platform = tempfile::tempdir().unwrap();
+        std::fs::write(platform.path().join("localreel.db"), b"").unwrap();
+        let candidates = vec![platform.path().to_path_buf()];
+        assert!(adopt_from(platform.path(), candidates).is_none());
     }
 }

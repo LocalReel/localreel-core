@@ -16,5 +16,8 @@ from the module boundaries.
 | 008 | [Extension contract](008-extension-contract.md) |
 | 009 | [Repositories and versioning](009-repositories.md) |
 | 010 | [Playback transport](010-playback-transport.md) |
+| 011 | [Two personas, one binary](011-personas.md) |
+| 012 | [Persistent state locations](012-state-locations.md) |
 
-Status: all **Accepted** on 2026-11-01 unless noted otherwise.
+Status: all **Accepted** on 2026-11-01 unless noted otherwise (011 and 012 on
+2026-11-07).

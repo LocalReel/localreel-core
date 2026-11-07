@@ -12,6 +12,7 @@ pub mod events;
 pub mod jobs;
 pub mod media_ops;
 pub mod migrations;
+pub mod paths;
 pub mod storage;
 pub mod time;
 
