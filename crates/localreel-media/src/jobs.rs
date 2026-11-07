@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::jobs::{JobContext, JobHandler, JobOutcome, JobRegistry};
-use localreel_kernel::media_ops::{MediaInput, MediaOps};
+use localreel_kernel::media_ops::{
+    is_hardware_failure, HwAccel, MediaInput, MediaOps, TranscodeOptions, TranscodeRequest,
+};
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
@@ -364,37 +366,86 @@ impl JobHandler for TranscodeHandler {
             media.modified_at
         );
         let output = self.0.transcode_dir.join(&filename);
-        let mut last_progress = 0.0f64;
-        let mut last_report = Instant::now() - Duration::from_secs(2);
+        let hwaccel = self.0.media_ops.hwaccel();
+        let options = TranscodeOptions { hwaccel };
+        let cancel = context.cancel_flag();
 
         context.report_progress(0.0, Some("transcoding"));
-        self.0.media_ops.transcode(
+        let mut fallback = false;
+        match self.0.media_ops.transcode(
             &input,
             &output,
             &preset,
-            media.duration,
-            &context.cancel_flag(),
-            |progress| {
-                if progress - last_progress >= 0.02
-                    || last_report.elapsed() >= Duration::from_secs(1)
-                {
-                    context.report_progress(progress, Some("transcoding"));
-                    last_progress = progress;
-                    last_report = Instant::now();
-                }
+            &TranscodeRequest {
+                options,
+                duration_secs: media.duration,
+                cancel: &cancel,
             },
-        )?;
+            progress_reporter(context),
+        ) {
+            Ok(()) => {}
+            Err(error) if hwaccel != HwAccel::None && is_hardware_failure(&error.to_string()) => {
+                // The encoder exists but this machine cannot run it (no device,
+                // no driver, a container without /dev/dri). One CPU retry turns
+                // a hard failure into a slower success.
+                tracing::warn!(
+                    media_id = media.id,
+                    hwaccel = hwaccel.as_str(),
+                    "hardware encoder failed, retrying on the CPU: {error}"
+                );
+                context.report_progress(0.0, Some("hardware encoder failed, retrying on CPU"));
+                self.0.media_ops.transcode(
+                    &input,
+                    &output,
+                    &preset,
+                    &TranscodeRequest {
+                        options: TranscodeOptions {
+                            hwaccel: HwAccel::None,
+                        },
+                        duration_secs: media.duration,
+                        cancel: &cancel,
+                    },
+                    progress_reporter(context),
+                )?;
+                fallback = true;
+            }
+            Err(error) => return Err(error),
+        }
 
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         service.record_variant(media.id, "transcode", &preset_name, &filename, size)?;
-        context.report_progress(1.0, Some("transcode ready"));
+        context.report_progress(
+            1.0,
+            Some(if fallback {
+                "transcode ready (hardware encoder failed, retried on CPU)"
+            } else {
+                "transcode ready"
+            }),
+        );
         JobOutcome::json(serde_json::json!({
             "path": filename,
             "preset": preset_name,
             "size": size,
+            "hwaccel": if fallback { "cpu" } else { hwaccel.as_str() },
         }))
+    }
+}
+
+/// Throttled progress reporting for one transcode attempt.
+///
+/// A closure cannot be reused after it is moved into `transcode`, so each
+/// attempt builds its own.
+fn progress_reporter(context: &JobContext) -> impl FnMut(f64) + '_ {
+    let mut last_progress = 0.0f64;
+    let mut last_report = Instant::now() - Duration::from_secs(2);
+    move |progress: f64| {
+        if progress - last_progress >= 0.02 || last_report.elapsed() >= Duration::from_secs(1) {
+            context.report_progress(progress, Some("transcoding"));
+            last_progress = progress;
+            last_report = Instant::now();
+        }
     }
 }
 

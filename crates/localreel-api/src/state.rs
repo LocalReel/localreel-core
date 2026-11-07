@@ -25,6 +25,8 @@ pub struct AppState {
     /// What the installed ffmpeg/ffprobe pair can do (`full`, `probe-only`,
     /// `missing`), so the UI can explain what is degraded instead of guessing.
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
+    /// Resolved hardware acceleration: `none` when no encoder is usable.
+    pub hwaccel: localreel_kernel::media_ops::HwAccel,
     pub started_at: i64,
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
     /// selects on it together with Ctrl+C.
@@ -44,6 +46,7 @@ pub struct AppStateParts {
     pub accounts: AccountService,
     pub transcodes: Arc<localreel_media::TranscodeGate>,
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
+    pub hwaccel: localreel_kernel::media_ops::HwAccel,
 }
 
 impl AppState {
@@ -57,6 +60,7 @@ impl AppState {
             accounts,
             transcodes,
             ffmpeg_capability,
+            hwaccel,
         } = parts;
         let watchers = Arc::new(localreel_media::WatcherManager::new(
             media.clone(),
@@ -74,6 +78,7 @@ impl AppState {
             watchers,
             transcodes,
             ffmpeg_capability,
+            hwaccel,
             started_at: now_secs(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         })

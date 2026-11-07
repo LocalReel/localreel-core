@@ -298,6 +298,7 @@ async fn admin_health(
         "database": database,
         "ffmpeg": state.ffmpeg_capability.can_transcode(),
         "ffmpeg_capability": state.ffmpeg_capability.as_str(),
+        "hwaccel": state.hwaccel.as_str(),
         "media_count": media_count,
         "data_dir": state.config.data_dir,
         "thumbnail_dir": state.config.media.thumbnail_dir,
@@ -1326,6 +1327,7 @@ mod tests {
             accounts,
             transcodes,
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
+            hwaccel: localreel_kernel::media_ops::HwAccel::None,
         })
     }
 

@@ -220,7 +220,8 @@ fn doctor() -> anyhow::Result<()> {
         config.media.probe_timeout,
         config.media.thumbnail_timeout,
         config.media.transcode_timeout,
-    );
+    )
+    .with_hwaccel(config.media.hwaccel);
     println!("LocalReel doctor");
     println!("  version:   {}", localreel_kernel::VERSION);
     println!("  mode:      {} ({})", config.mode, config.mode_source);
@@ -242,6 +243,11 @@ fn doctor() -> anyhow::Result<()> {
         media_ops.capability().as_str()
     );
     println!("  ffprobe:   {}", media_ops.ffprobe_path().display());
+    println!(
+        "  hwaccel:   {} (preferred: {})",
+        media_ops.hwaccel().as_str(),
+        config.media.hwaccel.as_str()
+    );
     match media_ops.capability() {
         localreel_kernel::media_ops::FfmpegCapability::Full => {}
         localreel_kernel::media_ops::FfmpegCapability::ProbeOnly => {
@@ -584,14 +590,27 @@ async fn serve(
         println!("  First run: open the UI and set the owner password.");
         println!();
     }
-    let media_ops = Arc::new(MediaOps::discover(
-        config.media.ffmpeg.clone(),
-        config.media.ffprobe.clone(),
-        config.media.probe_timeout,
-        config.media.thumbnail_timeout,
-        config.media.transcode_timeout,
-    ));
+    let media_ops = Arc::new(
+        MediaOps::discover(
+            config.media.ffmpeg.clone(),
+            config.media.ffprobe.clone(),
+            config.media.probe_timeout,
+            config.media.thumbnail_timeout,
+            config.media.transcode_timeout,
+        )
+        .with_hwaccel(config.media.hwaccel),
+    );
     let ffmpeg_capability = media_ops.capability();
+    // Resolve once, at startup: the encoder table needs one ffmpeg spawn and the
+    // answer does not change while the process runs.
+    let hwaccel = media_ops.hwaccel();
+    if ffmpeg_capability.can_transcode() {
+        info!(
+            hwaccel = hwaccel.as_str(),
+            preferred = config.media.hwaccel.as_str(),
+            "hardware acceleration resolved"
+        );
+    }
     if !ffmpeg_capability.can_probe() {
         tracing::warn!(
             "ffprobe is not available; scanning cannot read metadata and no encoding is possible"
@@ -790,6 +809,7 @@ async fn serve(
         accounts,
         transcodes,
         ffmpeg_capability,
+        hwaccel,
     });
     let app = localreel_api::router(state.clone());
 

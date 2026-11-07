@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -100,6 +101,188 @@ impl MediaInput {
     }
 }
 
+/// Hardware acceleration requested for transcoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwAccel {
+    /// Use the best encoder this machine actually has, else the CPU.
+    #[default]
+    Auto,
+    /// Always encode on the CPU.
+    None,
+    Nvenc,
+    Qsv,
+    Vaapi,
+    Videotoolbox,
+}
+
+/// `(accelerator, codec family, ffmpeg encoder name)`.
+const HARDWARE_ENCODERS: &[(HwAccel, &str, &str)] = &[
+    (HwAccel::Nvenc, "h264", "h264_nvenc"),
+    (HwAccel::Nvenc, "hevc", "hevc_nvenc"),
+    (HwAccel::Qsv, "h264", "h264_qsv"),
+    (HwAccel::Qsv, "hevc", "hevc_qsv"),
+    (HwAccel::Vaapi, "h264", "h264_vaapi"),
+    (HwAccel::Vaapi, "hevc", "hevc_vaapi"),
+    (HwAccel::Videotoolbox, "h264", "h264_videotoolbox"),
+    (HwAccel::Videotoolbox, "hevc", "hevc_videotoolbox"),
+];
+
+impl HwAccel {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "none" | "off" | "cpu" => Some(Self::None),
+            "nvenc" => Some(Self::Nvenc),
+            "qsv" => Some(Self::Qsv),
+            "vaapi" => Some(Self::Vaapi),
+            "videotoolbox" => Some(Self::Videotoolbox),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Nvenc => "nvenc",
+            Self::Qsv => "qsv",
+            Self::Vaapi => "vaapi",
+            Self::Videotoolbox => "videotoolbox",
+        }
+    }
+
+    /// The ffmpeg encoder that implements this accelerator for `video_codec`.
+    ///
+    /// Presets name an encoder (`libx264`), not a codec family, so both spellings
+    /// are accepted. `copy` and codecs nobody accelerates return `None`, which
+    /// keeps the CPU path in charge.
+    pub fn encoder_for(self, video_codec: &str) -> Option<&'static str> {
+        let family = match video_codec {
+            "h264" | "libx264" | "x264" => "h264",
+            "hevc" | "h265" | "libx265" | "x265" => "hevc",
+            _ => return None,
+        };
+        HARDWARE_ENCODERS
+            .iter()
+            .find(|(accel, codec, _)| *accel == self && *codec == family)
+            .map(|(_, _, name)| *name)
+    }
+}
+
+/// Options for one transcode. Extend this instead of growing the argument list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscodeOptions {
+    /// The accelerator to use. `Auto` must be resolved before it gets here.
+    pub hwaccel: HwAccel,
+}
+
+/// Everything one transcode needs besides the input, output and preset.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscodeRequest<'a> {
+    pub options: TranscodeOptions,
+    /// Source length, used to turn ffmpeg's progress into a 0..1 ratio.
+    pub duration_secs: Option<f64>,
+    /// Polled while ffmpeg runs; set it to stop the encode.
+    pub cancel: &'a AtomicBool,
+}
+
+/// The encoders an ffmpeg build reports.
+///
+/// `ffmpeg -encoders` is the only portable way to know whether `h264_nvenc`
+/// exists on this machine; the list is parsed once per process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncoderSet {
+    names: std::collections::BTreeSet<String>,
+}
+
+impl EncoderSet {
+    /// Parse the table printed by `ffmpeg -hide_banner -encoders`.
+    pub fn parse(text: &str) -> Self {
+        let mut names = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(_flags) = fields.next() else {
+                continue;
+            };
+            let Some(name) = fields.next() else {
+                continue;
+            };
+            if name.len() > 1
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            {
+                names.insert(name.to_string());
+            }
+        }
+        Self { names }
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The first accelerator this build supports on this platform.
+    pub fn hardware(&self) -> Option<HwAccel> {
+        // VAAPI is a Linux interface and VideoToolbox is Apple's; asking for
+        // them elsewhere only produces a failed transcode.
+        let candidates: &[HwAccel] = if cfg!(target_os = "linux") {
+            &[HwAccel::Nvenc, HwAccel::Qsv, HwAccel::Vaapi]
+        } else if cfg!(target_os = "macos") {
+            &[HwAccel::Videotoolbox]
+        } else {
+            &[HwAccel::Nvenc, HwAccel::Qsv]
+        };
+        candidates.iter().copied().find(|accel| {
+            accel
+                .encoder_for("h264")
+                .is_some_and(|encoder| self.has(encoder))
+        })
+    }
+}
+
+/// Resolve a configured preference against what the build can do.
+pub fn resolve_hwaccel(preference: HwAccel, encoders: &EncoderSet) -> HwAccel {
+    match preference {
+        HwAccel::None => HwAccel::None,
+        HwAccel::Auto => encoders.hardware().unwrap_or(HwAccel::None),
+        explicit => {
+            let usable = explicit
+                .encoder_for("h264")
+                .is_some_and(|encoder| encoders.has(encoder));
+            if usable {
+                explicit
+            } else {
+                HwAccel::None
+            }
+        }
+    }
+}
+
+/// Whether ffmpeg's failure looks like "this machine cannot do hardware
+/// encoding" rather than "this file is broken".
+///
+/// Only these failures are retried on the CPU: retrying a corrupt input would
+/// just fail twice and hide the real error.
+pub fn is_hardware_failure(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "no capable devices",
+        "cannot load",
+        "invalid device",
+        "device not found",
+        "failed to initialise",
+        "hardware accelerator failed",
+        "impossible to convert between the formats",
+    ];
+    let lower = stderr.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Typed transcode profile. Extensions never pass raw ffmpeg argv; they pick a
 /// named preset that the host knows how to execute.
 #[derive(Debug, Clone)]
@@ -136,6 +319,10 @@ pub struct MediaOps {
     probe_timeout: Duration,
     thumbnail_timeout: Duration,
     transcode_timeout: Duration,
+    /// Configured preference; resolved against [`MediaOps::encoders`].
+    hwaccel_preference: HwAccel,
+    /// `ffmpeg -encoders`, detected once (the call costs a spawn).
+    encoders: Arc<std::sync::OnceLock<EncoderSet>>,
 }
 
 impl MediaOps {
@@ -152,6 +339,43 @@ impl MediaOps {
             probe_timeout,
             thumbnail_timeout,
             transcode_timeout,
+            hwaccel_preference: HwAccel::Auto,
+            encoders: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Choose how hardware acceleration is picked (`auto` by default).
+    pub fn with_hwaccel(mut self, preference: HwAccel) -> Self {
+        self.hwaccel_preference = preference;
+        self
+    }
+
+    /// The encoders this ffmpeg build reports, detected on first use.
+    pub fn encoders(&self) -> &EncoderSet {
+        self.encoders.get_or_init(|| self.detect_encoders())
+    }
+
+    /// The accelerator to use right now: the configured one when it works,
+    /// otherwise the best available, otherwise the CPU.
+    pub fn hwaccel(&self) -> HwAccel {
+        resolve_hwaccel(self.hwaccel_preference, self.encoders())
+    }
+
+    fn detect_encoders(&self) -> EncoderSet {
+        if !command_available(&self.ffmpeg) {
+            return EncoderSet::default();
+        }
+        let mut command = binary_command(&self.ffmpeg);
+        command.args(["-hide_banner", "-encoders"]);
+        match run_capture(
+            &mut command,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+        ) {
+            Ok(output) if output.status_success => {
+                EncoderSet::parse(&String::from_utf8_lossy(&output.stdout))
+            }
+            Ok(_) | Err(_) => EncoderSet::default(),
         }
     }
 
@@ -425,16 +649,23 @@ impl MediaOps {
         input: &MediaInput,
         output: &Path,
         preset: &TranscodePreset,
-        duration_secs: Option<f64>,
-        cancel: &AtomicBool,
+        request: &TranscodeRequest<'_>,
         mut on_progress: impl FnMut(f64),
     ) -> Result<()> {
+        let request = *request;
+        let duration_secs = request.duration_secs;
+        let cancel = request.cancel;
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let mut command = binary_command(&self.ffmpeg);
-        command.args(transcode_args(input, output, preset));
+        command.args(build_transcode_args(
+            input,
+            output,
+            preset,
+            &request.options,
+        ));
 
         command
             .stdin(Stdio::null())
@@ -664,15 +895,22 @@ fn run_capture(
     })
 }
 
+/// VAAPI render node. The usual one on a Linux desktop or NAS with an iGPU.
+pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
 /// Build the ffmpeg arguments for a typed preset.
+///
+/// Pure on purpose: every hardware/CPU combination is covered by a snapshot test
+/// instead of by watching a real encode.
 ///
 /// `copy` means "remux this stream as-is": encoder-only flags (`-preset`,
 /// `-crf`, `-b:a`) are dropped, which turns a multi-minute re-encode of an
 /// H.264 file into a few seconds of container rewriting.
-pub(crate) fn transcode_args(
+pub fn build_transcode_args(
     input: &MediaInput,
     output: &Path,
     preset: &TranscodePreset,
+    options: &TranscodeOptions,
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
@@ -698,20 +936,58 @@ pub(crate) fn transcode_args(
             "-dn",
             "-map_chapters",
             "-1",
-            "-c:v",
         ]
         .iter()
         .map(|value| text(value)),
     );
-    args.push(text(&preset.video_codec));
-    if preset.video_codec != "copy" {
-        args.extend([
-            text("-preset"),
-            text(&preset.speed),
-            text("-crf"),
-            text(&preset.crf.to_string()),
-        ]);
+
+    let hardware = options
+        .hwaccel
+        .encoder_for(&preset.video_codec)
+        .filter(|_| preset.video_codec != "copy");
+    match hardware {
+        Some(encoder) => {
+            if options.hwaccel == HwAccel::Vaapi {
+                // Surfaces must be uploaded to the render node before the
+                // encoder sees them, so the device and the filter precede `-c:v`.
+                args.extend(
+                    [
+                        "-vaapi_device",
+                        DEFAULT_VAAPI_DEVICE,
+                        "-vf",
+                        "format=nv12,hwupload",
+                    ]
+                    .iter()
+                    .map(|value| text(value)),
+                );
+            }
+            args.push(text("-c:v"));
+            args.push(text(encoder));
+            // Hardware encoders have their own quality knobs; `-crf`/`-preset`
+            // belong to libx264 and would be rejected here.
+            let quality: &[&str] = match options.hwaccel {
+                HwAccel::Nvenc => &["-cq", "23", "-preset", "p5"],
+                HwAccel::Qsv => &["-global_quality", "23"],
+                HwAccel::Vaapi => &["-qp", "23"],
+                HwAccel::Videotoolbox => &["-q:v", "65"],
+                HwAccel::Auto | HwAccel::None => &[],
+            };
+            args.extend(quality.iter().map(|value| text(value)));
+        }
+        None => {
+            args.push(text("-c:v"));
+            args.push(text(&preset.video_codec));
+            if preset.video_codec != "copy" {
+                args.extend([
+                    text("-preset"),
+                    text(&preset.speed),
+                    text("-crf"),
+                    text(&preset.crf.to_string()),
+                ]);
+            }
+        }
     }
+
     args.push(text("-c:a"));
     args.push(text(&preset.audio_codec));
     if preset.audio_codec != "copy" {
@@ -966,18 +1242,28 @@ mod tests {
     }
 
     fn args_of(preset: &TranscodePreset) -> Vec<String> {
-        transcode_args(&MediaInput::path("in.mkv"), Path::new("out.mp4"), preset)
-            .into_iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect()
+        args_with(preset, HwAccel::None)
+    }
+
+    fn args_with(preset: &TranscodePreset, hwaccel: HwAccel) -> Vec<String> {
+        build_transcode_args(
+            &MediaInput::path("in.mkv"),
+            Path::new("out.mp4"),
+            preset,
+            &TranscodeOptions { hwaccel },
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
     }
 
     #[test]
     fn transcode_args_accept_a_url_input() {
-        let args: Vec<String> = transcode_args(
+        let args: Vec<String> = build_transcode_args(
             &MediaInput::url("http://127.0.0.1:3001/api/v1/media/7/stream"),
             Path::new("out.mp4"),
             &TranscodePreset::default(),
+            &TranscodeOptions::default(),
         )
         .into_iter()
         .map(|value| value.to_string_lossy().into_owned())
@@ -1008,6 +1294,159 @@ mod tests {
         assert!(args.contains(&"aac".to_string()));
         assert!(args.contains(&"-b:a".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    #[test]
+    fn hardware_encoders_replace_libx264_and_its_quality_flags() {
+        let preset = TranscodePreset::default();
+        let nvenc = args_with(&preset, HwAccel::Nvenc);
+        assert!(nvenc.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
+        assert!(nvenc.windows(2).any(|pair| pair == ["-cq", "23"]));
+        assert!(nvenc.windows(2).any(|pair| pair == ["-preset", "p5"]));
+        // `-crf`/`-preset veryfast` are libx264 flags; ffmpeg rejects them here.
+        assert!(!nvenc.contains(&"-crf".to_string()));
+        assert!(!nvenc.contains(&"veryfast".to_string()));
+        assert!(!nvenc.contains(&"libx264".to_string()));
+
+        let qsv = args_with(&preset, HwAccel::Qsv);
+        assert!(qsv.windows(2).any(|pair| pair == ["-c:v", "h264_qsv"]));
+        assert!(qsv.windows(2).any(|pair| pair == ["-global_quality", "23"]));
+
+        let apple = args_with(&preset, HwAccel::Videotoolbox);
+        assert!(apple
+            .windows(2)
+            .any(|pair| pair == ["-c:v", "h264_videotoolbox"]));
+        assert!(apple.windows(2).any(|pair| pair == ["-q:v", "65"]));
+
+        // Audio handling is unchanged on every path.
+        for args in [&nvenc, &qsv, &apple] {
+            assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+            assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+        }
+    }
+
+    #[test]
+    fn vaapi_uploads_to_the_render_node_before_the_encoder() {
+        let args = args_with(&TranscodePreset::default(), HwAccel::Vaapi);
+        let device = args
+            .iter()
+            .position(|arg| arg == "-vaapi_device")
+            .expect("vaapi needs a device");
+        assert_eq!(args[device + 1], DEFAULT_VAAPI_DEVICE);
+        let upload = args
+            .iter()
+            .position(|arg| arg == "-vf")
+            .expect("vaapi needs the upload filter");
+        assert_eq!(args[upload + 1], "format=nv12,hwupload");
+        let encoder = args
+            .iter()
+            .position(|arg| arg == "-c:v")
+            .expect("an encoder is required");
+        // The device and the filter must be configured before the encoder.
+        assert!(device < encoder);
+        assert!(upload < encoder);
+        assert_eq!(args[encoder + 1], "h264_vaapi");
+        assert!(args.windows(2).any(|pair| pair == ["-qp", "23"]));
+        assert!(!args.contains(&"-crf".to_string()));
+    }
+
+    #[test]
+    fn hevc_presets_pick_the_hevc_encoder() {
+        let preset = TranscodePreset {
+            name: "hevc".into(),
+            video_codec: "hevc".into(),
+            audio_codec: "aac".into(),
+            crf: 26,
+            speed: "veryfast".into(),
+            audio_bitrate: "160k".into(),
+        };
+        let args = args_with(&preset, HwAccel::Nvenc);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "hevc_nvenc"]));
+        // A codec no accelerator provides stays on the CPU.
+        let av1 = TranscodePreset {
+            video_codec: "libsvtav1".into(),
+            ..preset.clone()
+        };
+        let cpu = args_with(&av1, HwAccel::Nvenc);
+        assert!(cpu.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+        assert!(!cpu.contains(&"hevc_nvenc".to_string()));
+    }
+
+    #[test]
+    fn a_remux_ignores_hardware_entirely() {
+        let preset = TranscodePreset {
+            name: "remux".into(),
+            video_codec: "copy".into(),
+            audio_codec: "copy".into(),
+            crf: 23,
+            speed: "veryfast".into(),
+            audio_bitrate: "160k".into(),
+        };
+        let args = args_with(&preset, HwAccel::Nvenc);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(!args.contains(&"h264_nvenc".to_string()));
+        assert!(!args.contains(&"-vaapi_device".to_string()));
+    }
+
+    #[test]
+    fn the_encoder_table_is_parsed_from_ffmpeg_output() {
+        let table = "\
+Encoders:
+ V..... = Video
+ A..... = Audio
+ ------
+ V....D libx264              libx264 H.264 / AVC (codec h264)
+ V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)
+ V....D h264_vaapi           H.264/MPEG-4 AVC (VAAPI) (codec h264)
+ A....D aac                  AAC (Advanced Audio Coding)
+";
+        let set = EncoderSet::parse(table);
+        assert!(set.has("libx264"));
+        assert!(set.has("h264_nvenc"));
+        assert!(set.has("h264_vaapi"));
+        assert!(set.has("aac"));
+        // Header and legend lines must not become encoder names.
+        assert!(!set.has("Video"));
+        assert!(!set.has("Encoders:"));
+        assert!(!EncoderSet::parse("").has("libx264"));
+    }
+
+    #[test]
+    fn acceleration_resolution_prefers_what_the_machine_has() {
+        let nvenc = EncoderSet::parse(" V....D h264_nvenc NVIDIA\n");
+        assert_eq!(resolve_hwaccel(HwAccel::Nvenc, &nvenc), HwAccel::Nvenc);
+        // Asked for something this build does not have: CPU.
+        assert_eq!(resolve_hwaccel(HwAccel::Vaapi, &nvenc), HwAccel::None);
+        assert_eq!(resolve_hwaccel(HwAccel::None, &nvenc), HwAccel::None);
+        // Nothing detected at all: CPU.
+        assert_eq!(
+            resolve_hwaccel(HwAccel::Auto, &EncoderSet::default()),
+            HwAccel::None
+        );
+        // Auto picks the first usable accelerator on this platform.
+        let both = EncoderSet::parse(" V....D h264_nvenc NVIDIA\n V....D h264_qsv Intel\n");
+        let resolved = resolve_hwaccel(HwAccel::Auto, &both);
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert_eq!(resolved, HwAccel::Nvenc);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(resolved, HwAccel::None);
+        }
+    }
+
+    #[test]
+    fn only_hardware_failures_justify_a_cpu_retry() {
+        assert!(is_hardware_failure(
+            "Cannot load libnvidia-encode.so.1\n Impossible to convert between the formats"
+        ));
+        assert!(is_hardware_failure(
+            "[h264_nvenc @ 0x1] No capable devices found"
+        ));
+        assert!(is_hardware_failure("Invalid device: /dev/dri/renderD128"));
+        // A broken file must not be retried: it would fail twice and hide why.
+        assert!(!is_hardware_failure(
+            "Invalid data found when processing input"
+        ));
+        assert!(!is_hardware_failure(""));
     }
 
     #[test]

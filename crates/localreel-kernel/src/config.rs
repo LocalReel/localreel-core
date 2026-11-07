@@ -135,6 +135,9 @@ pub struct MediaConfig {
     pub max_concurrent_transcodes: usize,
     /// A playback session with no request for this long is reclaimed.
     pub idle_session_secs: u64,
+    /// Hardware acceleration preference: `auto` (default), `none`, `nvenc`,
+    /// `qsv`, `vaapi` or `videotoolbox`.
+    pub hwaccel: crate::media_ops::HwAccel,
 }
 
 impl Default for Config {
@@ -175,6 +178,7 @@ impl Default for Config {
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
                 max_concurrent_transcodes: 2,
                 idle_session_secs: 900,
+                hwaccel: crate::media_ops::HwAccel::Auto,
             },
             scan: ScanConfig { watch: true },
             plugins: Vec::new(),
@@ -329,6 +333,13 @@ impl Config {
         if let Some(value) = file.media.idle_session_secs {
             self.media.idle_session_secs = value;
         }
+        if let Some(value) = &file.media.hwaccel {
+            self.media.hwaccel = crate::media_ops::HwAccel::parse(value).ok_or_else(|| {
+                KernelError::Config(format!(
+                    "invalid hwaccel '{value}': expected auto, none, nvenc, qsv, vaapi or videotoolbox"
+                ))
+            })?;
+        }
         if let Some(value) = file.scan.watch {
             self.scan.watch = value;
         }
@@ -412,6 +423,13 @@ impl Config {
         }
         if let Some(value) = env_u64("LOCALREEL_IDLE_SESSION_SECS")? {
             self.media.idle_session_secs = value;
+        }
+        if let Some(value) = env_string("LOCALREEL_HWACCEL") {
+            self.media.hwaccel = crate::media_ops::HwAccel::parse(&value).ok_or_else(|| {
+                KernelError::Config(format!(
+                    "invalid LOCALREEL_HWACCEL '{value}': expected auto, none, nvenc, qsv, vaapi or videotoolbox"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -577,6 +595,7 @@ struct MediaFile {
     cache_max_age_hours: Option<u64>,
     max_concurrent_transcodes: Option<usize>,
     idle_session_secs: Option<u64>,
+    hwaccel: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -771,6 +790,27 @@ mod tests {
         let mut invalid = Config::default();
         invalid.media.max_concurrent_transcodes = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn hwaccel_defaults_to_auto_and_rejects_nonsense() {
+        use crate::media_ops::HwAccel;
+
+        assert_eq!(Config::default().media.hwaccel, HwAccel::Auto);
+
+        let parsed: ConfigFile = toml::from_str("[media]\nhwaccel = \"nvenc\"").unwrap();
+        let mut config = Config::default();
+        config.apply_file(parsed).unwrap();
+        assert_eq!(config.media.hwaccel, HwAccel::Nvenc);
+
+        // A typo must fail at load time instead of silently encoding on the CPU.
+        let parsed: ConfigFile = toml::from_str("[media]\nhwaccel = \"nvdec\"").unwrap();
+        let mut broken = Config::default();
+        assert!(broken.apply_file(parsed).is_err());
+
+        assert_eq!(HwAccel::parse("QSV"), Some(HwAccel::Qsv));
+        assert_eq!(HwAccel::parse("off"), Some(HwAccel::None));
+        assert!(HwAccel::parse("nvdec").is_none());
     }
 
     #[test]
