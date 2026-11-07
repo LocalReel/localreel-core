@@ -166,11 +166,16 @@ impl MediaOps {
         command.arg(input.as_os());
         let output = run_capture(&mut command, self.probe_timeout, cancel)?;
         if !output.status_success {
-            return Err(KernelError::Media(format!(
-                "ffprobe failed for {}: {}",
-                input.display(),
-                tail_text(&output.stderr, 4096)
-            )));
+            // The input path and ffprobe's stderr are diagnostics: the response
+            // body gets the summary, the administrator gets the rest.
+            return Err(KernelError::media_detail(
+                "ffprobe could not read this file",
+                format!(
+                    "input={}; stderr: {}",
+                    input.display(),
+                    tail_text(&output.stderr, 4096)
+                ),
+            ));
         }
         parse_probe_json(&output.stdout)
     }
@@ -199,11 +204,14 @@ impl MediaOps {
         let result = run_capture(&mut command, self.thumbnail_timeout, cancel);
         match result {
             Ok(output) if output.status_success => Ok(()),
-            Ok(output) => Err(KernelError::Media(format!(
-                "ffmpeg thumbnail failed for {}: {}",
-                input.display(),
-                tail_text(&output.stderr, 4096)
-            ))),
+            Ok(output) => Err(KernelError::media_detail(
+                "ffmpeg could not generate a thumbnail",
+                format!(
+                    "input={}; stderr: {}",
+                    input.display(),
+                    tail_text(&output.stderr, 4096)
+                ),
+            )),
             Err(error) => {
                 let _ = std::fs::remove_file(output);
                 Err(error)
@@ -347,11 +355,14 @@ impl MediaOps {
             }
             Ok(false) => {
                 let _ = std::fs::remove_dir_all(output_dir);
-                Err(KernelError::Media(format!(
-                    "ffmpeg hls packaging failed for {}: {}",
-                    input.display(),
-                    tail_text(&stderr, 4096)
-                )))
+                Err(KernelError::media_detail(
+                    "ffmpeg could not package this file for HLS",
+                    format!(
+                        "input={}; stderr: {}",
+                        input.display(),
+                        tail_text(&stderr, 4096)
+                    ),
+                ))
             }
             Err(error) => {
                 let _ = std::fs::remove_dir_all(output_dir);
@@ -471,10 +482,15 @@ impl MediaOps {
             }
             Ok(false) => {
                 let _ = std::fs::remove_file(output);
-                Err(KernelError::Media(format!(
-                    "ffmpeg transcode failed: {}",
-                    tail_text(&stderr, 8192)
-                )))
+                Err(KernelError::media_detail(
+                    "ffmpeg could not transcode this file",
+                    format!(
+                        "input={}; output={}; stderr: {}",
+                        input.display(),
+                        output.display(),
+                        tail_text(&stderr, 8192)
+                    ),
+                ))
             }
             Err(error) => {
                 let _ = std::fs::remove_file(output);

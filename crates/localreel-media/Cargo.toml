@@ -18,7 +18,9 @@ tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 regex.workspace = true
+tokio.workspace = true
+# Filesystem notifications for automatic rescanning of local sources.
+notify = "6"
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true

@@ -18,6 +18,8 @@ pub struct AppState {
     pub media: MediaService,
     pub accounts: AccountService,
     pub login_limiter: LoginLimiter,
+    /// Filesystem subscriptions for the enabled local sources.
+    pub watchers: std::sync::Arc<localreel_media::WatcherManager>,
     pub ffmpeg_available: bool,
     pub started_at: i64,
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
@@ -35,6 +37,11 @@ impl AppState {
         accounts: AccountService,
         ffmpeg_available: bool,
     ) -> Arc<Self> {
+        let watchers = std::sync::Arc::new(localreel_media::WatcherManager::new(
+            media.clone(),
+            jobs.clone(),
+            config.scan.watch,
+        ));
         Arc::new(Self {
             config,
             db,
@@ -43,9 +50,21 @@ impl AppState {
             media,
             accounts,
             login_limiter: LoginLimiter::new(),
+            watchers,
             ffmpeg_available,
             started_at: now_secs(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// Reconcile the filesystem watchers with the `sources` table.
+    ///
+    /// Every mutation that can change the set of watchable directories calls
+    /// this. Failures are logged, never propagated: a library that cannot be
+    /// watched still scans on demand.
+    pub fn refresh_watchers(&self) {
+        if let Err(error) = self.watchers.refresh() {
+            tracing::warn!("failed to refresh source watchers: {error}");
+        }
     }
 }

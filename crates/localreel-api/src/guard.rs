@@ -10,6 +10,36 @@ use axum::{
 
 use crate::state::AppState;
 
+use localreel_media::{CurrentUser, Role};
+
+/// Decide, for one request, whether error bodies may carry diagnostics.
+///
+/// A diagnostic is a local path or an encoder's stderr: useful while
+/// troubleshooting, never appropriate for a viewer. It is therefore revealed
+/// only to an administrator, and only from loopback or when `RUST_LOG` asks for
+/// debug output. Everyone else gets the stable code and message.
+///
+/// Runs *inside* [`crate::auth::authenticate`] so the session is already on the
+/// request extensions.
+pub async fn detail_scope(request: Request, next: Next) -> Response {
+    let admin = request
+        .extensions()
+        .get::<CurrentUser>()
+        .is_some_and(|current| current.user.role == Role::Admin);
+    let loopback = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_loopback_authority);
+    let reveal = should_reveal_detail(admin, loopback, crate::error::debug_logging_enabled());
+    crate::error::with_reveal_detail(reveal, next.run(request)).await
+}
+
+/// Diagnostics are for administrators, from loopback or while debugging.
+fn should_reveal_detail(admin: bool, loopback: bool, debug: bool) -> bool {
+    admin && (loopback || debug)
+}
+
 /// Default local-only guard.
 ///
 /// Rejects requests whose `Host` is not loopback, and (when present) whose
@@ -125,5 +155,18 @@ mod tests {
         assert!(is_loopback_origin("http://localhost:5173"));
         assert!(!is_loopback_origin("https://example.com"));
         assert!(!is_loopback_origin("null"));
+    }
+
+    #[test]
+    fn diagnostics_are_only_revealed_to_a_local_or_debugging_administrator() {
+        // The ordinary viewer never sees an internal path, whatever the mode.
+        assert!(!should_reveal_detail(false, true, false));
+        assert!(!should_reveal_detail(false, false, true));
+        // An administrator on this machine, or one troubleshooting.
+        assert!(should_reveal_detail(true, true, false));
+        assert!(should_reveal_detail(true, true, true));
+        // An administrator over the network only while debug logging is on.
+        assert!(should_reveal_detail(true, false, true));
+        assert!(!should_reveal_detail(true, false, false));
     }
 }

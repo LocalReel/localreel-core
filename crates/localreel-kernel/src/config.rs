@@ -76,8 +76,21 @@ pub struct Config {
     pub allow_remote: bool,
     pub jobs: JobsConfig,
     pub media: MediaConfig,
+    pub scan: ScanConfig,
     /// Sidecar plugins to start with the server (packages on disk).
     pub plugins: Vec<PluginConfig>,
+}
+
+/// How sources are rescanned.
+///
+/// Watching is on by default: a library that only updates when someone presses
+/// "scan" is not a media server. It degrades quietly — an unwatchable source
+/// (a WebDAV plugin, an SMB mount, a kernel without inotify slots left) is
+/// skipped and reported, never fatal.
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    /// Watch enabled local sources and rescan them when files appear.
+    pub watch: bool,
 }
 
 /// One configured sidecar plugin.
@@ -153,6 +166,7 @@ impl Default for Config {
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
             },
+            scan: ScanConfig { watch: true },
             plugins: Vec::new(),
         }
     }
@@ -299,6 +313,9 @@ impl Config {
         if let Some(value) = file.media.cache_max_age_hours {
             self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
         }
+        if let Some(value) = file.scan.watch {
+            self.scan.watch = value;
+        }
         if !file.plugins.is_empty() {
             self.plugins = file
                 .plugins
@@ -368,6 +385,9 @@ impl Config {
         }
         if let Some(value) = env_u64("LOCALREEL_TRANSCODE_CACHE_MAX_AGE_HOURS")? {
             self.media.cache_max_age = Duration::from_secs(value.saturating_mul(60 * 60));
+        }
+        if let Some(value) = env_bool("LOCALREEL_WATCH")? {
+            self.scan.watch = value;
         }
         Ok(())
     }
@@ -468,6 +488,8 @@ struct ConfigFile {
     #[serde(default)]
     media: MediaFile,
     #[serde(default)]
+    scan: ScanFile,
+    #[serde(default)]
     plugins: Vec<PluginFile>,
 }
 
@@ -519,6 +541,11 @@ struct MediaFile {
     hls_dir: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
     cache_max_age_hours: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScanFile {
+    watch: Option<bool>,
 }
 
 /// Platform log directory, independent of the configuration file.

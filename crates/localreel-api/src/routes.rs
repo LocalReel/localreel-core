@@ -30,7 +30,7 @@ use localreel_media::{
 
 use crate::auth;
 use crate::error::ApiError;
-use crate::guard::{loopback_guard, security_headers};
+use crate::guard::{detail_scope, loopback_guard, security_headers};
 use crate::state::AppState;
 
 const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
@@ -99,14 +99,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
-    let api =
-        public_api
-            .merge(user_api)
-            .merge(admin_api)
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                auth::authenticate,
-            ));
+    let api = public_api
+        .merge(user_api)
+        .merge(admin_api)
+        .layer(axum::middleware::from_fn(detail_scope))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ));
 
     let mut router = Router::new().merge(api);
 
@@ -293,6 +293,7 @@ async fn admin_health(
         "data_dir": state.config.data_dir,
         "thumbnail_dir": state.config.media.thumbnail_dir,
         "transcode_dir": state.config.media.transcode_dir,
+        "watchers": state.watchers.status(),
         "jobs": recent_jobs,
     })))
 }
@@ -500,6 +501,9 @@ async fn add_source(
         Some(kind) => state.media.add_source_with_kind(&payload.uri, kind)?,
         None => state.media.add_source(&payload.uri)?,
     };
+    // A new local folder starts being watched immediately; a plugin kind is
+    // reported as skipped rather than retried.
+    state.refresh_watchers();
     Ok((StatusCode::CREATED, Json(source)).into_response())
 }
 
@@ -521,6 +525,7 @@ async fn patch_source(
     } else {
         return Err(ApiError::bad_request("provide enabled or archived"));
     };
+    state.refresh_watchers();
     Ok(Json(source))
 }
 
@@ -535,13 +540,17 @@ async fn delete_source(
     Path(id): Path<i64>,
     Query(query): Query<DeleteSourceQuery>,
 ) -> Result<Json<DeleteSourceReport>, ApiError> {
-    Ok(Json(state.media.delete_source(
+    let report = state.media.delete_source(
         id,
         query.delete_media.unwrap_or(false),
         query.dry_run.unwrap_or(false),
         &state.config.media.thumbnail_dir,
         &state.config.media.transcode_dir,
-    )?))
+    )?;
+    if !report.dry_run {
+        state.refresh_watchers();
+    }
+    Ok(Json(report))
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,11 +565,14 @@ async fn remap_source(
     Path(id): Path<i64>,
     Json(payload): Json<RemapSourceRequest>,
 ) -> Result<Json<RemapReport>, ApiError> {
-    Ok(Json(state.media.remap_source(
-        id,
-        &payload.uri,
-        payload.dry_run,
-    )?))
+    let report = state
+        .media
+        .remap_source(id, &payload.uri, payload.dry_run)?;
+    if !report.dry_run {
+        // A remap moves the root; the watcher has to follow it.
+        state.refresh_watchers();
+    }
+    Ok(Json(report))
 }
 
 async fn scan_source(
@@ -1336,6 +1348,53 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("\"status\":\"ok\""));
         assert!(text.contains("\"database\":true"));
+    }
+
+    /// The admin health endpoint drives the "watching / not watching" badge.
+    #[tokio::test]
+    async fn admin_health_reports_the_watchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/admin/health", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["watchers"]["enabled"], true);
+        assert_eq!(health["watchers"]["active"], 0);
+        assert_eq!(health["watchers"]["skipped"], serde_json::json!([]));
+
+        // Adding a local source subscribes to it immediately.
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/sources",
+                &session,
+                &csrf,
+                serde_json::json!({ "uri": library.path() }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(request_as("/api/v1/admin/health", &session))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["watchers"]["active"], 1);
     }
 
     #[tokio::test]

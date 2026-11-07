@@ -17,6 +17,7 @@ pub mod series;
 pub mod service;
 pub mod state_migration;
 pub mod storage;
+pub mod watch;
 
 pub use account::{AccountService, CurrentUser, Role, Session, User, UserPatch};
 pub use backup::{
@@ -37,3 +38,4 @@ pub use state_migration::{
     episode_key, migrate_legacy_state, StateMigrationDetail, StateMigrationReport,
 };
 pub use storage::StorageRegistry;
+pub use watch::{WatcherManager, WatcherStatus};

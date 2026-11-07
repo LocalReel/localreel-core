@@ -737,6 +737,26 @@ async fn serve(
     );
     let app = localreel_api::router(state.clone());
 
+    // Subscribe to every enabled local source before the first request can
+    // change one. Unwatchable sources are logged and reported, never fatal.
+    state.refresh_watchers();
+    let watcher_status = state.watchers.status();
+    if watcher_status.enabled {
+        info!(
+            active = watcher_status.active,
+            skipped = watcher_status.skipped.len(),
+            "watching local sources for changes"
+        );
+        if !watcher_status.skipped.is_empty() {
+            warn!(
+                skipped = ?watcher_status.skipped,
+                "some sources cannot be watched and will only rescan on demand"
+            );
+        }
+    } else {
+        info!("filesystem watching is disabled (LOCALREEL_WATCH=0)");
+    }
+
     info!("LocalReel listening on {url}");
     events.publish(Event::ServerStarted {
         version: localreel_kernel::VERSION.to_string(),
