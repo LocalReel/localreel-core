@@ -51,6 +51,26 @@ impl FfmpegCapability {
     }
 }
 
+/// One stream reported by `ffprobe`.
+///
+/// Everything the track menu needs: which audio streams exist, what language the
+/// container says they are, and whether one is marked default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProbeStream {
+    /// ffmpeg stream index, the value `-map 0:<index>` expects.
+    pub index: i64,
+    /// `video`, `audio`, `subtitle`, `data`, ...
+    pub codec_type: String,
+    pub codec_name: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub channels: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
 /// Metadata extracted from `ffprobe`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeResult {
@@ -60,6 +80,8 @@ pub struct ProbeResult {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub bitrate: Option<i64>,
+    /// Every stream, in container order.
+    pub streams: Vec<ProbeStream>,
 }
 
 /// Input to one ffprobe/ffmpeg invocation.
@@ -175,6 +197,11 @@ impl HwAccel {
 pub struct TranscodeOptions {
     /// The accelerator to use. `Auto` must be resolved before it gets here.
     pub hwaccel: HwAccel,
+    /// ffmpeg stream index of the audio track to keep.
+    ///
+    /// `None` means "the first audio track" — the behaviour every earlier
+    /// release had, which keeps the existing variant names valid.
+    pub audio_stream: Option<usize>,
 }
 
 /// Everything one transcode needs besides the input, output and preset.
@@ -184,6 +211,16 @@ pub struct TranscodeRequest<'a> {
     /// Source length, used to turn ffmpeg's progress into a 0..1 ratio.
     pub duration_secs: Option<f64>,
     /// Polled while ffmpeg runs; set it to stop the encode.
+    pub cancel: &'a AtomicBool,
+}
+
+/// Everything one HLS packaging run needs.
+#[derive(Debug, Clone, Copy)]
+pub struct HlsRequest<'a> {
+    pub segment_secs: u32,
+    pub duration_secs: Option<f64>,
+    /// ffmpeg stream index of the audio to keep; `None` keeps the first track.
+    pub audio_stream: Option<usize>,
     pub cancel: &'a AtomicBool,
 }
 
@@ -497,47 +534,16 @@ impl MediaOps {
         &self,
         input: &MediaInput,
         output_dir: &Path,
-        segment_secs: u32,
-        duration_secs: Option<f64>,
-        cancel: &AtomicBool,
+        request: &HlsRequest<'_>,
         mut on_progress: impl FnMut(f64),
     ) -> Result<()> {
+        let request = *request;
+        let duration_secs = request.duration_secs;
+        let cancel = request.cancel;
         std::fs::create_dir_all(output_dir)?;
         let mut command = binary_command(&self.ffmpeg);
+        command.args(build_hls_args(input, output_dir, &request));
         command
-            .args(["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"])
-            .arg(input.as_os())
-            .args([
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-f",
-                "hls",
-                "-hls_time",
-            ])
-            .arg(segment_secs.to_string())
-            .args([
-                "-hls_playlist_type",
-                "vod",
-                "-hls_flags",
-                "independent_segments",
-                "-hls_segment_filename",
-            ])
-            .arg(output_dir.join("seg_%05d.ts"))
-            .arg(output_dir.join("index.m3u8"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -798,6 +804,9 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<ProbeResult> {
             .iter()
             .find(|stream| stream["codec_type"] == "audio")
     });
+    let details: Vec<ProbeStream> = streams
+        .map(|streams| streams.iter().filter_map(parse_stream).collect())
+        .unwrap_or_default();
 
     Ok(ProbeResult {
         duration,
@@ -811,6 +820,25 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<ProbeResult> {
             None => Some("none".to_string()),
         },
         bitrate,
+        streams: details,
+    })
+}
+
+/// Parse one element of `streams[]`. A stream without an index cannot be mapped
+/// later, so it is dropped rather than stored half-known.
+fn parse_stream(value: &serde_json::Value) -> Option<ProbeStream> {
+    let index = value["index"].as_i64()?;
+    Some(ProbeStream {
+        index,
+        codec_type: value["codec_type"].as_str().unwrap_or_default().to_string(),
+        codec_name: value["codec_name"].as_str().map(str::to_string),
+        language: value["tags"]["language"].as_str().map(str::to_string),
+        title: value["tags"]["title"].as_str().map(str::to_string),
+        channels: value["channels"].as_i64().map(|value| value as i32),
+        width: value["width"].as_i64().map(|value| value as i32),
+        height: value["height"].as_i64().map(|value| value as i32),
+        is_default: value["disposition"]["default"].as_i64() == Some(1),
+        is_forced: value["disposition"]["forced"].as_i64() == Some(1),
     })
 }
 
@@ -898,6 +926,77 @@ fn run_capture(
 /// VAAPI render node. The usual one on a Linux desktop or NAS with an iGPU.
 pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 
+/// The `-map` value for an audio track.
+///
+/// `?` keeps a video-only file working: without it ffmpeg fails when the source
+/// has no audio at all, which is a legitimate library item.
+fn audio_map(stream: Option<usize>) -> String {
+    match stream {
+        Some(index) => format!("0:{index}?"),
+        None => "0:a:0?".to_string(),
+    }
+}
+
+/// Build the ffmpeg arguments for an HLS package.
+///
+/// Pure, like [`build_transcode_args`], so the audio mapping is testable without
+/// running ffmpeg.
+pub fn build_hls_args(
+    input: &MediaInput,
+    output_dir: &Path,
+    request: &HlsRequest<'_>,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    fn text(value: &str) -> OsString {
+        OsString::from(value)
+    }
+
+    let mut args: Vec<OsString> = ["-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"]
+        .iter()
+        .map(|value| text(value))
+        .collect();
+    args.push(input.as_os());
+    args.extend(["-map", "0:v:0", "-map"].iter().map(|value| text(value)));
+    args.push(text(&audio_map(request.audio_stream)));
+    args.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-f",
+            "hls",
+            "-hls_time",
+        ]
+        .iter()
+        .map(|value| text(value)),
+    );
+    args.push(text(&request.segment_secs.to_string()));
+    args.extend(
+        [
+            "-hls_playlist_type",
+            "vod",
+            "-hls_flags",
+            "independent_segments",
+            "-hls_segment_filename",
+        ]
+        .iter()
+        .map(|value| text(value)),
+    );
+    args.push(output_dir.join("seg_%05d.ts").into_os_string());
+    args.push(output_dir.join("index.m3u8").into_os_string());
+    args
+}
+
 /// Build the ffmpeg arguments for a typed preset.
 ///
 /// Pure on purpose: every hardware/CPU combination is covered by a snapshot test
@@ -926,19 +1025,12 @@ pub fn build_transcode_args(
     // Keep the web output clean: video + one audio track. Subtitles, data
     // streams and chapters are dropped — the mp4 muxer otherwise writes
     // chapters as an extra `text` track that no browser player needs.
+    args.extend(["-map", "0:v:0", "-map"].iter().map(|value| text(value)));
+    args.push(text(&audio_map(options.audio_stream)));
     args.extend(
-        [
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-sn",
-            "-dn",
-            "-map_chapters",
-            "-1",
-        ]
-        .iter()
-        .map(|value| text(value)),
+        ["-sn", "-dn", "-map_chapters", "-1"]
+            .iter()
+            .map(|value| text(value)),
     );
 
     let hardware = options
@@ -1246,11 +1338,22 @@ mod tests {
     }
 
     fn args_with(preset: &TranscodePreset, hwaccel: HwAccel) -> Vec<String> {
+        args_with_audio(preset, hwaccel, None)
+    }
+
+    fn args_with_audio(
+        preset: &TranscodePreset,
+        hwaccel: HwAccel,
+        audio_stream: Option<usize>,
+    ) -> Vec<String> {
         build_transcode_args(
             &MediaInput::path("in.mkv"),
             Path::new("out.mp4"),
             preset,
-            &TranscodeOptions { hwaccel },
+            &TranscodeOptions {
+                hwaccel,
+                audio_stream,
+            },
         )
         .into_iter()
         .map(|value| value.to_string_lossy().into_owned())
@@ -1450,6 +1553,86 @@ Encoders:
     }
 
     #[test]
+    fn a_selected_audio_track_maps_its_stream_index() {
+        let preset = TranscodePreset::default();
+        let default = args_with(&preset, HwAccel::None);
+        assert!(default.windows(2).any(|pair| pair == ["-map", "0:a:0?"]));
+
+        let chosen = args_with_audio(&preset, HwAccel::None, Some(3));
+        assert!(chosen.windows(2).any(|pair| pair == ["-map", "0:3?"]));
+        assert!(!chosen.contains(&"0:a:0?".to_string()));
+        // Exactly one audio map: two would mux both tracks into the output.
+        assert_eq!(chosen.iter().filter(|arg| arg.starts_with("0:")).count(), 2);
+    }
+
+    #[test]
+    fn hls_packaging_can_pick_an_audio_track_too() {
+        let dir = Path::new("hls-out");
+        let request = HlsRequest {
+            segment_secs: 4,
+            duration_secs: None,
+            audio_stream: Some(1),
+            cancel: &AtomicBool::new(false),
+        };
+        let args: Vec<String> = build_hls_args(&MediaInput::path("in.mkv"), dir, &request)
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:1?"]));
+        assert!(args.contains(&"4".to_string()));
+        assert!(args.iter().any(|arg| arg.ends_with("index.m3u8")));
+    }
+
+    #[test]
+    fn probe_json_reports_every_stream() {
+        let json = br#"{
+            "format": {"duration": "60.0"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080, "disposition": {"default": 1}},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2,
+                 "tags": {"language": "jpn", "title": "Japanese"},
+                 "disposition": {"default": 1}},
+                {"index": 2, "codec_type": "audio", "codec_name": "ac3", "channels": 6,
+                 "tags": {"language": "eng"}, "disposition": {"default": 0, "forced": 0}}
+            ]
+        }"#;
+        let probe = parse_probe_json(json).unwrap();
+        assert_eq!(probe.streams.len(), 3);
+
+        let video = &probe.streams[0];
+        assert_eq!(video.codec_type, "video");
+        assert_eq!(video.width, Some(1920));
+        assert!(video.is_default);
+
+        let japanese = &probe.streams[1];
+        assert_eq!(japanese.index, 1);
+        assert_eq!(japanese.codec_name.as_deref(), Some("aac"));
+        assert_eq!(japanese.language.as_deref(), Some("jpn"));
+        assert_eq!(japanese.title.as_deref(), Some("Japanese"));
+        assert_eq!(japanese.channels, Some(2));
+        assert!(japanese.is_default);
+
+        let english = &probe.streams[2];
+        assert_eq!(english.index, 2);
+        assert_eq!(english.language.as_deref(), Some("eng"));
+        assert!(!english.is_default);
+        assert!(!english.is_forced);
+
+        // The legacy summary fields are still derived from the same payload.
+        assert_eq!(probe.width, Some(1920));
+        assert_eq!(probe.video_codec.as_deref(), Some("h264"));
+        assert_eq!(probe.audio_codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn a_stream_without_an_index_is_dropped() {
+        let json = br#"{"streams": [{"codec_type": "audio", "codec_name": "aac"}]}"#;
+        let probe = parse_probe_json(json).unwrap();
+        assert!(probe.streams.is_empty(), "an unmappable stream is useless");
+    }
+
+    #[test]
     fn transcode_args_drop_encoder_flags_for_copy() {
         let preset = TranscodePreset {
             name: "remux".into(),
@@ -1516,9 +1699,12 @@ Encoders:
         ops.package_hls(
             &MediaInput::path(&input),
             &output,
-            1,
-            Some(2.0),
-            &AtomicBool::new(false),
+            &HlsRequest {
+                segment_secs: 1,
+                duration_secs: Some(2.0),
+                audio_stream: None,
+                cancel: &AtomicBool::new(false),
+            },
             |_| {},
         )
         .unwrap();

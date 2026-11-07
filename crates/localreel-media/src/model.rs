@@ -19,6 +19,33 @@ impl MediaFilter {
     }
 }
 
+/// One playable track of a media item.
+///
+/// Today only audio tracks are produced; `kind` is the discriminator subtitles
+/// will use, so the player can already be written against a stable shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub id: i64,
+    pub media_id: i64,
+    /// `audio` (subtitle is reserved).
+    pub kind: String,
+    /// `embedded` (in the container) or `sidecar` (a file next to it).
+    pub source: String,
+    /// ffmpeg stream index; `None` for sidecar tracks.
+    pub stream_index: Option<i64>,
+    /// Sidecar path; `None` for embedded tracks.
+    pub path: Option<String>,
+    /// Codec name: `aac`, `ac3`, `eac3`, `flac`, ...
+    pub format: Option<String>,
+    /// Normalized language tag (`zh`, `en`, `ja`), when the container names one.
+    pub language: Option<String>,
+    /// Container title, when it has one.
+    pub title: Option<String>,
+    pub channels: Option<i64>,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
 /// A configured media source (a local directory or an HLS endpoint).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {

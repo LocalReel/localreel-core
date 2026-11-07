@@ -57,6 +57,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/feed", get(feed))
         .route("/api/v1/search", get(search_media))
         .route("/api/v1/media/:id", get(get_media))
+        .route("/api/v1/media/:id/tracks", get(list_tracks))
         .route("/api/v1/media/:id/state", get(get_state).put(put_state))
         .route("/api/v1/media/:id/playback", post(prepare_playback))
         .route(
@@ -699,6 +700,21 @@ async fn get_media(
         .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))
 }
 
+/// Tracks of one media item.
+///
+/// A missing media is a 404 rather than an empty list: "this file has no other
+/// audio" and "this id does not exist" are different answers.
+async fn list_tracks(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<localreel_media::Track>>, ApiError> {
+    state
+        .media
+        .get_media(id)?
+        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    Ok(Json(state.media.list_tracks(id)?))
+}
+
 async fn get_state(
     State(state): State<Arc<AppState>>,
     Extension(current): Extension<CurrentUser>,
@@ -776,6 +792,9 @@ async fn cancel_job(
 #[derive(Debug, Deserialize)]
 struct PlaybackQuery {
     format: Option<String>,
+    /// Requested audio track id. Choosing anything but the default track forces
+    /// a remux/transcode, because a browser cannot switch embedded tracks.
+    audio: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -818,7 +837,28 @@ async fn prepare_playback(
         return prepare_hls_playback(state, &media);
     }
 
-    if is_hls(&media) {
+    // Resolve the requested audio track before deciding how to play: choosing a
+    // non-default track rules out direct play, because the <video> element
+    // cannot switch embedded tracks.
+    let audio_track = match query.audio {
+        Some(track_id) => {
+            let track = state.media.get_track(media.id, track_id)?.ok_or_else(|| {
+                ApiError::not_found(format!("track {track_id} of media {id} not found"))
+            })?;
+            if track.kind != "audio" {
+                return Err(ApiError::bad_request("only audio tracks can be selected"));
+            }
+            Some(track)
+        }
+        None => None,
+    };
+    let switching_audio = audio_track.as_ref().is_some_and(|track| !track.is_default);
+    let audio_stream = audio_track
+        .as_ref()
+        .and_then(|track| track.stream_index)
+        .and_then(|index| usize::try_from(index).ok());
+
+    if is_hls(&media) && !switching_audio {
         return Ok(Json(PlaybackResponse {
             mode: "direct",
             url: Some(media.uri),
@@ -828,7 +868,7 @@ async fn prepare_playback(
         .into_response());
     }
 
-    if direct_play_supported(&media) {
+    if direct_play_supported(&media) && !switching_audio {
         return Ok(Json(PlaybackResponse {
             mode: "direct",
             url: Some(format!("/api/v1/media/{}/stream", media.id)),
@@ -839,14 +879,15 @@ async fn prepare_playback(
     }
 
     let preset_name = preferred_preset(&media);
+    let variant_key = localreel_media::transcode_variant_key(preset_name, audio_stream);
 
     if let Some(variant) = state
         .media
-        .find_variant(media.id, "transcode", preset_name)?
+        .find_variant(media.id, "transcode", &variant_key)?
     {
         let path = state.config.media.transcode_dir.join(&variant.path);
         if path.is_file() {
-            if let Err(error) = state.media.touch_variant(media.id, preset_name) {
+            if let Err(error) = state.media.touch_variant(media.id, &variant_key) {
                 tracing::warn!(
                     media_id = media.id,
                     "failed to touch transcode variant: {error}"
@@ -865,6 +906,7 @@ async fn prepare_playback(
     let payload = serde_json::json!({
         "media_id": media.id,
         "preset": preset_name,
+        "audio_stream": audio_stream,
     })
     .to_string();
     // Starting an encode on a machine that is out of memory only makes it
@@ -879,7 +921,7 @@ async fn prepare_playback(
     let job_id = state.jobs.enqueue(
         "transcode",
         &payload,
-        Some(&format!("transcode:{}:{preset_name}", media.id)),
+        Some(&format!("transcode:{}:{variant_key}", media.id)),
         2,
     )?;
     state.transcodes.attach_job(media.id, "transcode", &job_id);
@@ -1408,6 +1450,173 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("\"status\":\"ok\""));
         assert!(text.contains("\"database\":true"));
+    }
+
+    /// A direct-playable media row with a default and a second audio track.
+    ///
+    /// Raw SQL because the media service has no "insert media" entry point (the
+    /// scanner owns that), and this test is about the HTTP contract.
+    fn seed_playable(state: &AppState, dir: &std::path::Path) -> (i64, i64, i64) {
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = state.media.add_source(library.to_str().unwrap()).unwrap();
+        let now = localreel_kernel::time::now_secs();
+        let uri = library.join("movie.mp4").to_string_lossy().to_string();
+        state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media (uid, source_id, uri, canonical_path, filename,
+                         video_codec, audio_codec, file_size, modified_at, created_at, updated_at)
+                     VALUES ('playable', ?1, ?2, ?2, 'movie.mp4', 'h264', 'aac', 0, 0, ?3, ?3)",
+                    (source.id, uri, now),
+                )?;
+                let media_id = connection.last_insert_rowid();
+                let track = |index: i64, language: &str, is_default: i64| {
+                    connection.execute(
+                        "INSERT INTO media_tracks (media_id, kind, source, stream_index,
+                             format, language, is_default, is_forced, created_at)
+                         VALUES (?1, 'audio', 'embedded', ?2, 'aac', ?3, ?4, 0, ?5)",
+                        (media_id, index, language, is_default, now),
+                    )?;
+                    Ok::<i64, localreel_kernel::error::KernelError>(connection.last_insert_rowid())
+                };
+                let first = track(1, "ja", 1)?;
+                let second = track(2, "en", 0)?;
+                Ok((media_id, first, second))
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tracks_list_the_audio_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let (media_id, _, _) = seed_playable(&state, dir.path());
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as(
+                &format!("/api/v1/media/{media_id}/tracks"),
+                &session,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tracks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tracks.as_array().unwrap().len(), 2);
+        assert_eq!(tracks[0]["language"], "ja");
+        assert_eq!(tracks[0]["is_default"], true);
+        assert_eq!(tracks[0]["kind"], "audio");
+        assert_eq!(tracks[1]["stream_index"], 2);
+        assert_eq!(tracks[1]["is_default"], false);
+    }
+
+    #[tokio::test]
+    async fn tracks_need_a_session_and_an_existing_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        // No session: the tracker is behind the ordinary sign-in wall.
+        let response = app
+            .clone()
+            .oneshot(request("/api/v1/media/1/tracks"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request_as("/api/v1/media/999/tracks", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn choosing_the_default_track_keeps_direct_play() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let (media_id, default_track, _other) = seed_playable(&state, dir.path());
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                &format!("/api/v1/media/{media_id}/playback?audio={default_track}"),
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let playback: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback["mode"], "direct");
+    }
+
+    #[tokio::test]
+    async fn choosing_another_track_forces_a_transcode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let (media_id, _default_track, other) = seed_playable(&state, dir.path());
+        let jobs = state.jobs.clone();
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                &format!("/api/v1/media/{media_id}/playback?audio={other}"),
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        // A browser cannot switch embedded audio tracks, so the answer is a job.
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let playback: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback["mode"], "preparing");
+
+        let jobs = jobs.list_recent(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, "transcode");
+        let payload: serde_json::Value = serde_json::from_str(&jobs[0].payload).unwrap();
+        assert_eq!(payload["audio_stream"], 2);
+        // The audio choice is part of the cache key, so languages do not collide.
+        assert!(jobs[0]
+            .dedupe_key
+            .as_deref()
+            .is_some_and(|key| key.ends_with("_a2")));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_track_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let (media_id, _, _) = seed_playable(&state, dir.path());
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                &format!("/api/v1/media/{media_id}/playback?audio=999"),
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.

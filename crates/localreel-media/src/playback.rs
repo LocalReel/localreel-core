@@ -15,6 +15,19 @@ pub const REMUX_PRESET: &str = "remux_h264";
 /// DTS, FLAC, ...) the browser cannot play straight from MP4.
 pub const REMUX_PRESET_AAC: &str = "remux_h264_aac";
 
+/// The variant key for one transcode.
+///
+/// The audio choice is part of the key: two viewers watching the same file in
+/// different languages need two different files, and neither may overwrite the
+/// other. The default track keeps the historical key so existing caches stay
+/// valid.
+pub fn transcode_variant_key(preset: &str, audio_stream: Option<usize>) -> String {
+    match audio_stream {
+        Some(index) => format!("{preset}_a{index}"),
+        None => preset.to_string(),
+    }
+}
+
 /// True when the media URI is an HTTP(S) `.m3u8` playlist.
 pub fn is_hls(media: &Media) -> bool {
     if !media.uri.to_ascii_lowercase().starts_with("http") {

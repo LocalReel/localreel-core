@@ -11,9 +11,11 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBehavior};
 
 use crate::model::{
-    CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun, Source,
+    CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun,
+    Source, Track,
 };
 use crate::storage::StorageRegistry;
+use crate::tracks::normalize_language;
 
 /// One page of the shared library, filtered for one account.
 #[derive(Debug, Clone, Copy)]
@@ -971,6 +973,95 @@ impl MediaService {
         })
     }
 
+    /// Replace the embedded tracks of one media item from a fresh probe.
+    ///
+    /// A re-probe is authoritative: the old rows are deleted first, so a track
+    /// that no longer exists cannot linger in the player's menu. Returns how
+    /// many tracks were written.
+    pub fn replace_probe_tracks(&self, media_id: i64, probe: &ProbeResult) -> Result<usize> {
+        let now = now_secs();
+        let tracks: Vec<&localreel_kernel::media_ops::ProbeStream> = probe
+            .streams
+            .iter()
+            .filter(|stream| stream.codec_type == "audio")
+            .collect();
+        // The container's `default` disposition wins; without one, the first
+        // audio track is what a player would pick anyway.
+        let marked_default = tracks.iter().any(|stream| stream.is_default);
+        let fallback_default = if marked_default {
+            None
+        } else {
+            tracks.first().map(|stream| stream.index)
+        };
+
+        self.db.with_write(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM media_tracks WHERE media_id = ?1 AND source = 'embedded'",
+                [media_id],
+            )?;
+            let mut written = 0usize;
+            for stream in &tracks {
+                let is_default = stream.is_default || Some(stream.index) == fallback_default;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO media_tracks (
+                         media_id, kind, source, stream_index, path, format, language,
+                         title, channels, is_default, is_forced, created_at
+                     ) VALUES (?1, 'audio', 'embedded', ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        media_id,
+                        stream.index,
+                        stream.codec_name,
+                        stream.language.as_deref().and_then(normalize_language),
+                        stream.title,
+                        stream.channels.map(i64::from),
+                        i64::from(is_default),
+                        i64::from(stream.is_forced),
+                        now,
+                    ],
+                )?;
+                written += 1;
+            }
+            transaction.commit()?;
+            Ok(written)
+        })
+    }
+
+    /// Tracks of one media item, video streams excluded.
+    ///
+    /// Ordered by stream index so the menu follows the file.
+    pub fn list_tracks(&self, media_id: i64) -> Result<Vec<Track>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, media_id, kind, source, stream_index, path, format, language,
+                        title, channels, is_default, is_forced
+                 FROM media_tracks
+                 WHERE media_id = ?1
+                 ORDER BY kind, COALESCE(stream_index, 2147483647), id",
+            )?;
+            let rows = statement.query_map([media_id], row_to_track)?;
+            let mut tracks = Vec::new();
+            for row in rows {
+                tracks.push(row?);
+            }
+            Ok(tracks)
+        })
+    }
+
+    pub fn get_track(&self, media_id: i64, track_id: i64) -> Result<Option<Track>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, media_id, kind, source, stream_index, path, format, language,
+                            title, channels, is_default, is_forced
+                     FROM media_tracks WHERE id = ?1 AND media_id = ?2",
+                    params![track_id, media_id],
+                    row_to_track,
+                )
+                .optional()?)
+        })
+    }
+
     pub fn get_state(&self, user_id: i64, media_id: i64) -> Result<MediaState> {
         self.db.with_read(|connection| {
             let state = connection
@@ -1148,6 +1239,23 @@ fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         archived_at: row.get(6)?,
+    })
+}
+
+fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
+    Ok(Track {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        kind: row.get(2)?,
+        source: row.get(3)?,
+        stream_index: row.get(4)?,
+        path: row.get(5)?,
+        format: row.get(6)?,
+        language: row.get(7)?,
+        title: row.get(8)?,
+        channels: row.get(9)?,
+        is_default: row.get::<_, i64>(10)? != 0,
+        is_forced: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -1440,6 +1548,117 @@ mod tests {
                 Ok(connection.last_insert_rowid())
             })
             .unwrap()
+    }
+
+    #[test]
+    fn probe_tracks_are_replaced_wholesale() {
+        use localreel_kernel::media_ops::{ProbeResult, ProbeStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_dir, service) = setup();
+        let videos = dir.path().join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        let source_id = service.add_source(videos.to_str().unwrap()).unwrap().id;
+        let media_id = insert_media(&service, source_id, "tracks");
+
+        let stream = |index: i64, language: &str, default: bool| ProbeStream {
+            index,
+            codec_type: "audio".into(),
+            codec_name: Some("aac".into()),
+            language: Some(language.into()),
+            title: None,
+            channels: Some(2),
+            is_default: default,
+            ..ProbeStream::default()
+        };
+        let probe = ProbeResult {
+            duration: Some(60.0),
+            streams: vec![
+                ProbeStream {
+                    index: 0,
+                    codec_type: "video".into(),
+                    codec_name: Some("h264".into()),
+                    ..ProbeStream::default()
+                },
+                stream(1, "jpn", true),
+                stream(3, "eng", false),
+            ],
+            ..ProbeResult::default()
+        };
+
+        assert_eq!(service.replace_probe_tracks(media_id, &probe).unwrap(), 2);
+        let tracks = service.list_tracks(media_id).unwrap();
+        assert_eq!(tracks.len(), 2, "video streams are not tracks");
+        // Normalized to the short tag the UI compares against.
+        assert_eq!(tracks[0].language.as_deref(), Some("ja"));
+        assert_eq!(tracks[0].stream_index, Some(1));
+        assert!(tracks[0].is_default);
+        assert_eq!(tracks[1].language.as_deref(), Some("en"));
+        assert_eq!(tracks[1].stream_index, Some(3));
+        assert!(!tracks[1].is_default);
+        assert_eq!(tracks[1].channels, Some(2));
+
+        // A re-probe that lost the English track must not leave it in the menu.
+        let only_japanese = ProbeResult {
+            streams: vec![stream(1, "jpn", true)],
+            ..ProbeResult::default()
+        };
+        assert_eq!(
+            service
+                .replace_probe_tracks(media_id, &only_japanese)
+                .unwrap(),
+            1
+        );
+        assert_eq!(service.list_tracks(media_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_first_audio_track_is_the_default_when_the_container_says_nothing() {
+        use localreel_kernel::media_ops::{ProbeResult, ProbeStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_dir, service) = setup();
+        let videos = dir.path().join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        let source_id = service.add_source(videos.to_str().unwrap()).unwrap().id;
+        let media_id = insert_media(&service, source_id, "defaults");
+
+        let probe = ProbeResult {
+            streams: vec![
+                ProbeStream {
+                    index: 1,
+                    codec_type: "audio".into(),
+                    codec_name: Some("aac".into()),
+                    ..ProbeStream::default()
+                },
+                ProbeStream {
+                    index: 2,
+                    codec_type: "audio".into(),
+                    codec_name: Some("ac3".into()),
+                    ..ProbeStream::default()
+                },
+            ],
+            ..ProbeResult::default()
+        };
+        service.replace_probe_tracks(media_id, &probe).unwrap();
+        let tracks = service.list_tracks(media_id).unwrap();
+        assert!(
+            tracks[0].is_default,
+            "the first track is what a player picks"
+        );
+        assert!(!tracks[1].is_default);
+        // Timestamps and identity are exposed to the UI.
+        assert!(tracks[0].id > 0);
+        assert_eq!(tracks[0].media_id, media_id);
+        assert_eq!(tracks[0].kind, "audio");
+        assert_eq!(tracks[0].source, "embedded");
+
+        // get_track is scoped to the media it belongs to.
+        assert!(service.get_track(media_id, tracks[0].id).unwrap().is_some());
+        assert!(service
+            .get_track(media_id + 1, tracks[0].id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

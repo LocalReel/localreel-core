@@ -6,13 +6,14 @@ use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::jobs::{JobContext, JobHandler, JobOutcome, JobRegistry};
 use localreel_kernel::media_ops::{
-    is_hardware_failure, HwAccel, MediaInput, MediaOps, TranscodeOptions, TranscodeRequest,
+    is_hardware_failure, HlsRequest, HwAccel, MediaInput, MediaOps, TranscodeOptions,
+    TranscodeRequest,
 };
 use localreel_kernel::storage::MediaUri;
 use serde::{Deserialize, Serialize};
 
 use crate::backup::{read_backup_with_limit, Backup, MAX_BACKUP_RESTORE_BYTES};
-use crate::playback::{preset_by_name, DEFAULT_TRANSCODE_PRESET};
+use crate::playback::{preset_by_name, transcode_variant_key, DEFAULT_TRANSCODE_PRESET};
 use crate::restore::restore_backup;
 use crate::scan::discover_source_with_storage;
 use crate::service::MediaService;
@@ -245,6 +246,11 @@ impl JobHandler for ProbeMediaHandler {
         context.report_progress(0.1, Some("ffprobe"));
         let probe = self.0.media_ops.probe(&input, &context.cancel_flag())?;
         service.update_probe(media.id, &probe)?;
+        // The track list is derived state: a re-probe replaces it wholesale, so
+        // a stream that disappeared from the container disappears from the UI.
+        if let Err(error) = service.replace_probe_tracks(media.id, &probe) {
+            tracing::warn!(media_id = media.id, "failed to record tracks: {error}");
+        }
         context.report_progress(0.9, Some("metadata updated"));
 
         if media.thumbnail_path.is_none() {
@@ -326,6 +332,9 @@ struct TranscodePayload {
     media_id: i64,
     #[serde(default)]
     preset: Option<String>,
+    /// ffmpeg stream index of the audio track to keep; omitted = first track.
+    #[serde(default)]
+    audio_stream: Option<usize>,
 }
 
 struct TranscodeHandler(Arc<Shared>);
@@ -343,6 +352,9 @@ impl JobHandler for TranscodeHandler {
         let preset = preset_by_name(&preset_name).ok_or_else(|| {
             KernelError::InvalidInput(format!("unsupported transcode preset '{preset_name}'"))
         })?;
+        // The audio choice is part of the variant key, so two languages never
+        // overwrite each other's cache entry.
+        let variant_key = transcode_variant_key(&preset_name, payload.audio_stream);
 
         let service = MediaService::new(self.0.db.clone());
         let media = service
@@ -359,15 +371,22 @@ impl JobHandler for TranscodeHandler {
         }
 
         let filename = format!(
-            "transcode_{}_{}_{}_{}.mp4",
+            "transcode_{}_{}_{}_{}_{}.mp4",
             sanitize_component(&media.uid, 64),
             sanitize_component(&preset_name, 32),
+            payload
+                .audio_stream
+                .map(|index| format!("a{index}"))
+                .unwrap_or_else(|| "aauto".to_string()),
             media.file_size,
             media.modified_at
         );
         let output = self.0.transcode_dir.join(&filename);
         let hwaccel = self.0.media_ops.hwaccel();
-        let options = TranscodeOptions { hwaccel };
+        let options = TranscodeOptions {
+            hwaccel,
+            audio_stream: payload.audio_stream,
+        };
         let cancel = context.cancel_flag();
 
         context.report_progress(0.0, Some("transcoding"));
@@ -401,6 +420,7 @@ impl JobHandler for TranscodeHandler {
                     &TranscodeRequest {
                         options: TranscodeOptions {
                             hwaccel: HwAccel::None,
+                            ..options
                         },
                         duration_secs: media.duration,
                         cancel: &cancel,
@@ -415,7 +435,7 @@ impl JobHandler for TranscodeHandler {
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        service.record_variant(media.id, "transcode", &preset_name, &filename, size)?;
+        service.record_variant(media.id, "transcode", &variant_key, &filename, size)?;
         context.report_progress(
             1.0,
             Some(if fallback {
@@ -454,6 +474,9 @@ struct HlsPayload {
     media_id: i64,
     #[serde(default)]
     segment_secs: Option<u32>,
+    /// ffmpeg stream index of the audio track to keep; omitted = first track.
+    #[serde(default)]
+    audio_stream: Option<usize>,
 }
 
 struct HlsPackageHandler(Arc<Shared>);
@@ -502,9 +525,12 @@ impl JobHandler for HlsPackageHandler {
         self.0.media_ops.package_hls(
             &input,
             &temp_dir,
-            segment_secs,
-            media.duration,
-            &context.cancel_flag(),
+            &HlsRequest {
+                segment_secs,
+                duration_secs: media.duration,
+                audio_stream: payload.audio_stream,
+                cancel: &context.cancel_flag(),
+            },
             |progress| context.report_progress(0.05 + progress * 0.9, Some("packaging hls")),
         )?;
 
