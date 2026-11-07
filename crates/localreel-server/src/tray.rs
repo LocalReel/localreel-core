@@ -10,6 +10,8 @@
 
 /// What happened to the console window when the tray was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Windows can report all three; on other platforms only absent/kept occur.
+#[allow(dead_code)]
 pub enum ConsoleState {
     /// No console at all: a service manager or the GUI launcher started us.
     Absent,
