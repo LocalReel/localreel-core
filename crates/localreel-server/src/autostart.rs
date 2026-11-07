@@ -3,9 +3,10 @@
 //! Each platform gets its native mechanism, because a "start at login" entry
 //! that pops a console window on every login is worse than none:
 //!
-//! - Windows: a Task Scheduler entry running the desktop persona with the tray
-//!   and without opening a browser. A scheduled task gets no console, so the
-//!   tray is the only surface.
+//! - Windows: the per-user Run key pointing at the GUI launcher, which starts
+//!   the server without a console window (a scheduled task with a logon trigger
+//!   needs administrator rights). Falls back to the console binary when a
+//!   package does not ship the launcher.
 //! - macOS: a LaunchAgent running the server persona, the same shape as the
 //!   plist shipped in the `.dmg`.
 //! - Linux: an XDG autostart entry running the server persona without a
@@ -71,21 +72,32 @@ pub const XDG_ENTRY_NAME: &str = "localreel.desktop";
 
 /// Decide the mechanism and its content. `home` is only used on Unix.
 pub fn backend(platform: Platform, exe: &Path, home: &Path) -> Backend {
-    let exe = exe.display();
     match platform {
-        Platform::Windows => Backend::RunKey {
-            name: RUN_VALUE.to_string(),
-            // Desktop persona so the tray appears; --no-open because a login
-            // should not steal the browser.
-            command: format!("\"{exe}\" serve --mode desktop --tray --no-open"),
-        },
+        Platform::Windows => {
+            let launcher = exe.with_file_name("localreel-desktop.exe");
+            let command = if launcher.is_file() {
+                // No console at all: nothing flashes at login.
+                format!("\"{}\"", launcher.display())
+            } else {
+                // Portable installs without the launcher still get the tray and
+                // keep the browser for themselves.
+                format!(
+                    "\"{}\" serve --mode desktop --tray --no-open",
+                    exe.display()
+                )
+            };
+            Backend::RunKey {
+                name: RUN_VALUE.to_string(),
+                command,
+            }
+        }
         Platform::MacOs => Backend::File {
             path: home.join("Library/LaunchAgents").join(LAUNCH_AGENT_NAME),
-            content: launch_agent(&exe.to_string()),
+            content: launch_agent(&exe.display().to_string()),
         },
         Platform::Linux => Backend::File {
             path: home.join(".config/autostart").join(XDG_ENTRY_NAME),
-            content: xdg_entry(&exe.to_string()),
+            content: xdg_entry(&exe.display().to_string()),
         },
     }
 }
@@ -251,14 +263,29 @@ fn command_ok(program: &str, args: &[&str]) -> bool {
 mod tests {
     use super::*;
 
-    fn exe() -> PathBuf {
-        PathBuf::from(r"C:\Users\ana\AppData\Local\LocalReel\localreel.exe")
+    #[test]
+    fn windows_prefers_the_gui_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("localreel.exe");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::write(dir.path().join("localreel-desktop.exe"), b"").unwrap();
+        match backend(Platform::Windows, &exe, dir.path()) {
+            Backend::RunKey { name, command } => {
+                assert_eq!(name, RUN_VALUE);
+                // The launcher is a GUI program: no console window at login.
+                assert!(command.ends_with("localreel-desktop.exe\""));
+                assert!(!command.contains("serve"));
+            }
+            other => panic!("unexpected backend: {other:?}"),
+        }
     }
 
     #[test]
-    fn windows_uses_the_per_user_run_key() {
-        let backend = backend(Platform::Windows, &exe(), Path::new(r"C:\Users\ana"));
-        match backend {
+    fn windows_falls_back_to_the_console_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("localreel.exe");
+        std::fs::write(&exe, b"").unwrap();
+        match backend(Platform::Windows, &exe, dir.path()) {
             Backend::RunKey { name, command } => {
                 assert_eq!(name, RUN_VALUE);
                 // A login must not steal the browser, and the tray needs the

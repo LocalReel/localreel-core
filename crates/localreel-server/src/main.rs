@@ -477,6 +477,14 @@ fn prune_backup_uploads(data_dir: &std::path::Path) {
     }
 }
 
+/// Ctrl+C is the terminal way out. A service manager and the GUI launcher give
+/// the process no console, so the signal can never arrive (and registering the
+/// handler reports an error): wait forever instead of shutting down at once.
+async fn wait_for_ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
 async fn serve(
     mode: RunMode,
     no_open: bool,
@@ -701,15 +709,17 @@ async fn serve(
     };
     let tray_active = tray_handle.is_some();
     if tray_active {
-        let hidden = tray::hide_console();
+        let console = tray::hide_console();
         info!(
             "tray icon installed; console {}",
-            if hidden { "hidden" } else { "kept" }
+            match console {
+                tray::ConsoleState::Absent => "absent",
+                tray::ConsoleState::Hidden => "hidden",
+                tray::ConsoleState::Kept => "kept",
+            }
         );
-        if hidden {
-            println!("  Tray:    right-click the notification-area icon to open or quit");
-        } else {
-            println!("  Tray:    right-click the notification-area icon to open or quit");
+        println!("  Tray:    right-click the notification-area icon to open or quit");
+        if console == tray::ConsoleState::Kept {
             println!("  Stop:    close this window, or press Ctrl+C");
         }
     } else if tray_icon {
@@ -758,7 +768,7 @@ async fn serve(
     )
     .with_graceful_shutdown(async move {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            _ = wait_for_ctrl_c() => {}
             _ = tray_shutdown => {}
             _ = shutdown_notify.notified() => {
                 info!("shutdown requested from the admin page");

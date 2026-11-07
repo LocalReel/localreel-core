@@ -11,6 +11,10 @@ publish = false
 name = "localreel"
 path = "src/main.rs"
 
+[[bin]]
+name = "localreel-desktop"
+path = "src/desktop.rs"
+
 [dependencies]
 localreel-kernel = { path = "../localreel-kernel" }
 localreel-media = { path = "../localreel-media" }

@@ -8,8 +8,20 @@
 //! Only Windows has an implementation. Elsewhere the API is a no-op so the
 //! server code stays platform-neutral.
 
+/// What happened to the console window when the tray was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleState {
+    /// No console at all: a service manager or the GUI launcher started us.
+    Absent,
+    /// The console belonged to this process and is now hidden.
+    Hidden,
+    /// The console is shared (a terminal); left visible so the user keeps it.
+    Kept,
+}
+
 #[cfg(windows)]
 mod platform {
+    use super::ConsoleState;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
@@ -96,32 +108,37 @@ mod platform {
     }
 
     /// Hide the console window once the tray exists, so a double-click leaves
-    /// only the tray icon behind. Returns whether the console was hidden.
+    /// only the tray icon behind.
     ///
     /// The console is shared with every process attached to it. Hiding a
     /// terminal the user started the server from would hide their terminal, so
     /// this only acts when the console belongs to this process alone (the
-    /// double-click and shortcut case).
-    pub fn hide_console() -> bool {
+    /// double-click, shortcut and launcher cases).
+    pub fn hide_console() -> ConsoleState {
         // SAFETY: both calls are read-only queries; the buffer length is passed
         // together with the pointer.
         unsafe {
+            let console = GetConsoleWindow();
+            if console.is_null() {
+                return ConsoleState::Absent;
+            }
             let mut attached = [0u32; 8];
             let count = windows_sys::Win32::System::Console::GetConsoleProcessList(
                 attached.as_mut_ptr(),
                 attached.len() as u32,
             );
             if count != 1 {
-                return false;
+                return ConsoleState::Kept;
             }
-            let console = GetConsoleWindow();
-            if console.is_null() {
-                return false;
-            }
-            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            let hidden = windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
                 console,
                 windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
-            ) != 0
+            ) != 0;
+            if hidden {
+                ConsoleState::Hidden
+            } else {
+                ConsoleState::Kept
+            }
         }
     }
 
@@ -339,6 +356,8 @@ pub use platform::{hide_console, spawn, Tray};
 
 #[cfg(not(windows))]
 mod stub {
+    use super::ConsoleState;
+
     pub struct Tray;
 
     impl Tray {
@@ -350,8 +369,8 @@ mod stub {
         None
     }
 
-    pub fn hide_console() -> bool {
-        false
+    pub fn hide_console() -> ConsoleState {
+        ConsoleState::Absent
     }
 }
 
