@@ -356,4 +356,4 @@ mod stub {
 }
 
 #[cfg(not(windows))]
-pub use stub::{hide_console, spawn};
+pub use stub::{hide_console, spawn, Tray};
