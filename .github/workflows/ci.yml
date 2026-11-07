@@ -7,9 +7,15 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref makes the previous run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
