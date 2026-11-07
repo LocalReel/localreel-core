@@ -1,3 +1,4 @@
+mod autostart;
 mod launch;
 mod logging;
 mod tray;
@@ -54,6 +55,11 @@ enum Command {
     Migrate,
     /// Print configuration and environment checks.
     Doctor,
+    /// Start LocalReel with the user session (enable/disable/status).
+    Autostart {
+        #[arg(value_enum, default_value_t = AutostartAction::Status)]
+        action: AutostartAction,
+    },
     /// Discover media under one configured source (walk/fingerprint/upsert).
     Scan { source_id: i64 },
     /// Rewrite a local source root, preserving media ids/state.
@@ -130,6 +136,12 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AutostartAction {
+    Status,
+    Enable,
+    Disable,
+}
 async fn dispatch(cli: Cli, mode: RunMode) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve {
         no_open: false,
@@ -145,6 +157,7 @@ async fn dispatch(cli: Cli, mode: RunMode) -> anyhow::Result<()> {
         } => serve(mode, no_open, tray, port, host).await,
         Command::Migrate => migrate(),
         Command::Doctor => doctor(),
+        Command::Autostart { action } => autostart(action),
         Command::Scan { source_id } => scan(source_id),
         Command::RemapSource {
             source_id,
@@ -182,6 +195,20 @@ fn migrate() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn autostart(action: AutostartAction) -> anyhow::Result<()> {
+    match action {
+        AutostartAction::Status => println!("autostart: {}", autostart::status()),
+        AutostartAction::Enable => {
+            autostart::enable()?;
+            println!("autostart: {}", autostart::status());
+        }
+        AutostartAction::Disable => {
+            autostart::disable()?;
+            println!("autostart: {}", autostart::status());
+        }
+    }
+    Ok(())
+}
 fn doctor() -> anyhow::Result<()> {
     let (config, source) = Config::load_with_source()?;
     config.ensure_dirs()?;
@@ -197,6 +224,7 @@ fn doctor() -> anyhow::Result<()> {
     println!("LocalReel doctor");
     println!("  version:   {}", localreel_kernel::VERSION);
     println!("  mode:      {} ({})", config.mode, config.mode_source);
+    println!("  autostart: {}", autostart::status());
     println!(
         "  config:    {}",
         source
