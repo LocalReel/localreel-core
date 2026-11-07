@@ -35,15 +35,21 @@ pub struct MediaJobs {
     shared: Arc<Shared>,
 }
 
+#[derive(Clone)]
 struct Shared {
     db: Database,
     media_ops: Arc<MediaOps>,
     thumbnail_dir: PathBuf,
     transcode_dir: PathBuf,
     hls_dir: PathBuf,
+    preview_dir: PathBuf,
     storage: Arc<StorageRegistry>,
     /// Base URL of the running server, used to read remote media over HTTP.
     stream_base: Option<String>,
+    /// Render progress-bar sprite sheets for long videos.
+    preview_sprites: bool,
+    /// Anything shorter than this gets no sprite.
+    preview_min_secs: f64,
 }
 
 impl MediaJobs {
@@ -70,19 +76,36 @@ impl MediaJobs {
         transcode_dir: PathBuf,
         storage: Arc<StorageRegistry>,
     ) -> Self {
+        let data_dir = thumbnail_dir.parent().map(|parent| parent.to_path_buf());
         Self {
             shared: Arc::new(Shared {
                 db,
                 media_ops,
-                hls_dir: thumbnail_dir
-                    .parent()
+                hls_dir: data_dir
+                    .as_ref()
                     .map(|parent| parent.join("hls"))
                     .unwrap_or_else(|| PathBuf::from("hls")),
+                preview_dir: data_dir
+                    .as_ref()
+                    .map(|parent| parent.join("previews"))
+                    .unwrap_or_else(|| PathBuf::from("previews")),
                 thumbnail_dir,
                 transcode_dir,
                 storage,
                 stream_base: None,
+                preview_sprites: true,
+                preview_min_secs: 600.0,
             }),
+        }
+    }
+
+    /// Apply one change to the shared configuration without repeating every
+    /// field for each builder.
+    fn reshape(self, update: impl FnOnce(&mut Shared)) -> Self {
+        let mut shared = (*self.shared).clone();
+        update(&mut shared);
+        Self {
+            shared: Arc::new(shared),
         }
     }
 
@@ -90,35 +113,23 @@ impl MediaJobs {
     /// through `/api/v1/media/<id>/stream` instead of a local path.
     pub fn with_stream_base(self, base: impl Into<String>) -> Self {
         let base = base.into();
-        let existing = &*self.shared;
-        Self {
-            shared: Arc::new(Shared {
-                db: existing.db.clone(),
-                media_ops: existing.media_ops.clone(),
-                thumbnail_dir: existing.thumbnail_dir.clone(),
-                transcode_dir: existing.transcode_dir.clone(),
-                hls_dir: existing.hls_dir.clone(),
-                storage: existing.storage.clone(),
-                stream_base: Some(base),
-            }),
-        }
+        self.reshape(|shared| shared.stream_base = Some(base))
     }
 
     /// Point HLS packaging at the configured directory.
     pub fn with_hls_dir(self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
-        let existing = &*self.shared;
-        Self {
-            shared: Arc::new(Shared {
-                db: existing.db.clone(),
-                media_ops: existing.media_ops.clone(),
-                thumbnail_dir: existing.thumbnail_dir.clone(),
-                transcode_dir: existing.transcode_dir.clone(),
-                hls_dir: dir,
-                storage: existing.storage.clone(),
-                stream_base: existing.stream_base.clone(),
-            }),
-        }
+        self.reshape(|shared| shared.hls_dir = dir)
+    }
+
+    /// Configure progress-bar previews.
+    pub fn with_previews(self, dir: impl Into<PathBuf>, enabled: bool, min_secs: f64) -> Self {
+        let dir = dir.into();
+        self.reshape(|shared| {
+            shared.preview_dir = dir;
+            shared.preview_sprites = enabled;
+            shared.preview_min_secs = min_secs;
+        })
     }
 
     pub fn register(&self, registry: &mut JobRegistry) {
@@ -127,6 +138,7 @@ impl MediaJobs {
         registry.register(ThumbnailHandler(self.shared.clone()));
         registry.register(TranscodeHandler(self.shared.clone()));
         registry.register(HlsPackageHandler(self.shared.clone()));
+        registry.register(PreviewSpriteHandler(self.shared.clone()));
         registry.register(CacheGcHandler(self.shared.clone()));
         registry.register(RestoreBackupHandler(self.shared.clone()));
         registry.register(RestoreBackupFileHandler(self.shared.clone()));
@@ -272,6 +284,28 @@ impl JobHandler for ProbeMediaHandler {
             }
         }
 
+        // Long videos get a progress-bar preview; short ones gain nothing from
+        // one and the render still costs a process launch.
+        if self.0.preview_sprites
+            && probe
+                .duration
+                .is_some_and(|duration| duration >= self.0.preview_min_secs)
+        {
+            let payload = serde_json::json!({ "media_id": media.id }).to_string();
+            if let Err(error) = context.queue().enqueue_with_priority(
+                "preview_sprite",
+                &payload,
+                Some(&format!("sprite:{}", media.id)),
+                2,
+                THUMBNAIL_PRIORITY - 5,
+            ) {
+                tracing::warn!(
+                    media_id = media.id,
+                    "failed to enqueue preview sprite job: {error}"
+                );
+            }
+        }
+
         JobOutcome::json(probe)
     }
 }
@@ -324,6 +358,78 @@ impl JobHandler for ThumbnailHandler {
         service.record_variant(media.id, "thumbnail", "default", &filename, size)?;
         context.report_progress(1.0, Some("thumbnail ready"));
         Ok(JobOutcome::empty())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PreviewPayload {
+    media_id: i64,
+}
+
+/// Render the sprite sheet the progress bar shows on hover.
+///
+/// Only long videos ask for one: a ten-second clip gains nothing from a preview
+/// and the encode still costs a process launch.
+struct PreviewSpriteHandler(Arc<Shared>);
+
+impl JobHandler for PreviewSpriteHandler {
+    fn kind(&self) -> &'static str {
+        "preview_sprite"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: PreviewPayload = context.payload()?;
+        let service = MediaService::new(self.0.db.clone());
+        let media = service
+            .get_media(payload.media_id)?
+            .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
+
+        let Some(duration) = media.duration.filter(|value| *value > 0.0) else {
+            return JobOutcome::json(serde_json::json!({ "skipped": "unknown duration" }));
+        };
+        if duration < self.0.preview_min_secs {
+            return JobOutcome::json(serde_json::json!({ "skipped": "too short" }));
+        }
+
+        let filename = format!("{}.jpg", sanitize_component(&media.uid, 64));
+        let output = self.0.preview_dir.join(&filename);
+        if output.is_file() {
+            let size = std::fs::metadata(&output)
+                .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            service.record_variant(media.id, "sprite", "default", &filename, size)?;
+            return JobOutcome::json(serde_json::json!({
+                "file": filename,
+                "exists": true,
+            }));
+        }
+
+        let input = media_input(&media, self.0.stream_base.as_deref())?;
+        if let MediaInput::Path(path) = &input {
+            if !path.is_file() {
+                return Err(KernelError::NotFound(format!(
+                    "media file is missing: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let interval = localreel_kernel::media_ops::preview_interval(Some(duration));
+        context.report_progress(0.1, Some("rendering preview sprites"));
+        self.0
+            .media_ops
+            .preview_sprite(&input, &output, interval, &context.cancel_flag())?;
+
+        let size = std::fs::metadata(&output)
+            .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        service.record_variant(media.id, "sprite", "default", &filename, size)?;
+        context.report_progress(1.0, Some("preview sprites ready"));
+        JobOutcome::json(serde_json::json!({
+            "file": filename,
+            "interval": interval,
+            "size": size,
+        }))
     }
 }
 

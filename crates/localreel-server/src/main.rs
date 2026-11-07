@@ -646,6 +646,11 @@ async fn serve(
     )
     .with_stream_base(format!("http://{stream_host}:{}", config.port))
     .with_hls_dir(config.media.hls_dir.clone())
+    .with_previews(
+        config.media.preview_dir.clone(),
+        config.media.preview_sprites,
+        config.media.preview_min_secs as f64,
+    )
     .register(&mut registry);
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -125,6 +125,12 @@ pub struct MediaConfig {
     pub transcode_dir: PathBuf,
     /// HLS playlists and segments produced on demand.
     pub hls_dir: PathBuf,
+    /// Progress-bar preview sprite sheets.
+    pub preview_dir: PathBuf,
+    /// Generate preview sprites for long videos.
+    pub preview_sprites: bool,
+    /// Skip the sprite for anything shorter than this.
+    pub preview_min_secs: u64,
     pub cache_max_bytes: u64,
     pub cache_max_age: Duration,
     /// How many ffmpeg jobs (transcode/HLS packaging) may run at once.
@@ -174,6 +180,9 @@ impl Default for Config {
                 thumbnail_dir: data_dir.join("thumbnails"),
                 transcode_dir: data_dir.join("transcodes"),
                 hls_dir: data_dir.join("hls"),
+                preview_dir: data_dir.join("previews"),
+                preview_sprites: true,
+                preview_min_secs: 600,
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
                 cache_max_age: Duration::from_secs(30 * 24 * 60 * 60),
                 max_concurrent_transcodes: 2,
@@ -257,6 +266,7 @@ impl Config {
         self.media.thumbnail_dir = dir.join("thumbnails");
         self.media.transcode_dir = dir.join("transcodes");
         self.media.hls_dir = dir.join("hls");
+        self.media.preview_dir = dir.join("previews");
         self.data_dir = dir;
     }
 
@@ -320,6 +330,15 @@ impl Config {
         }
         if let Some(value) = file.media.hls_dir {
             self.media.hls_dir = value;
+        }
+        if let Some(value) = file.media.previews_dir {
+            self.media.preview_dir = value;
+        }
+        if let Some(value) = file.media.preview_sprites {
+            self.media.preview_sprites = value;
+        }
+        if let Some(value) = file.media.preview_min_secs {
+            self.media.preview_min_secs = value;
         }
         if let Some(value) = file.media.cache_max_bytes {
             self.media.cache_max_bytes = value;
@@ -424,6 +443,15 @@ impl Config {
         if let Some(value) = env_u64("LOCALREEL_IDLE_SESSION_SECS")? {
             self.media.idle_session_secs = value;
         }
+        if let Some(value) = env_string("LOCALREEL_PREVIEW_DIR") {
+            self.media.preview_dir = PathBuf::from(value);
+        }
+        if let Some(value) = env_bool("LOCALREEL_PREVIEW_SPRITES")? {
+            self.media.preview_sprites = value;
+        }
+        if let Some(value) = env_u64("LOCALREEL_PREVIEW_MIN_SECS")? {
+            self.media.preview_min_secs = value;
+        }
         if let Some(value) = env_string("LOCALREEL_HWACCEL") {
             self.media.hwaccel = crate::media_ops::HwAccel::parse(&value).ok_or_else(|| {
                 KernelError::Config(format!(
@@ -490,6 +518,7 @@ impl Config {
             &self.media.thumbnail_dir,
             &self.media.transcode_dir,
             &self.media.hls_dir,
+            &self.media.preview_dir,
             &self.log_dir,
         ] {
             std::fs::create_dir_all(dir).map_err(|error| {
@@ -591,6 +620,9 @@ struct MediaFile {
     thumbnails_dir: Option<PathBuf>,
     transcodes_dir: Option<PathBuf>,
     hls_dir: Option<PathBuf>,
+    previews_dir: Option<PathBuf>,
+    preview_sprites: Option<bool>,
+    preview_min_secs: Option<u64>,
     cache_max_bytes: Option<u64>,
     cache_max_age_hours: Option<u64>,
     max_concurrent_transcodes: Option<usize>,
@@ -887,6 +919,10 @@ mod tests {
             PathBuf::from("/tmp/library/transcodes")
         );
         assert_eq!(config.media.hls_dir, PathBuf::from("/tmp/library/hls"));
+        assert_eq!(
+            config.media.preview_dir,
+            PathBuf::from("/tmp/library/previews")
+        );
     }
 
     #[test]

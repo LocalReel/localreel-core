@@ -38,6 +38,7 @@ const MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
 pub fn router(state: Arc<AppState>) -> Router {
     let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
     let transcodes = ServeDir::new(state.config.media.transcode_dir.clone());
+    let previews = ServeDir::new(state.config.media.preview_dir.clone());
     let embedded = crate::web::is_embedded();
     let web_dir = state.config.resolved_web_dir();
 
@@ -60,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/media/:id/tracks", get(list_tracks))
         .route("/api/v1/media/:id/state", get(get_state).put(put_state))
         .route("/api/v1/media/:id/playback", post(prepare_playback))
+        .route("/api/v1/media/:id/preview.vtt", get(preview_vtt))
         .route(
             "/api/v1/media/:id/stream",
             get(stream_media).head(head_media),
@@ -67,6 +69,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(events))
         .nest_service("/thumbnails", thumbnails)
         .nest_service("/transcodes", transcodes)
+        .nest_service("/previews", previews)
         .route("/hls/*path", get(serve_hls));
 
     // Administrators only: library structure, jobs, backups and accounts.
@@ -715,6 +718,45 @@ async fn list_tracks(
     Ok(Json(state.media.list_tracks(id)?))
 }
 
+/// The WebVTT track that turns the sprite sheet into progress-bar previews.
+///
+/// Generated on demand from the stored sprite and the media duration, so a
+/// change in the sampling interval needs no cache invalidation.
+async fn preview_vtt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let media = state
+        .media
+        .get_media(id)?
+        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    let missing = || ApiError::not_found(format!("media {id} has no preview"));
+    let duration = media
+        .duration
+        .filter(|value| *value > 0.0)
+        .ok_or_else(missing)?;
+    let variant = state
+        .media
+        .find_variant(id, "sprite", "default")?
+        .ok_or_else(missing)?;
+    if !state.config.media.preview_dir.join(&variant.path).is_file() {
+        return Err(missing());
+    }
+
+    let interval = localreel_kernel::media_ops::preview_interval(Some(duration));
+    let tile = localreel_media::tile_size(media.width, media.height);
+    let cues = localreel_media::preview_cues(duration, interval, tile);
+    let body = localreel_media::preview_vtt(&format!("/previews/{}", variant.path), &cues);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 async fn get_state(
     State(state): State<Arc<AppState>>,
     Extension(current): Extension<CurrentUser>,
@@ -1354,6 +1396,10 @@ mod tests {
         migrations::apply(&db, "media", localreel_media::migrations::list()).unwrap();
         let events = EventBus::new(16);
         let jobs = JobQueue::new(db.clone(), events.clone());
+        // Keep every derived directory inside the temp dir: a test must never
+        // touch the operator's real cache.
+        let mut config = Config::default();
+        config.set_data_dir(dir.to_path_buf());
         let media = MediaService::new(db.clone());
         let accounts = localreel_media::AccountService::new(db.clone());
         let transcodes = Arc::new(localreel_media::TranscodeGate::new(
@@ -1361,7 +1407,7 @@ mod tests {
             std::time::Duration::from_secs(900),
         ));
         AppState::new(crate::state::AppStateParts {
-            config: Config::default(),
+            config,
             db,
             events,
             jobs,
@@ -1617,6 +1663,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn preview_vtt_describes_the_sprite_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = state.media.add_source(library.to_str().unwrap()).unwrap();
+        let now = localreel_kernel::time::now_secs();
+        let media_id = state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media (uid, source_id, uri, canonical_path, filename,
+                         duration, width, height, file_size, modified_at, created_at, updated_at)
+                     VALUES ('previewme', ?1, ?2, ?2, 'long.mp4', 600.0, 1920, 1080, 0, 0, ?3, ?3)",
+                    (
+                        source.id,
+                        library.join("long.mp4").to_string_lossy().to_string(),
+                        now,
+                    ),
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+
+        // No sprite yet: the client must get a 404, not an empty document.
+        let app = router(state.clone());
+        let response = app
+            .oneshot(request_as(
+                &format!("/api/v1/media/{media_id}/preview.vtt"),
+                &session,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let filename = "previewme.jpg";
+        std::fs::create_dir_all(&state.config.media.preview_dir).unwrap();
+        std::fs::write(state.config.media.preview_dir.join(filename), b"jpeg").unwrap();
+        state
+            .media
+            .record_variant(media_id, "sprite", "default", filename, 4)
+            .unwrap();
+        state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE media SET thumbnail_path = 'previewme.jpg' WHERE id = ?1",
+                    [media_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(request_as(
+                &format!("/api/v1/media/{media_id}/preview.vtt"),
+                &session,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/vtt"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.starts_with("WEBVTT\n\n"));
+        assert!(text.contains("/previews/previewme.jpg#xywh=0,0,160,90"));
+        // Ten minutes at six seconds per tile: one hundred cues.
+        assert_eq!(text.matches("-->").count(), 100);
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.

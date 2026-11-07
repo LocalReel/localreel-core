@@ -199,7 +199,7 @@ pub struct TranscodeOptions {
     pub hwaccel: HwAccel,
     /// ffmpeg stream index of the audio track to keep.
     ///
-    /// `None` means "the first audio track" — the behaviour every earlier
+    /// `None` means "the first audio track" 鈥?the behaviour every earlier
     /// release had, which keeps the existing variant names valid.
     pub audio_stream: Option<usize>,
 }
@@ -516,6 +516,41 @@ impl MediaOps {
                     "input={}; stderr: {}",
                     input.display(),
                     tail_text(&output.stderr, 4096)
+                ),
+            )),
+            Err(error) => {
+                let _ = std::fs::remove_file(output);
+                Err(error)
+            }
+        }
+    }
+
+    /// Render one sprite sheet of `input` into `output`.
+    ///
+    /// The sheet is a 10x10 grid sampled every `interval` seconds; the player
+    /// turns it into progress-bar previews through the WebVTT the media layer
+    /// generates.
+    pub fn preview_sprite(
+        &self,
+        input: &MediaInput,
+        output: &Path,
+        interval: f64,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut command = binary_command(&self.ffmpeg);
+        command.args(build_preview_args(input, output, interval));
+        let result = run_capture(&mut command, self.thumbnail_timeout, cancel);
+        match result {
+            Ok(captured) if captured.status_success => Ok(()),
+            Ok(captured) => Err(KernelError::media_detail(
+                "ffmpeg could not build a preview sprite",
+                format!(
+                    "input={}; stderr: {}",
+                    input.display(),
+                    tail_text(&captured.stderr, 4096)
                 ),
             )),
             Err(error) => {
@@ -926,6 +961,48 @@ fn run_capture(
 /// VAAPI render node. The usual one on a Linux desktop or NAS with an iGPU.
 pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 
+/// Preview sprite geometry: a 10x10 grid of 160 px wide tiles.
+///
+/// The grid is fixed and the sampling interval is derived from the duration, so
+/// a two-hour film and a ten-minute episode both produce one small image.
+pub const PREVIEW_COLUMNS: u32 = 10;
+pub const PREVIEW_ROWS: u32 = 10;
+pub const PREVIEW_TILE_WIDTH: u32 = 160;
+
+/// Seconds between two preview frames for a file of `duration`.
+///
+/// Never below one second: a sprite sheet full of duplicate frames is useless.
+pub fn preview_interval(duration: Option<f64>) -> f64 {
+    let total = duration.filter(|value| *value > 0.0).unwrap_or(600.0);
+    let slots = f64::from(PREVIEW_COLUMNS * PREVIEW_ROWS);
+    (total / slots).max(1.0)
+}
+
+/// Build the ffmpeg arguments for a sprite sheet.
+///
+/// Pure so the sampling maths is unit-tested; the encode itself runs through
+/// [`MediaOps::preview_sprite`].
+pub fn build_preview_args(
+    input: &MediaInput,
+    output: &Path,
+    interval: f64,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    let mut args: Vec<OsString> = ["-y", "-v", "error", "-i"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    args.push(input.as_os());
+    args.push(OsString::from("-vf"));
+    args.push(OsString::from(format!(
+        "fps=1/{interval:.6},scale={PREVIEW_TILE_WIDTH}:-1,tile={PREVIEW_COLUMNS}x{PREVIEW_ROWS}"
+    )));
+    args.extend(["-frames:v", "1", "-q:v", "5"].iter().map(OsString::from));
+    args.push(output.as_os_str().to_owned());
+    args
+}
+
 /// The `-map` value for an audio track.
 ///
 /// `?` keeps a video-only file working: without it ffmpeg fails when the source
@@ -1023,7 +1100,7 @@ pub fn build_transcode_args(
         .collect();
     args.push(input.as_os());
     // Keep the web output clean: video + one audio track. Subtitles, data
-    // streams and chapters are dropped — the mp4 muxer otherwise writes
+    // streams and chapters are dropped 鈥?the mp4 muxer otherwise writes
     // chapters as an extra `text` track that no browser player needs.
     args.extend(["-map", "0:v:0", "-map"].iter().map(|value| text(value)));
     args.push(text(&audio_map(options.audio_stream)));
