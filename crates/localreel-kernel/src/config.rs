@@ -77,8 +77,47 @@ pub struct Config {
     pub jobs: JobsConfig,
     pub media: MediaConfig,
     pub scan: ScanConfig,
+    pub metadata: MetadataConfig,
     /// Sidecar plugins to start with the server (packages on disk).
     pub plugins: Vec<PluginConfig>,
+}
+
+/// Where optional posters and descriptions come from.
+///
+/// `none` (the default) is a complete, working configuration: the library uses
+/// thumbnails and filenames and never talks to the internet. Choosing `tmdb`
+/// requires an API key; without one the provider is treated as `none` and the
+/// server says so instead of failing.
+#[derive(Debug, Clone)]
+pub struct MetadataConfig {
+    pub provider: MetadataProvider,
+    pub api_key: Option<String>,
+    /// TMDB language tag, for example `zh-CN` or `en-US`.
+    pub language: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataProvider {
+    #[default]
+    None,
+    Tmdb,
+}
+
+impl MetadataProvider {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "" => Some(Self::None),
+            "tmdb" => Some(Self::Tmdb),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Tmdb => "tmdb",
+        }
+    }
 }
 
 /// How sources are rescanned.
@@ -127,6 +166,8 @@ pub struct MediaConfig {
     pub hls_dir: PathBuf,
     /// Progress-bar preview sprite sheets.
     pub preview_dir: PathBuf,
+    /// Downloaded posters, served at `/posters`.
+    pub poster_dir: PathBuf,
     /// Generate preview sprites for long videos.
     pub preview_sprites: bool,
     /// Skip the sprite for anything shorter than this.
@@ -181,6 +222,7 @@ impl Default for Config {
                 transcode_dir: data_dir.join("transcodes"),
                 hls_dir: data_dir.join("hls"),
                 preview_dir: data_dir.join("previews"),
+                poster_dir: data_dir.join("cache").join("posters"),
                 preview_sprites: true,
                 preview_min_secs: 600,
                 cache_max_bytes: 20 * 1024 * 1024 * 1024,
@@ -190,6 +232,11 @@ impl Default for Config {
                 hwaccel: crate::media_ops::HwAccel::Auto,
             },
             scan: ScanConfig { watch: true },
+            metadata: MetadataConfig {
+                provider: MetadataProvider::None,
+                api_key: None,
+                language: "zh-CN".to_string(),
+            },
             plugins: Vec::new(),
         }
     }
@@ -267,6 +314,7 @@ impl Config {
         self.media.transcode_dir = dir.join("transcodes");
         self.media.hls_dir = dir.join("hls");
         self.media.preview_dir = dir.join("previews");
+        self.media.poster_dir = dir.join("cache").join("posters");
         self.data_dir = dir;
     }
 
@@ -362,6 +410,20 @@ impl Config {
         if let Some(value) = file.scan.watch {
             self.scan.watch = value;
         }
+        if let Some(value) = &file.metadata.provider {
+            self.metadata.provider = MetadataProvider::parse(value).ok_or_else(|| {
+                KernelError::Config(format!(
+                    "invalid metadata provider '{value}': expected none or tmdb"
+                ))
+            })?;
+        }
+        if let Some(value) = &file.metadata.api_key {
+            let trimmed = value.trim();
+            self.metadata.api_key = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        if let Some(value) = &file.metadata.language {
+            self.metadata.language = value.clone();
+        }
         if !file.plugins.is_empty() {
             self.plugins = file
                 .plugins
@@ -449,6 +511,19 @@ impl Config {
         if let Some(value) = env_bool("LOCALREEL_PREVIEW_SPRITES")? {
             self.media.preview_sprites = value;
         }
+        if let Some(value) = env_string("LOCALREEL_METADATA_PROVIDER") {
+            self.metadata.provider = MetadataProvider::parse(&value).ok_or_else(|| {
+                KernelError::Config(format!(
+                    "invalid LOCALREEL_METADATA_PROVIDER '{value}': expected none or tmdb"
+                ))
+            })?;
+        }
+        if let Some(value) = env_string("LOCALREEL_TMDB_API_KEY") {
+            self.metadata.api_key = Some(value);
+        }
+        if let Some(value) = env_string("LOCALREEL_METADATA_LANGUAGE") {
+            self.metadata.language = value;
+        }
         if let Some(value) = env_u64("LOCALREEL_PREVIEW_MIN_SECS")? {
             self.media.preview_min_secs = value;
         }
@@ -519,6 +594,7 @@ impl Config {
             &self.media.transcode_dir,
             &self.media.hls_dir,
             &self.media.preview_dir,
+            &self.media.poster_dir,
             &self.log_dir,
         ] {
             std::fs::create_dir_all(dir).map_err(|error| {
@@ -570,6 +646,8 @@ struct ConfigFile {
     media: MediaFile,
     #[serde(default)]
     scan: ScanFile,
+    #[serde(default)]
+    metadata: MetadataFile,
     #[serde(default)]
     plugins: Vec<PluginFile>,
 }
@@ -633,6 +711,13 @@ struct MediaFile {
 #[derive(Debug, Default, Deserialize)]
 struct ScanFile {
     watch: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MetadataFile {
+    provider: Option<String>,
+    api_key: Option<String>,
+    language: Option<String>,
 }
 
 /// Platform log directory, independent of the configuration file.

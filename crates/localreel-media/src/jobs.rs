@@ -50,6 +50,12 @@ struct Shared {
     preview_sprites: bool,
     /// Anything shorter than this gets no sprite.
     preview_min_secs: f64,
+    /// External metadata provider, when one is configured.
+    metadata: Option<Arc<dyn crate::metadata::MetadataProvider>>,
+    /// Where downloaded posters live.
+    poster_dir: PathBuf,
+    /// A media item is re-matched at most once per this window.
+    metadata_max_age_secs: i64,
 }
 
 impl MediaJobs {
@@ -95,6 +101,12 @@ impl MediaJobs {
                 stream_base: None,
                 preview_sprites: true,
                 preview_min_secs: 600.0,
+                metadata: None,
+                poster_dir: data_dir
+                    .as_ref()
+                    .map(|parent| parent.join("cache").join("posters"))
+                    .unwrap_or_else(|| PathBuf::from("posters")),
+                metadata_max_age_secs: 7 * 24 * 60 * 60,
             }),
         }
     }
@@ -132,6 +144,19 @@ impl MediaJobs {
         })
     }
 
+    /// Configure the optional external metadata provider.
+    pub fn with_metadata(
+        self,
+        provider: Option<Arc<dyn crate::metadata::MetadataProvider>>,
+        poster_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let poster_dir = poster_dir.into();
+        self.reshape(|shared| {
+            shared.metadata = provider;
+            shared.poster_dir = poster_dir;
+        })
+    }
+
     pub fn register(&self, registry: &mut JobRegistry) {
         registry.register(ScanSourceHandler(self.shared.clone()));
         registry.register(ProbeMediaHandler(self.shared.clone()));
@@ -139,6 +164,7 @@ impl MediaJobs {
         registry.register(TranscodeHandler(self.shared.clone()));
         registry.register(HlsPackageHandler(self.shared.clone()));
         registry.register(PreviewSpriteHandler(self.shared.clone()));
+        registry.register(MetadataMatchHandler(self.shared.clone()));
         registry.register(CacheGcHandler(self.shared.clone()));
         registry.register(RestoreBackupHandler(self.shared.clone()));
         registry.register(RestoreBackupFileHandler(self.shared.clone()));
@@ -302,6 +328,26 @@ impl JobHandler for ProbeMediaHandler {
                 tracing::warn!(
                     media_id = media.id,
                     "failed to enqueue preview sprite job: {error}"
+                );
+            }
+        }
+
+        // External metadata is opt-in and refreshed at most once a week, so a
+        // rescan does not hammer the provider.
+        if self.0.metadata.is_some()
+            && service.metadata_is_stale(media.id, self.0.metadata_max_age_secs)?
+        {
+            let payload = serde_json::json!({ "media_id": media.id }).to_string();
+            if let Err(error) = context.queue().enqueue_with_priority(
+                "metadata_match",
+                &payload,
+                Some(&format!("metadata:{}", media.id)),
+                1,
+                THUMBNAIL_PRIORITY - 6,
+            ) {
+                tracing::warn!(
+                    media_id = media.id,
+                    "failed to enqueue metadata job: {error}"
                 );
             }
         }
@@ -679,6 +725,100 @@ fn directory_size(path: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MetadataPayload {
+    media_id: i64,
+}
+
+/// Match one media item against the configured provider.
+///
+/// Everything here is best effort: a provider that is down, a title that does
+/// not match and a poster that fails to download are all warnings, never a job
+/// failure. A wrong poster is worse than no poster, so the confidence threshold
+/// does the rejecting.
+struct MetadataMatchHandler(Arc<Shared>);
+
+impl JobHandler for MetadataMatchHandler {
+    fn kind(&self) -> &'static str {
+        "metadata_match"
+    }
+
+    fn run(&self, context: &JobContext) -> Result<JobOutcome> {
+        let payload: MetadataPayload = context.payload()?;
+        let Some(provider) = &self.0.metadata else {
+            return JobOutcome::json(serde_json::json!({ "skipped": "no provider configured" }));
+        };
+        let service = MediaService::new(self.0.db.clone());
+        let media = service
+            .get_media(payload.media_id)?
+            .ok_or_else(|| KernelError::NotFound(format!("media {}", payload.media_id)))?;
+
+        // Episodes are matched by their show, not by "S01E02"; films by the
+        // cleaned filename.
+        let (series_key, series_title) = service.series_info(media.id)?;
+        let series = series_key.is_some();
+        let (title, year) = match series_title {
+            Some(title) if !title.trim().is_empty() => (title, None),
+            _ => crate::metadata::clean_title(&media.filename),
+        };
+        if title.trim().is_empty() {
+            return JobOutcome::json(serde_json::json!({ "skipped": "no usable title" }));
+        }
+        let query = crate::metadata::MetadataQuery {
+            title,
+            year,
+            series,
+        };
+
+        context.report_progress(0.1, Some("searching metadata"));
+        let candidate = match provider.search(&query) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                tracing::warn!(media_id = media.id, "metadata search failed: {error}");
+                return JobOutcome::json(serde_json::json!({ "error": error }));
+            }
+        };
+        let Some(candidate) = candidate else {
+            return JobOutcome::json(serde_json::json!({
+                "matched": false,
+                "title": query.title,
+            }));
+        };
+
+        context.report_progress(0.5, Some("downloading poster"));
+        let mut poster_path = None;
+        if let Some(url) = &candidate.poster_url {
+            match provider.download(url) {
+                Ok(bytes) if bytes.len() > 1024 => {
+                    std::fs::create_dir_all(&self.0.poster_dir)?;
+                    let name = format!("{}.jpg", media.id);
+                    std::fs::write(self.0.poster_dir.join(&name), &bytes)?;
+                    poster_path = Some(name);
+                }
+                Ok(_) => tracing::warn!(media_id = media.id, "poster was too small to be an image"),
+                Err(error) => {
+                    tracing::warn!(media_id = media.id, "poster download failed: {error}")
+                }
+            }
+        }
+
+        service.upsert_metadata(
+            media.id,
+            provider.name(),
+            &candidate,
+            poster_path.as_deref(),
+        )?;
+        context.report_progress(1.0, Some("metadata matched"));
+        JobOutcome::json(serde_json::json!({
+            "matched": true,
+            "provider_id": candidate.provider_id,
+            "title": candidate.title,
+            "confidence": candidate.confidence,
+            "poster": poster_path.is_some(),
+        }))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

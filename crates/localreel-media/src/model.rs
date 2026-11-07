@@ -46,6 +46,26 @@ pub struct Track {
     pub is_forced: bool,
 }
 
+/// External metadata for one media item.
+///
+/// Present only when a provider is configured and a match cleared the confidence
+/// threshold; the library works without it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaMetadata {
+    pub media_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+    /// File name under `<data>/cache/posters`.
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    pub release_date: Option<String>,
+    pub vote_average: Option<f64>,
+    pub confidence: f64,
+    pub fetched_at: i64,
+}
+
 /// A configured media source (a local directory or an HLS endpoint).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {

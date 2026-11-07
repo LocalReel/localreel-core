@@ -11,8 +11,8 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBehavior};
 
 use crate::model::{
-    CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaState, ScanIssue, ScanRun,
-    Source, Track,
+    CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaMetadata, MediaState, ScanIssue,
+    ScanRun, Source, Track,
 };
 use crate::storage::StorageRegistry;
 use crate::tracks::normalize_language;
@@ -1062,6 +1062,148 @@ impl MediaService {
         })
     }
 
+    /// External metadata for one media item, when a provider matched it.
+    pub fn get_metadata(&self, media_id: i64) -> Result<Option<MediaMetadata>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT media_id, provider, provider_id, title, overview, poster_path,
+                            backdrop_path, release_date, vote_average, confidence, fetched_at
+                     FROM media_metadata WHERE media_id = ?1",
+                    [media_id],
+                    row_to_metadata,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Store (or replace) what a provider said about one media item.
+    pub fn upsert_metadata(
+        &self,
+        media_id: i64,
+        provider: &str,
+        candidate: &crate::metadata::MetadataCandidate,
+        poster_path: Option<&str>,
+    ) -> Result<()> {
+        let now = now_secs();
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO media_metadata (
+                     media_id, provider, provider_id, title, overview, poster_path,
+                     backdrop_path, release_date, vote_average, confidence, fetched_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(media_id) DO UPDATE SET
+                     provider = excluded.provider,
+                     provider_id = excluded.provider_id,
+                     title = excluded.title,
+                     overview = excluded.overview,
+                     poster_path = excluded.poster_path,
+                     backdrop_path = excluded.backdrop_path,
+                     release_date = excluded.release_date,
+                     vote_average = excluded.vote_average,
+                     confidence = excluded.confidence,
+                     fetched_at = excluded.fetched_at",
+                params![
+                    media_id,
+                    provider,
+                    candidate.provider_id,
+                    candidate.title,
+                    candidate.overview,
+                    poster_path,
+                    candidate.backdrop_url,
+                    candidate.release_date,
+                    candidate.vote_average,
+                    candidate.confidence,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether the item has no metadata, or it is older than `max_age_secs`.
+    pub fn metadata_is_stale(&self, media_id: i64, max_age_secs: i64) -> Result<bool> {
+        let fetched: Option<i64> = self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT fetched_at FROM media_metadata WHERE media_id = ?1",
+                    [media_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })?;
+        match fetched {
+            None => Ok(true),
+            Some(at) => Ok(now_secs() - at >= max_age_secs),
+        }
+    }
+
+    /// Poster file names for a set of media ids, for list enrichment.
+    pub fn poster_paths(&self, ids: &[i64]) -> Result<HashMap<i64, String>> {
+        let mut posters = HashMap::new();
+        if ids.is_empty() {
+            return Ok(posters);
+        }
+        self.db.with_read(|connection| {
+            let placeholders = (0..ids.len())
+                .map(|index| format!("?{}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = connection.prepare(&format!(
+                "SELECT media_id, poster_path FROM media_metadata
+                 WHERE poster_path IS NOT NULL AND media_id IN ({placeholders})"
+            ))?;
+            let values: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (media_id, path) = row?;
+                posters.insert(media_id, path);
+            }
+            Ok(())
+        })?;
+        Ok(posters)
+    }
+
+    /// The series grouping the scan derived for one item.
+    ///
+    /// Kept out of [`Media`] because it is display metadata, not a property of
+    /// the file, but the metadata matcher needs the show's name.
+    pub fn series_info(&self, media_id: i64) -> Result<(Option<String>, Option<String>)> {
+        self.db.with_read(|connection| {
+            Ok(connection.query_row(
+                "SELECT series_key, series_title FROM media WHERE id = ?1",
+                [media_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+    }
+
+    /// Media ids a metadata match should cover, optionally limited to one source.
+    pub fn media_ids(&self, source_id: Option<i64>) -> Result<Vec<i64>> {
+        self.db.with_read(|connection| {
+            let mut ids = Vec::new();
+            match source_id {
+                Some(source_id) => {
+                    let mut statement = connection
+                        .prepare("SELECT id FROM media WHERE source_id = ?1 ORDER BY id")?;
+                    for row in statement.query_map([source_id], |row| row.get(0))? {
+                        ids.push(row?);
+                    }
+                }
+                None => {
+                    let mut statement = connection.prepare("SELECT id FROM media ORDER BY id")?;
+                    for row in statement.query_map([], |row| row.get(0))? {
+                        ids.push(row?);
+                    }
+                }
+            }
+            Ok(ids)
+        })
+    }
+
     pub fn get_state(&self, user_id: i64, media_id: i64) -> Result<MediaState> {
         self.db.with_read(|connection| {
             let state = connection
@@ -1239,6 +1381,22 @@ fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         archived_at: row.get(6)?,
+    })
+}
+
+fn row_to_metadata(row: &Row<'_>) -> rusqlite::Result<MediaMetadata> {
+    Ok(MediaMetadata {
+        media_id: row.get(0)?,
+        provider: row.get(1)?,
+        provider_id: row.get(2)?,
+        title: row.get(3)?,
+        overview: row.get(4)?,
+        poster_path: row.get(5)?,
+        backdrop_path: row.get(6)?,
+        release_date: row.get(7)?,
+        vote_average: row.get(8)?,
+        confidence: row.get(9)?,
+        fetched_at: row.get(10)?,
     })
 }
 
@@ -1659,6 +1817,57 @@ mod tests {
             .get_track(media_id + 1, tracks[0].id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn metadata_round_trips_and_goes_stale() {
+        let (dir, service) = setup();
+        let videos = dir.path().join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        let source_id = service.add_source(videos.to_str().unwrap()).unwrap().id;
+        let media_id = insert_media(&service, source_id, "metadata");
+
+        assert!(service.get_metadata(media_id).unwrap().is_none());
+        assert!(service.metadata_is_stale(media_id, 60).unwrap());
+
+        let candidate = crate::metadata::MetadataCandidate {
+            provider_id: "603".into(),
+            title: "The Matrix".into(),
+            overview: Some("A hacker learns the truth.".into()),
+            release_date: Some("1999-03-31".into()),
+            vote_average: Some(8.2),
+            poster_url: Some("https://image.tmdb.org/t/p/w500/abc.jpg".into()),
+            backdrop_url: None,
+            confidence: 1.0,
+        };
+        service
+            .upsert_metadata(media_id, "tmdb", &candidate, Some("603.jpg"))
+            .unwrap();
+
+        let stored = service.get_metadata(media_id).unwrap().unwrap();
+        assert_eq!(stored.provider, "tmdb");
+        assert_eq!(stored.provider_id, "603");
+        assert_eq!(stored.title.as_deref(), Some("The Matrix"));
+        assert_eq!(stored.poster_path.as_deref(), Some("603.jpg"));
+        assert_eq!(stored.vote_average, Some(8.2));
+        assert!(!service.metadata_is_stale(media_id, 60).unwrap());
+        assert!(
+            !service.poster_paths(&[media_id]).unwrap().is_empty(),
+            "posters are listed by media id"
+        );
+
+        // Re-matching replaces the row rather than failing on the primary key.
+        let updated = crate::metadata::MetadataCandidate {
+            title: "The Matrix (Remastered)".into(),
+            ..candidate
+        };
+        service
+            .upsert_metadata(media_id, "tmdb", &updated, None)
+            .unwrap();
+        let stored = service.get_metadata(media_id).unwrap().unwrap();
+        assert_eq!(stored.title.as_deref(), Some("The Matrix (Remastered)"));
+        assert_eq!(stored.poster_path, None);
+        assert!(service.poster_paths(&[media_id]).unwrap().is_empty());
     }
 
     #[test]

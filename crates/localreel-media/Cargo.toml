@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "localreel-media"
 version.workspace = true
 edition.workspace = true
@@ -21,6 +21,8 @@ regex.workspace = true
 tokio.workspace = true
 # Filesystem notifications for automatic rescanning of local sources.
 notify = "6"
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+

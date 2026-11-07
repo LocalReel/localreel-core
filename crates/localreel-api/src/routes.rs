@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let thumbnails = ServeDir::new(state.config.media.thumbnail_dir.clone());
     let transcodes = ServeDir::new(state.config.media.transcode_dir.clone());
     let previews = ServeDir::new(state.config.media.preview_dir.clone());
+    let posters = ServeDir::new(state.config.media.poster_dir.clone());
     let embedded = crate::web::is_embedded();
     let web_dir = state.config.resolved_web_dir();
 
@@ -73,6 +74,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest_service("/thumbnails", thumbnails)
         .nest_service("/transcodes", transcodes)
         .nest_service("/previews", previews)
+        .nest_service("/posters", posters)
         .route("/hls/*path", get(serve_hls));
 
     // Administrators only: library structure, jobs, backups and accounts.
@@ -83,6 +85,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/audit", get(plugin_audit))
+        .route("/api/v1/metadata", get(metadata_status))
+        .route("/api/v1/metadata/match", post(match_metadata))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
         .route("/api/v1/backup/restore", post(enqueue_restore))
         .route("/api/v1/backup/restore/upload", post(upload_restore_file))
@@ -760,16 +764,95 @@ async fn search_media(
     list_media(State(state), Extension(current), Query(query)).await
 }
 
+/// One media item plus whatever external metadata matched it.
+///
+/// `metadata` and `poster_url` are omitted when no provider matched, so the
+/// shape a client sees without metadata is exactly the old one.
+#[derive(Debug, Serialize)]
+struct MediaDetail {
+    #[serde(flatten)]
+    media: Media,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<localreel_media::MediaMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poster_url: Option<String>,
+}
+
 async fn get_media(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<Media>, ApiError> {
-    state
+) -> Result<Json<MediaDetail>, ApiError> {
+    let media = state
         .media
         .get_media(id)?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))
+        .ok_or_else(|| ApiError::not_found(format!("media {id} not found")))?;
+    let metadata = state.media.get_metadata(id)?;
+    let poster_url = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.poster_path.as_ref())
+        .map(|path| format!("/posters/{path}"));
+    Ok(Json(MediaDetail {
+        media,
+        metadata,
+        poster_url,
+    }))
 }
+
+/// What the optional metadata provider is doing.
+async fn metadata_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "configured": state.config.metadata.provider.as_str(),
+        "provider": state.metadata_provider,
+        "language": state.config.metadata.language,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataMatchRequest {
+    #[serde(default)]
+    source_id: Option<i64>,
+}
+
+/// Queue a metadata match for one source, or for the whole library.
+///
+/// Only stale items are queued, so pressing the button twice does not re-query
+/// the provider for everything.
+async fn match_metadata(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<MetadataMatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.metadata_provider.is_none() {
+        return Err(ApiError::bad_request(
+            "no metadata provider is configured (set [metadata] provider and api_key)",
+        ));
+    }
+    let ids = state.media.media_ids(payload.source_id)?;
+    let mut queued = 0usize;
+    let mut skipped = 0usize;
+    for id in ids {
+        if !state.media.metadata_is_stale(id, SEVEN_DAYS)? {
+            skipped += 1;
+            continue;
+        }
+        let payload = serde_json::json!({ "media_id": id }).to_string();
+        match state.jobs.enqueue(
+            "metadata_match",
+            &payload,
+            Some(&format!("metadata:{id}")),
+            1,
+        ) {
+            Ok(_) => queued += 1,
+            Err(error) => tracing::warn!(media_id = id, "failed to queue metadata match: {error}"),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "queued": queued,
+        "fresh": skipped,
+    })))
+}
+
+/// A matched item is re-queried at most this often.
+const SEVEN_DAYS: i64 = 7 * 24 * 60 * 60;
 
 /// Tracks of one media item.
 ///
@@ -1483,6 +1566,7 @@ mod tests {
             accounts,
             transcodes,
             plugins: Arc::new(localreel_plugin::PluginHost::default()),
+            metadata_provider: None,
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
             hwaccel: localreel_kernel::media_ops::HwAccel::None,
         })
@@ -1874,6 +1958,82 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value[key], serde_json::json!([]), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn media_detail_carries_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let (media_id, _, _) = seed_playable(&state, dir.path());
+        let candidate = localreel_media::MetadataCandidate {
+            provider_id: "603".into(),
+            title: "The Matrix".into(),
+            overview: Some("A hacker learns the truth.".into()),
+            release_date: Some("1999-03-31".into()),
+            vote_average: Some(8.2),
+            poster_url: None,
+            backdrop_url: None,
+            confidence: 1.0,
+        };
+        state
+            .media
+            .upsert_metadata(media_id, "tmdb", &candidate, Some("603.jpg"))
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as(&format!("/api/v1/media/{media_id}"), &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Flattened: the media fields stay at the top level.
+        assert_eq!(detail["id"], media_id);
+        assert_eq!(detail["metadata"]["title"], "The Matrix");
+        assert_eq!(detail["metadata"]["provider"], "tmdb");
+        assert_eq!(detail["poster_url"], "/posters/603.jpg");
+    }
+
+    #[tokio::test]
+    async fn metadata_status_reports_that_nothing_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as("/api/v1/metadata", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["configured"], "none");
+        assert!(status["provider"].is_null(), "no provider was built");
+    }
+
+    #[tokio::test]
+    async fn matching_without_a_provider_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/metadata/match",
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        // A button that cannot do anything should say why, not queue nothing.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.

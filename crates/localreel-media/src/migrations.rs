@@ -33,5 +33,10 @@ pub fn list() -> &'static [Migration] {
             name: "media_tracks",
             sql: include_str!("../migrations/0006_tracks.sql"),
         },
+        Migration {
+            version: 7,
+            name: "media_metadata",
+            sql: include_str!("../migrations/0007_media_metadata.sql"),
+        },
     ]
 }

@@ -9,6 +9,7 @@ pub mod backup;
 pub mod gate;
 pub mod jobs;
 pub mod legacy;
+pub mod metadata;
 pub mod migrations;
 pub mod model;
 pub mod playback;
@@ -31,9 +32,13 @@ pub use backup::{
 pub use gate::{memory_pressure, ReapReport, TranscodeGate, TranscodeStatus};
 pub use jobs::MediaJobs;
 pub use legacy::{import_legacy, ImportReport};
+pub use metadata::{
+    clean_title, confidence, provider_from_config, MetadataCandidate, MetadataProvider,
+    MetadataQuery, CONFIDENCE_THRESHOLD,
+};
 pub use model::{
-    CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media, MediaFilter, MediaState,
-    MediaVariant, RemapReport, ScanIssue, ScanRun, Source, Track,
+    CacheGcReport, CacheStats, DeleteSourceReport, FeedItem, Media, MediaFilter, MediaMetadata,
+    MediaState, MediaVariant, RemapReport, ScanIssue, ScanRun, Source, Track,
 };
 pub use playback::transcode_variant_key;
 pub use preview::{preview_cues, preview_vtt, tile_size, PreviewCue};

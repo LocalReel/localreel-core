@@ -516,6 +516,18 @@ async fn serve(
     config.validate()?;
     config.ensure_dirs()?;
 
+    // Optional external metadata. A missing key degrades to "none" instead of
+    // failing startup; the admin page reports what is actually active.
+    let metadata_provider: Option<Arc<dyn localreel_media::MetadataProvider>> =
+        localreel_media::provider_from_config(&config.metadata).map(Arc::from);
+    match &metadata_provider {
+        Some(provider) => info!(provider = provider.name(), "external metadata enabled"),
+        None => info!(
+            configured = config.metadata.provider.as_str(),
+            "external metadata disabled"
+        ),
+    }
+
     if let Some(path) = &source {
         info!("loaded configuration from {}", path.display());
     }
@@ -615,9 +627,8 @@ async fn serve(
         )
         .with_hwaccel(config.media.hwaccel),
     );
-    let ffmpeg_capability = media_ops.capability();
-    // Resolve once, at startup: the encoder table needs one ffmpeg spawn and the
-    // answer does not change while the process runs.
+    let ffmpeg_capability = media_ops.capability(); // Resolve once, at startup: the encoder table needs one ffmpeg spawn and the
+                                                    // answer does not change while the process runs.
     let hwaccel = media_ops.hwaccel();
     if ffmpeg_capability.can_transcode() {
         info!(
@@ -666,6 +677,7 @@ async fn serve(
         config.media.preview_sprites,
         config.media.preview_min_secs as f64,
     )
+    .with_metadata(metadata_provider.clone(), config.media.poster_dir.clone())
     .register(&mut registry);
     let registry = Arc::new(registry);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -829,6 +841,7 @@ async fn serve(
         accounts,
         transcodes,
         plugins: plugin_host,
+        metadata_provider: metadata_provider.as_ref().map(|p| p.name().to_string()),
         ffmpeg_capability,
         hwaccel,
     });

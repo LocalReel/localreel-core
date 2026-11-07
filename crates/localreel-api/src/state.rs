@@ -24,6 +24,9 @@ pub struct AppState {
     pub transcodes: Arc<localreel_media::TranscodeGate>,
     /// The sidecar plugins this process started.
     pub plugins: Arc<localreel_plugin::PluginHost>,
+    /// The metadata provider actually active, or `None` when disabled or
+    /// configured without an API key.
+    pub metadata_provider: Option<String>,
     /// What the installed ffmpeg/ffprobe pair can do (`full`, `probe-only`,
     /// `missing`), so the UI can explain what is degraded instead of guessing.
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
@@ -48,6 +51,7 @@ pub struct AppStateParts {
     pub accounts: AccountService,
     pub transcodes: Arc<localreel_media::TranscodeGate>,
     pub plugins: Arc<localreel_plugin::PluginHost>,
+    pub metadata_provider: Option<String>,
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
     pub hwaccel: localreel_kernel::media_ops::HwAccel,
 }
@@ -63,6 +67,7 @@ impl AppState {
             accounts,
             transcodes,
             plugins,
+            metadata_provider,
             ffmpeg_capability,
             hwaccel,
         } = parts;
@@ -82,6 +87,7 @@ impl AppState {
             watchers,
             transcodes,
             plugins,
+            metadata_provider,
             ffmpeg_capability,
             hwaccel,
             started_at: now_secs(),
