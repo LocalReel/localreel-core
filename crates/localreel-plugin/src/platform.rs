@@ -16,6 +16,35 @@ use std::process::{Child, Command};
 
 use crate::limits::PluginLimits;
 
+/// Remove an AppContainer profile after the host has killed its wrapper.
+///
+/// The wrapper cleans up on a normal child exit; this is the safety net for
+/// `Drop`/timeout paths where the job is terminated before the wrapper runs its
+/// own cleanup.
+#[cfg(windows)]
+pub fn cleanup_appcontainer(profile: &str) {
+    use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+
+    let name = wide(profile);
+    unsafe {
+        DeleteAppContainerProfile(name.as_ptr());
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let path = std::path::PathBuf::from(local)
+            .join("Packages")
+            .join(profile);
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn cleanup_appcontainer(_profile: &str) {}
+
+#[cfg(windows)]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Prepare a command for tree-aware lifecycle handling and resource ceilings.
 pub fn configure(command: &mut Command, limits: PluginLimits) {
     #[cfg(unix)]

@@ -64,8 +64,8 @@ fn run() -> Result<(), String> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, WAIT_OBJECT_0};
     use windows_sys::Win32::Security::Isolation::{
-        CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
-        GetAppContainerFolderPath,
+        CreateAppContainerProfile, DeleteAppContainerProfile,
+        DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
     };
     use windows_sys::Win32::Security::{FreeSid, SECURITY_CAPABILITIES};
     use windows_sys::Win32::System::Console::{
@@ -234,6 +234,9 @@ fn run() -> Result<(), String> {
         }
         code
     };
+    let _ = std::fs::remove_dir_all(&plugin_dir);
+    unsafe { DeleteAppContainerProfile(profile_wide.as_ptr()) };
+    let _ = std::fs::remove_dir_all(&profile_dir);
     std::process::exit(code as i32);
 }
 

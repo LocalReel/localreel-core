@@ -444,12 +444,13 @@ app_container = true
 
 - only `transport = "stdio"` and native binaries are accepted; scripts are
   rejected because the interpreter lives outside the container;
-- the host runs `plugin-sandbox`, which copies the install directory into the
-  AppContainer profile folder and starts it with no capabilities;
+- the host runs `plugin-sandbox`, which copies the install directory into a
+  per-run AppContainer profile folder and starts it with no capabilities;
 - the plugin gets its broker over stdio, so it needs no loopback; a direct
   `TcpStream` connect fails with `WSAEACCES`;
-- a missing wrapper or profile failure is fail-closed. Profile folders are not
-  deleted automatically yet.
+- a missing wrapper or profile failure is fail-closed. The wrapper deletes the
+  profile on normal exit, and the runtime cleans it up again when it has to kill
+  the wrapper.
 
 These limits do not apply to HTTP-transport plugins, which still use loopback
 and can open their own socket. `fs.read` source roots are also still handed

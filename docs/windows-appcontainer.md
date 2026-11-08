@@ -46,8 +46,9 @@ loopback is needed.
 
 - `PluginRuntime` now launches `plugin-sandbox` when `[plugin_runtime]
   app_container = true`; the wrapper copies the install directory and the loader
-  runtime into the profile. Tests prove the stdio broker works and a raw
+  runtime into a per-run profile. Tests prove the stdio broker works and a raw
   `1.1.1.1:80` connect is denied.
 - Interpreter plugins are rejected (the interpreter is outside the package).
-- Profile folders and their copies are not deleted automatically yet.
+- The wrapper deletes the profile on normal exit; `PluginRuntime::drop` repeats
+  the cleanup after a kill. Crashes before either path can still leave a profile.
 - Unix/macOS network isolation is still absent.

@@ -48,6 +48,9 @@ pub struct PluginRuntime {
     /// Present for `entry.transport = "stdio"`; the control channel is pipes,
     /// not a listening socket.
     stdio: Option<Arc<StdioTransport>>,
+    /// AppContainer profile created by the wrapper, for host-side cleanup when
+    /// the runtime kills the wrapper before it can clean up itself.
+    appcontainer_profile: Option<String>,
 }
 
 /// Variables a plugin may inherit.
@@ -184,12 +187,23 @@ fn apply_plugin_env(
     command
 }
 
+fn appcontainer_profile_name(manifest: &Manifest, token: &str) -> String {
+    let profile: String = manifest
+        .id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let suffix: String = token.chars().take(8).collect();
+    format!("localreel-{profile}-{suffix}")
+}
+
 fn appcontainer_command(
     program: &Path,
     manifest: &Manifest,
     token: &str,
     config: &str,
     sandbox: &PluginSandbox,
+    profile: &str,
 ) -> Result<Command, PluginError> {
     if manifest.entry.runtime.is_some() {
         return Err(PluginError::NotReady(
@@ -214,15 +228,10 @@ fn appcontainer_command(
         .clone()
         .or_else(|| program.parent().map(Path::to_path_buf))
         .ok_or_else(|| PluginError::NotReady("plugin source directory is unknown".into()))?;
-    let profile: String = manifest
-        .id
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect();
     let mut command = Command::new(wrapper);
     command
         .arg("--profile")
-        .arg(format!("localreel-{profile}"))
+        .arg(profile)
         .arg("--source")
         .arg(&source)
         .arg("--program")
@@ -350,6 +359,7 @@ impl PluginRuntime {
             stderr,
             guard,
             stdio: None,
+            appcontainer_profile: None,
         };
         runtime.wait_until_healthy()?;
         Ok(runtime)
@@ -362,10 +372,17 @@ impl PluginRuntime {
         sandbox: &PluginSandbox,
         token: String,
     ) -> Result<Self, PluginError> {
-        let mut command = if sandbox.app_container {
-            appcontainer_command(program, manifest, &token, config, sandbox)?
+        let (mut command, appcontainer_profile) = if sandbox.app_container {
+            let profile = appcontainer_profile_name(manifest, &token);
+            (
+                appcontainer_command(program, manifest, &token, config, sandbox, &profile)?,
+                Some(profile),
+            )
         } else {
-            sandboxed_command(program, manifest, &token, config, sandbox)
+            (
+                sandboxed_command(program, manifest, &token, config, sandbox),
+                None,
+            )
         };
         command
             .stdin(Stdio::piped())
@@ -418,6 +435,7 @@ impl PluginRuntime {
             stderr,
             guard,
             stdio: Some(transport),
+            appcontainer_profile,
         };
         if let Err(error) = runtime.wait_until_healthy() {
             let mut child = runtime
@@ -563,6 +581,10 @@ impl Drop for PluginRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         platform::terminate(&mut child, &self.guard);
         let _ = child.wait();
+        drop(child);
+        if let Some(profile) = &self.appcontainer_profile {
+            platform::cleanup_appcontainer(profile);
+        }
     }
 }
 
