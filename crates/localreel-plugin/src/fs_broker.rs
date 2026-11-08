@@ -57,8 +57,10 @@ pub fn execute(roots: &[String], request: &FsRequest) -> Result<Value> {
     }
     match request.op.as_str() {
         "stat" => {
-            let metadata = std::fs::metadata(&target)
-                .map_err(|error| KernelError::Storage(format!("stat failed: {error}")))?;
+            let metadata = open_verified(&target, &roots).and_then(|file| {
+                file.metadata()
+                    .map_err(|error| KernelError::Storage(format!("stat failed: {error}")))
+            })?;
             Ok(json!({
                 "size": metadata.len(),
                 "modified": modified(&metadata),
@@ -98,9 +100,7 @@ pub fn execute(roots: &[String], request: &FsRequest) -> Result<Value> {
         }
         "read" => {
             let len = request.len.min(MAX_READ_BYTES);
-            let mut file = std::fs::File::open(&target)
-                .map_err(|error| KernelError::Storage(format!("open failed: {error}")))?;
-            verify_open_handle(&file, &roots)?;
+            let mut file = open_verified(&target, &roots)?;
             file.seek(SeekFrom::Start(request.start))
                 .map_err(|error| KernelError::Storage(format!("seek failed: {error}")))?;
             let mut body = Vec::new();
@@ -184,6 +184,25 @@ fn comparable(path: &Path) -> String {
     } else {
         text
     }
+}
+
+#[cfg(windows)]
+fn open_verified(path: &Path, roots: &[PathBuf]) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| KernelError::Storage(format!("open failed: {error}")))?;
+    verify_open_handle(&file, roots)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_verified(path: &Path, _roots: &[PathBuf]) -> Result<std::fs::File> {
+    std::fs::File::open(path).map_err(|error| KernelError::Storage(format!("open failed: {error}")))
 }
 
 #[cfg(windows)]
