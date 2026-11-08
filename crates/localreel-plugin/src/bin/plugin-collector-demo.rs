@@ -171,6 +171,17 @@ fn collect() {
         }
         Err(error) => eprintln!("collector: cannot encode result: {error}"),
     }
+
+    if config
+        .get("catalog")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        match client.write_catalog(&titles) {
+            Ok(written) => eprintln!("collector: catalog drafts={written}"),
+            Err(error) => eprintln!("collector: catalog.write failed: {error}"),
+        }
+    }
 }
 
 fn main() {

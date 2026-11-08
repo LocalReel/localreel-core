@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1 adds `net.fetch`, phase 2.2 adds `secret.use`)
+- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`)
 - Date: 2026-11-08
 
 ## Context
@@ -53,9 +53,15 @@ The CMS/collector probe made the gap concrete:
    active `secret.use` grant, the handle/host scope and the injection rule, reads
    the value from the host store, injects it, audits handle+host (never the
    value) and forbids redirects so the credential cannot leave the scope. The
-   value is never returned by any API. Other capabilities remain disclosure-only
-   until their broker exists. The control channel is still loopback HTTP; phase 3
-   replaces it and adds OS isolation.
+   value is never returned by any API.
+8. **Phase 2.3 adds `catalog.write(draft)`.** The plugin submits normalized
+   titles; the host validates counts/fields/URLs, checks the active grant and
+   upserts `plugin_catalog_drafts`. `publish` is rejected: promotion into the
+   browsable `cms_*` tables is a reviewed admin action. Play URLs are untrusted
+   draft data and must be validated again before playback.
+9. **Other capabilities remain disclosure-only** until their broker exists. The
+   control channel is still loopback HTTP; phase 3 replaces it and adds OS
+   isolation.
 
 ## Consequences
 

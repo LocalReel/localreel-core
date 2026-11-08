@@ -57,7 +57,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Plugins have no browser session; this one authenticates with the
         // token the host gave the sidecar when it started it.
         .route("/api/v1/plugin-proxy", post(plugin_proxy))
-        .route("/api/v1/plugin-broker/fetch", post(plugin_broker_fetch));
+        .route("/api/v1/plugin-broker/fetch", post(plugin_broker_fetch))
+        .route("/api/v1/plugin-broker/catalog", post(plugin_broker_catalog));
 
     // Any signed-in account: the shared library plus that account's own state.
     let user_api = Router::new()
@@ -107,6 +108,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins/:id/enable", post(plugin_enable))
         .route("/api/v1/plugins/:id/disable", post(plugin_disable))
         .route("/api/v1/plugins/:id/logs", get(plugin_logs))
+        .route("/api/v1/catalog/drafts", get(list_catalog_drafts))
         .route("/api/v1/metadata", get(metadata_status))
         .route("/api/v1/metadata/match", post(match_metadata))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
@@ -377,6 +379,51 @@ async fn plugin_broker_fetch(
         "status": response.status,
         "content_type": response.content_type,
         "body_b64": body,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogWritePayload {
+    items: Vec<serde_json::Value>,
+}
+
+/// Host-mediated `catalog.write(draft)`: validate and stage, never publish.
+async fn plugin_broker_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CatalogWritePayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    let written = state.plugins.catalog_write(token, payload.items)?;
+    Ok(Json(serde_json::json!({ "written": written })))
+}
+
+/// Drafts staged by plugins, for the eventual CMS review screen.
+async fn list_catalog_drafts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.plugins.catalog().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the catalog draft store is not available",
+        )
+    })?;
+    let drafts = store.list(None, 200)?;
+    let count = store.count(None)?;
+    Ok(Json(serde_json::json!({
+        "drafts": drafts,
+        "count": count,
     })))
 }
 
@@ -2762,6 +2809,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn catalog_drafts_are_listed_for_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        state
+            .plugins
+            .catalog()
+            .unwrap()
+            .upsert(
+                "collector",
+                "0.1.0",
+                &[serde_json::json!({
+                    "remote_id": "1001",
+                    "name": "示例影片",
+                    "lines": [{
+                        "source_tag": "量子",
+                        "episodes": [{
+                            "index": 1,
+                            "name": "正片",
+                            "play_url": "https://cdn.example/1001.m3u8"
+                        }]
+                    }]
+                })],
+            )
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as("/api/v1/catalog/drafts", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["drafts"][0]["remote_id"], "1001");
+        assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
     }
 
     #[tokio::test]

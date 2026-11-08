@@ -27,13 +27,16 @@ use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::time::now_secs;
 use serde::Serialize;
+use serde_json::Value;
 use url::Url;
 
 use crate::audit::{AuditEvent, AuditLog};
 use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
 use crate::capability::{
-    self, CapabilityDescriptor, NetFetchScope, RequestedCapability, SecretUseScope, CAPABILITIES,
+    self, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, NetFetchScope,
+    RequestedCapability, SecretUseScope, CAPABILITIES,
 };
+use crate::catalog::CatalogDraftStore;
 use crate::gate::Gate;
 use crate::grants::{CapabilityGrant, GrantStore};
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
@@ -244,6 +247,7 @@ pub(crate) struct Shared {
     pub(crate) audit: Option<AuditLog>,
     pub(crate) grants: Option<GrantStore>,
     pub(crate) secrets: Option<SecretStore>,
+    pub(crate) catalog: Option<CatalogDraftStore>,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
     pub(crate) host_url: RwLock<Option<String>>,
@@ -319,6 +323,7 @@ impl Default for PluginHost {
             None,
             None,
             None,
+            None,
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -330,7 +335,8 @@ impl PluginHost {
         Self::build(
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
-            Some(SecretStore::new(db)),
+            Some(SecretStore::new(db.clone())),
+            Some(CatalogDraftStore::new(db)),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -342,7 +348,8 @@ impl PluginHost {
         Self::build(
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
-            Some(SecretStore::new(db)),
+            Some(SecretStore::new(db.clone())),
+            Some(CatalogDraftStore::new(db)),
             install_root,
             stop_timeout,
         )
@@ -352,6 +359,7 @@ impl PluginHost {
         audit: Option<AuditLog>,
         grants: Option<GrantStore>,
         secrets: Option<SecretStore>,
+        catalog: Option<CatalogDraftStore>,
         install_root: PathBuf,
         stop_timeout: Duration,
     ) -> Self {
@@ -361,6 +369,7 @@ impl PluginHost {
                 audit,
                 grants,
                 secrets,
+                catalog,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
                 install_root,
@@ -380,6 +389,10 @@ impl PluginHost {
 
     pub fn secrets(&self) -> Option<&SecretStore> {
         self.shared.secrets.as_ref()
+    }
+
+    pub fn catalog(&self) -> Option<&CatalogDraftStore> {
+        self.shared.catalog.as_ref()
     }
 
     /// Tell newly started plugins where the host's capability broker lives.
@@ -847,6 +860,109 @@ impl PluginHost {
             }
         }
     }
+    /// Host-mediated `catalog.write(draft)`.
+    ///
+    /// The plugin submits normalized titles; the host validates them against
+    /// the grant scope and stores them in the draft staging table. `publish` is
+    /// deliberately rejected: promotion into the browsable CMS is a reviewed
+    /// host action, not a plugin write.
+    pub fn catalog_write(&self, token: &str, items: Vec<Value>) -> Result<usize> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.catalog_write_for(&plugin_id, &version, items)
+    }
+
+    fn catalog_write_for(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        items: Vec<Value>,
+    ) -> Result<usize> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let started = Instant::now();
+
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "catalog.write");
+        let Some(grant) = grant else {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("catalog.write"),
+                action: "capability.catalog",
+                result: "denied",
+                detail: Some("catalog.write is not granted for this plugin version"),
+                scope_digest: None,
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            return Err(KernelError::PermissionDenied(
+                "catalog.write is not granted for this plugin version".to_string(),
+            ));
+        };
+        let scope: CatalogWriteScope =
+            serde_json::from_value(grant.scope.clone()).map_err(|error| {
+                KernelError::InvalidInput(format!("stored catalog.write scope is invalid: {error}"))
+            })?;
+        if scope.mode != CatalogWriteMode::Draft {
+            return Err(KernelError::PermissionDenied(
+                "catalog.write mode 'publish' is not supported; use draft".to_string(),
+            ));
+        }
+        if items.len() as u64 > scope.max_items_per_run {
+            return Err(KernelError::InvalidInput(format!(
+                "catalog.write accepts at most {} items per run",
+                scope.max_items_per_run
+            )));
+        }
+        let store = self.shared.catalog.as_ref().ok_or_else(|| {
+            KernelError::StorageUnavailable("the catalog draft store is unavailable".to_string())
+        })?;
+        let written = store.upsert(plugin_id, version, &items)?;
+        let bytes = i64::try_from(
+            serde_json::to_vec(&items)
+                .map(|body| body.len())
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        audit
+            .record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("catalog.write"),
+                action: "capability.catalog",
+                result: "allowed",
+                detail: Some(&format!("drafts={written}")),
+                scope_digest: Some(&grant.scope_digest),
+                bytes_in: Some(bytes),
+                bytes_out: None,
+                duration_ms: Some(started.elapsed().as_millis() as i64),
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            })
+            .map_err(|error| {
+                KernelError::Storage(format!(
+                    "the capability audit could not be written: {error}"
+                ))
+            })?;
+        Ok(written)
+    }
+
     fn apply_secret(
         &self,
         plugin_id: &str,
@@ -1374,6 +1490,74 @@ mod tests {
             Err(KernelError::PermissionDenied(_))
         ));
         assert!(request.headers.is_empty());
+    }
+
+    #[test]
+    fn catalog_write_stages_drafts_and_respects_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("catalog.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+        host.grants()
+            .unwrap()
+            .grant(
+                "collector",
+                "0.1.0",
+                "catalog.write",
+                serde_json::json!({"mode": "draft", "max_items_per_run": 1}),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let title = |remote_id: &str| {
+            serde_json::json!({
+                "remote_id": remote_id,
+                "name": "示例",
+                "lines": [{
+                    "source_tag": "量子",
+                    "episodes": [{
+                        "index": 1,
+                        "name": "正片",
+                        "play_url": "https://cdn.example/1.m3u8"
+                    }]
+                }]
+            })
+        };
+        assert!(host
+            .catalog_write_for("collector", "0.1.0", vec![title("1"), title("2")])
+            .is_err());
+        assert_eq!(host.catalog().unwrap().count(Some("collector")).unwrap(), 0);
+        assert_eq!(
+            host.catalog_write_for("collector", "0.1.0", vec![title("1")])
+                .unwrap(),
+            1
+        );
+        assert_eq!(host.catalog().unwrap().count(Some("collector")).unwrap(), 1);
+
+        host.grants()
+            .unwrap()
+            .grant(
+                "collector",
+                "0.1.0",
+                "catalog.write",
+                serde_json::json!({"mode": "publish"}),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            host.catalog_write_for("collector", "0.1.0", vec![title("3")]),
+            Err(KernelError::PermissionDenied(_))
+        ));
+        assert!(host
+            .audit()
+            .unwrap()
+            .recent(Some("collector"), 10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.capability.as_deref() == Some("catalog.write")
+                && entry.result.as_deref() == Some("allowed")));
     }
 
     #[test]

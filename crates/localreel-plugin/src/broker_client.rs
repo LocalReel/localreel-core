@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 
 /// One decoded broker answer.
@@ -123,6 +124,46 @@ impl BrokerClient {
         headers: &[(&str, &str)],
     ) -> Result<T, String> {
         self.fetch(url, headers)?.json()
+    }
+
+    /// Stage normalized titles through `catalog.write(draft)`.
+    pub fn write_catalog<T: Serialize>(&self, items: &[T]) -> Result<usize, String> {
+        let payload = serde_json::json!({ "items": items });
+        let endpoint = format!("{}/api/v1/plugin-broker/catalog", self.base_url);
+        let response = match self
+            .agent
+            .post(&endpoint)
+            .set("x-localreel-plugin", &self.token)
+            .set("content-type", "application/json")
+            .send_string(&payload.to_string())
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                let mut text = String::new();
+                let _ = response
+                    .into_reader()
+                    .take(8 * 1024)
+                    .read_to_string(&mut text);
+                return Err(format!(
+                    "catalog.write refused the batch ({status}): {}",
+                    broker_error_message(&text)
+                ));
+            }
+            Err(error) => return Err(format!("catalog.write request failed: {error}")),
+        };
+        let mut text = String::new();
+        response
+            .into_reader()
+            .take(8 * 1024 * 1024)
+            .read_to_string(&mut text)
+            .map_err(|error| format!("catalog.write response could not be read: {error}"))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("catalog.write response is not JSON: {error}"))?;
+        value
+            .get("written")
+            .and_then(Value::as_u64)
+            .and_then(|written| usize::try_from(written).ok())
+            .ok_or_else(|| "catalog.write response has no written count".to_string())
     }
 }
 

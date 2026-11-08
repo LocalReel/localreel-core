@@ -111,14 +111,14 @@ owned by the host; the plugin chooses only from the published vocabulary:
 
   The response mixes `source: "manifest"` (declared) with `source: "legacy"`
   (the old `storage:read`/`network` permissions, shown for compatibility).
-- **Enforcement status (phase 2.2):** `net.fetch` and `secret.use` are enforced by
-  the host broker: the plugin's per-run token, the active grant for its exact
-  version, the declared scope and the SSRF/redirect policy are checked before a
-  socket is opened, and every allow/deny is audited. The other capabilities
-  (`fs.read`, `schedule.request`, `catalog.write`, `blob.*`) are still disclosure
-  + grants; they do not have a runtime broker yet. None of this is an OS
-  sandbox: a plugin can still open its own socket, which is why phase 3 replaces
-  the transport and adds OS isolation (ADR-019).
+- **Enforcement status (phase 2.3):** `net.fetch`, `secret.use` and
+  `catalog.write(draft)` are enforced by the host broker: the plugin's per-run
+  token, the active grant for its exact version, the declared scope and the
+  SSRF/redirect policy are checked before any side effect, and every allow/deny
+  is audited. The other capabilities (`fs.read`, `schedule.request`, `blob.*`)
+  are still disclosure + grants; they do not have a runtime broker yet. None of
+  this is an OS sandbox: a plugin can still open its own socket, which is why
+  phase 3 replaces the transport and adds OS isolation (ADR-019).
 
 ## Broker: `net.fetch` (phase 2.1)
 
@@ -207,6 +207,37 @@ account boundary. Encryption at rest is a follow-up; the guarantee this phase
 makes is that the **plugin never reads the value**, not that an attacker with
 the host's data directory cannot.
 
+## Broker: `catalog.write(draft)` (phase 2.3)
+
+A collector submits normalized titles; it never writes the catalog tables that
+the user browses:
+
+```http
+POST /api/v1/plugin-broker/catalog
+x-localreel-plugin: <LOCALREEL_PLUGIN_TOKEN>
+content-type: application/json
+
+{"items": [{"remote_id": "1001", "name": "示例影片",
+  "lines": [{"source_tag": "量子", "episodes": [
+    {"index": 1, "name": "正片", "play_url": "https://cdn.example/1.m3u8"}
+  ]}]}]}
+```
+
+The host checks the active `catalog.write` grant for the exact version, the
+`mode`/`max_items_per_run` scope, validates every title/line/episode and upserts
+`plugin_catalog_drafts`. Validation limits: 2000 items per run, 16 lines per
+title, 500 episodes per line, 20 000 episodes per run, remote id ≤128 bytes,
+name ≤512, source tag ≤64, episode name ≤256, http(s) play URL ≤2048 bytes.
+
+Draft rows keep the original JSON, so the reviewed CMS promotion can add fields
+without re-collecting. `mode: "publish"` is rejected at this layer: promotion
+into `cms_*` is an admin action, not a plugin write. Admins inspect staged data
+with `GET /api/v1/catalog/drafts`.
+
+Play URLs in drafts are **untrusted plugin data**. They are not fetched by the
+draft endpoint; the eventual playback/proxy path must apply its own URL policy
+before opening a socket.
+
 ### Reference collector (phase 2.1)
 
 `plugin-collector-demo` is the first consumer that uses only the broker. Its
@@ -231,6 +262,10 @@ manifest asks for one allowlisted host:
         "redirects": 0,
         "rate_per_min": 60
       }
+    },
+    {
+      "name": "catalog.write",
+      "scope": { "mode": "draft", "max_items_per_run": 2000 }
     }
   ]
 }
@@ -239,12 +274,14 @@ manifest asks for one allowlisted host:
 Its config names the request URL and output file:
 
 ```json
-{ "url": "https://api.example.com/api.php/provide/vod/?ac=detail&pg=1", "out": "collected.json" }
+{ "url": "https://api.example.com/api.php/provide/vod/?ac=detail&pg=1",
+  "out": "collected.json", "catalog": true }
 ```
 
-After the host grants `net.fetch`, the plugin calls the broker, parses the
-MacCMS `list` into `{remote_id,name,lines:[{source_tag,episodes}]}` and writes
-`collected.json` into its working directory. It does not open an outbound socket
+After the host grants `net.fetch` and `catalog.write`, the plugin calls the
+broker, parses the MacCMS `list` into
+`{remote_id,name,lines:[{source_tag,episodes}]}`, writes `collected.json` and
+stages the same titles as catalog drafts. It does not open an outbound socket
 itself. There is no CMS catalog yet; this slice exists to keep the broker
 contract honest before the catalog schema is committed.
 

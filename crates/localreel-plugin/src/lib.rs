@@ -15,6 +15,7 @@ pub mod audit;
 pub mod broker;
 pub mod broker_client;
 pub mod capability;
+pub mod catalog;
 mod gate;
 pub mod grants;
 pub mod host;
@@ -35,6 +36,7 @@ pub use capability::{
     scope_digest, CapabilityDescriptor, CapabilityRequest, NetFetchScope, RequestedCapability,
     CAPABILITIES,
 };
+pub use catalog::{CatalogDraft, CatalogDraftStore};
 pub use gate::Gate;
 pub use grants::{CapabilityGrant, GrantStore};
 pub use host::{
