@@ -385,3 +385,119 @@ fn appcontainer_denies_the_plugins_own_socket() {
     let stderr = runtime.stderr_text(4096);
     assert!(stderr.contains("net: blocked"), "{stderr}");
 }
+
+fn spawn_fs_fixture() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let request = String::from_utf8_lossy(&body).to_string();
+            requests.push(request.clone());
+            let value: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let reply = match value["op"].as_str().unwrap_or_default() {
+                "stat" => json!({"size": 6, "modified": null, "is_dir": false}),
+                "list" => json!({"entries": [{
+                    "uri": "file:///library/a.mp4",
+                    "name": "a.mp4",
+                    "is_dir": false,
+                    "size": 6,
+                    "modified": null
+                }]}),
+                "read" => json!({"body_b64": "YmNk"}),
+                other => panic!("unexpected fs op {other}"),
+            };
+            let body = reply.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}"), server)
+}
+
+fn storage_plugin_serves_from_fs_broker(app_container: bool) {
+    let (host_url, server) = spawn_fs_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let program = format!("bin/plugin-demo{}", std::env::consts::EXE_SUFFIX);
+    let package = dir.path().join("demo-broker.lrplug");
+    build_package(&package, &program, &manifest(&program, "stdio"));
+    let install = dir.path().join("installed");
+    let extracted = extract(&package, &install).unwrap();
+    let executable = install.join(&extracted.entry.program);
+    let runtime = Arc::new(
+        PluginRuntime::start(
+            &executable,
+            &extracted,
+            &json!({ "fs_mode": "broker" }),
+            &localreel_plugin::PluginSandbox {
+                working_dir: Some(install.clone()),
+                roots: Vec::new(),
+                host_url: Some(host_url),
+                limits: Default::default(),
+                app_container,
+                sandbox_program: if app_container {
+                    Some(std::path::PathBuf::from(env!(
+                        "CARGO_BIN_EXE_plugin-sandbox"
+                    )))
+                } else {
+                    None
+                },
+            },
+        )
+        .unwrap(),
+    );
+    let storage = PluginStorage::new(runtime);
+
+    let file_uri = MediaUri::Local(std::path::PathBuf::from("unused.mp4"));
+    assert_eq!(storage.stat(&file_uri).unwrap().size, 6);
+    let listed = storage
+        .list(&MediaUri::Local(std::path::PathBuf::from("unused")))
+        .unwrap();
+    assert_eq!(listed[0].name, "a.mp4");
+
+    let mut reader = storage.open_range(&file_uri, 1, 3).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"bcd");
+
+    let requests = server.join().unwrap();
+    assert!(requests.iter().all(|body| body.contains("\"op\"")));
+    assert!(requests.iter().any(|body| body.contains("\"stat\"")));
+    assert!(requests.iter().any(|body| body.contains("\"list\"")));
+    assert!(requests.iter().any(|body| body.contains("\"read\"")));
+}
+
+#[test]
+fn storage_plugin_uses_fs_broker_over_stdio() {
+    storage_plugin_serves_from_fs_broker(false);
+}
+
+#[test]
+fn appcontainer_storage_plugin_uses_fs_broker() {
+    storage_plugin_serves_from_fs_broker(true);
+}

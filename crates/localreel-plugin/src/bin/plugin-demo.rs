@@ -3,7 +3,9 @@
 //! as the template for real providers (WebDAV, SMB, …).
 //!
 //! Configuration (`LOCALREEL_PLUGIN_CONFIG`):
-//! - `root` — directory to serve (required);
+//! - `root` — directory to serve (required in direct mode);
+//! - `fs_mode` — `"broker"` routes stat/list/read through the host `fs.read`
+//!   broker instead of `std::fs`; required in an AppContainer;
 //! - `public_http_base` — when set (e.g. `http://plugin.local`), entries are
 //!   reported as HTTP URIs under that base instead of `file://` URIs, which is
 //!   how a remote provider behaves.
@@ -12,16 +14,22 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use localreel_kernel::storage::MediaUri;
+use localreel_plugin::broker_client::BrokerClient;
 use localreel_plugin::server::{self, Entry, Handler, HandlerError, Stat};
 use serde_json::{json, Value};
 
 struct LocalHandler {
-    root: PathBuf,
+    root: Option<PathBuf>,
     public_http_base: Option<String>,
+    broker: Option<BrokerClient>,
 }
 
 impl LocalHandler {
     fn resolve(&self, uri: &str) -> Result<PathBuf, HandlerError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| HandlerError::failed("direct mode has no root"))?;
         let parsed = MediaUri::parse(uri)
             .map_err(|error| HandlerError::failed(format!("invalid uri: {error}")))?;
         let path = match parsed {
@@ -32,13 +40,12 @@ impl LocalHandler {
                     .as_deref()
                     .ok_or_else(|| HandlerError::failed("http uri without a public base"))?;
                 let relative = url.strip_prefix(base).ok_or(HandlerError::NotFound)?;
-                self.root
-                    .join(server::percent_decode(relative.trim_start_matches('/')))
+                root.join(server::percent_decode(relative.trim_start_matches('/')))
             }
             _ => return Err(HandlerError::NotFound),
         };
         let canonical = path.canonicalize().map_err(|_| HandlerError::NotFound)?;
-        if canonical.starts_with(&self.root) {
+        if canonical.starts_with(root) {
             Ok(canonical)
         } else {
             Err(HandlerError::NotFound)
@@ -46,10 +53,11 @@ impl LocalHandler {
     }
 
     fn describe(&self, path: &Path) -> Option<Entry> {
+        let root = self.root.as_ref()?;
         let metadata = std::fs::metadata(path).ok()?;
         let name = path.file_name()?.to_string_lossy().into_owned();
         let uri = if let Some(base) = &self.public_http_base {
-            let relative = path.strip_prefix(&self.root).ok()?;
+            let relative = path.strip_prefix(root).ok()?;
             let suffix = relative
                 .components()
                 .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -67,10 +75,63 @@ impl LocalHandler {
             modified: modified(&metadata),
         })
     }
+
+    fn broker(&self) -> Result<&BrokerClient, HandlerError> {
+        self.broker
+            .as_ref()
+            .ok_or_else(|| HandlerError::failed("fs broker is not configured"))
+    }
+
+    fn broker_entries(&self, uri: &str, recursive: bool) -> Result<Vec<Entry>, HandlerError> {
+        let mut entries = Vec::new();
+        let mut pending = vec![uri.to_string()];
+        while let Some(directory) = pending.pop() {
+            let value = self
+                .broker()?
+                .fs_list(&directory)
+                .map_err(HandlerError::failed)?;
+            let Some(items) = value.get("entries").and_then(Value::as_array) else {
+                return Err(HandlerError::failed("fs.list response has no entries"));
+            };
+            for item in items {
+                let entry = Entry {
+                    uri: item
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| HandlerError::failed("fs entry has no uri"))?
+                        .to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    is_dir: item.get("is_dir").and_then(Value::as_bool).unwrap_or(false),
+                    size: item.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    modified: item.get("modified").and_then(Value::as_i64),
+                };
+                if recursive && entry.is_dir {
+                    pending.push(entry.uri.clone());
+                }
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
 }
 
 impl Handler for LocalHandler {
     fn stat(&self, uri: &str) -> Result<Stat, HandlerError> {
+        if let Some(broker) = &self.broker {
+            let value = broker.fs_stat(uri).map_err(HandlerError::failed)?;
+            return Ok(Stat {
+                size: value.get("size").and_then(Value::as_u64).unwrap_or(0),
+                modified: value.get("modified").and_then(Value::as_i64),
+                is_dir: value
+                    .get("is_dir")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
         let path = self.resolve(uri)?;
         let metadata = std::fs::metadata(&path).map_err(|_| HandlerError::NotFound)?;
         Ok(Stat {
@@ -81,6 +142,9 @@ impl Handler for LocalHandler {
     }
 
     fn list(&self, uri: &str, recursive: bool) -> Result<Vec<Entry>, HandlerError> {
+        if self.broker.is_some() {
+            return self.broker_entries(uri, recursive);
+        }
         let root = self.resolve(uri)?;
         let mut entries = Vec::new();
         if recursive {
@@ -105,6 +169,11 @@ impl Handler for LocalHandler {
     }
 
     fn read(&self, uri: &str, start: u64, len: u64) -> Result<Vec<u8>, HandlerError> {
+        if let Some(broker) = &self.broker {
+            return broker
+                .fs_read(uri, start, len)
+                .map_err(HandlerError::failed);
+        }
         let path = self.resolve(uri)?;
         let mut file = std::fs::File::open(&path).map_err(|_| HandlerError::NotFound)?;
         let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -133,18 +202,32 @@ fn main() {
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(|| json!({}));
-    let root = config
-        .get("root")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .expect("LOCALREEL_PLUGIN_CONFIG must contain root");
-    let root = root.canonicalize().expect("plugin root must exist");
+    let broker_mode = config.get("fs_mode").and_then(Value::as_str) == Some("broker");
+    let broker = if broker_mode {
+        Some(BrokerClient::from_env().expect("fs broker is unavailable"))
+    } else {
+        None
+    };
+    let root = if broker_mode {
+        config
+            .get("root")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+    } else {
+        let root = config
+            .get("root")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .expect("LOCALREEL_PLUGIN_CONFIG must contain root");
+        Some(root.canonicalize().expect("plugin root must exist"))
+    };
     let handler = LocalHandler {
         root,
         public_http_base: config
             .get("public_http_base")
             .and_then(Value::as_str)
             .map(|value| value.trim_end_matches('/').to_string()),
+        broker,
     };
     let transport = std::env::var("LOCALREEL_PLUGIN_TRANSPORT").unwrap_or_else(|_| "http".into());
     let result = if transport == "stdio" {

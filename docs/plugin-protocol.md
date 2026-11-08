@@ -515,6 +515,11 @@ target outside all roots, and audits both allow and deny. The check and the
 `open` are separate syscalls; a same-user process racing a symlink is the
 remaining TOCTOU gap. `BrokerClient::fs_stat/fs_list/fs_read` use this endpoint.
 
+The reference storage plugin accepts `"fs_mode": "broker"` in its config: it
+forwards the host's `file://` URIs to this endpoint and never calls `std::fs`.
+That is the mode used by the AppContainer storage test; omitting `fs_mode` keeps
+the legacy direct-root behaviour for third-party plugins.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it

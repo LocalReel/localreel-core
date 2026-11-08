@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration)
 - Date: 2026-11-08
 
 ## Context
@@ -116,8 +116,11 @@ The CMS/collector probe made the gap concrete:
     caps reads at 8 MiB and audits allow/deny. Existing storage plugins still
     use the legacy direct roots until migrated; the check/open TOCTOU gap is
     documented.
-21. **Storage roots remain legacy** where not migrated. The HTTP transport
-    remains the default; phase 3 continues with Unix isolation and migration.
+21. **Phase 3.11 migrates the reference storage plugin.** `fs_mode =
+    "broker"` forwards URIs to the fs broker; the AppContainer storage test
+    serves stat/list/read this way. Third-party plugins that omit the mode still
+    use legacy direct roots until migrated. The HTTP transport remains the
+    default; phase 3 continues with Unix isolation and broader migration.
 
 ## Consequences
 
