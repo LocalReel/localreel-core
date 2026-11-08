@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive)
 - Date: 2026-11-08
 
 ## Context
@@ -91,7 +91,11 @@ The CMS/collector probe made the gap concrete:
     stores plugin/version, package digest, publisher, key fingerprint, result and
     time. The supervisor appends before extraction; admins read it at
     `/api/v1/plugins/verifications`. It is a local audit trail, not a public log.
-17. **`fs.read` remains legacy** (source roots handed directly) and is not
+17. **Phase 3.7 validates the Windows network primitive.** An AppContainer child
+    with no capabilities cannot connect out (`WSAEACCES 10013`); the prototype
+    copies the child and `vcruntime140.dll` into the profile folder. It is not
+    wired into `PluginHost` yet, and loopback-to-broker behavior is untested.
+18. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation.
 
