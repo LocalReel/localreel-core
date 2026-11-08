@@ -9,6 +9,7 @@ pub mod error;
 pub mod guard;
 pub mod routes;
 pub mod state;
+pub mod update;
 pub mod web;
 
 pub use routes::router;

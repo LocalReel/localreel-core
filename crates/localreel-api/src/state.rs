@@ -41,6 +41,8 @@ pub struct AppState {
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
     /// selects on it together with Ctrl+C.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// Last successful remote release check, and when it ran.
+    pub update_cache: std::sync::Mutex<Option<crate::update::CachedCheck>>,
 }
 
 /// The pieces the server assembles before it starts serving.
@@ -100,6 +102,7 @@ impl AppState {
             hwaccel,
             started_at: now_secs(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            update_cache: std::sync::Mutex::new(None),
         })
     }
 

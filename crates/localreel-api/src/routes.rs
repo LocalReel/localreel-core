@@ -80,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // Administrators only: library structure, jobs, backups and accounts.
     let admin_api = Router::new()
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/update", get(admin_update))
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
@@ -478,6 +479,70 @@ async fn admin_health(
             .status(usize::try_from(queued_transcodes).unwrap_or(0)),
         "jobs": recent_jobs,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateQuery {
+    /// Bypass the cache interval when the operator asks explicitly.
+    refresh: Option<bool>,
+}
+
+/// Latest published release, for the admin "update" card.
+///
+/// Read-only and rate-limited by the interval in `[update]`; the download is a
+/// link to the release page, never something the server runs itself.
+async fn admin_update(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UpdateQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let current = localreel_kernel::VERSION;
+    let config = state.config.update.clone();
+    if !config.check {
+        return Ok(Json(
+            crate::update::Status::build(false, current, None, None).to_json(),
+        ));
+    }
+
+    let interval = config.interval_hours.saturating_mul(3600) as i64;
+    let now = localreel_kernel::time::now_secs();
+    let cached = state
+        .update_cache
+        .lock()
+        .map(|cache| cache.clone())
+        .unwrap_or(None);
+    let stale = cached
+        .as_ref()
+        .map(|check| now - check.checked_at >= interval)
+        .unwrap_or(true);
+
+    let mut error = None;
+    if query.refresh.unwrap_or(false) || stale {
+        let feed = config
+            .feed
+            .clone()
+            .unwrap_or_else(|| crate::update::DEFAULT_FEED.to_string());
+        match tokio::task::spawn_blocking(move || crate::update::fetch(&feed)).await {
+            Ok(Ok(release)) => {
+                if let Ok(mut cache) = state.update_cache.lock() {
+                    *cache = Some(crate::update::CachedCheck {
+                        checked_at: now,
+                        release,
+                    });
+                }
+            }
+            Ok(Err(message)) => error = Some(message),
+            Err(join) => error = Some(format!("update check task: {join}")),
+        }
+    }
+
+    let cached = state
+        .update_cache
+        .lock()
+        .map(|cache| cache.clone())
+        .unwrap_or(None);
+    Ok(Json(
+        crate::update::Status::build(true, current, cached.as_ref(), error).to_json(),
+    ))
 }
 
 async fn download_backup(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {

@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -58,6 +58,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
 
 
 

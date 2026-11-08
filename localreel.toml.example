@@ -62,3 +62,12 @@ cache_max_age_hours = 720
 # How long a stop waits for in-flight plugin requests before killing the
 # process (seconds).
 # stop_timeout_secs = 5
+
+# Ask GitHub for the latest release so the Admin page can show it. The server
+# never downloads or installs anything: the card links to the release page.
+# Set check = false, or point feed at a mirror, on an offline network.
+#
+# [update]
+# check = true
+# feed = "https://api.github.com/repos/LocalReel/LocalReel/releases/latest"
+# interval_hours = 24

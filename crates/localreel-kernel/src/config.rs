@@ -82,6 +82,30 @@ pub struct Config {
     pub plugins: Vec<PluginConfig>,
     /// What happens when one of them cannot start.
     pub plugin_runtime: PluginRuntimeConfig,
+    /// Whether the admin page may ask GitHub for the latest release.
+    pub update: UpdateConfig,
+}
+
+/// Remote release checking: a tracker, not an installer.
+///
+/// `check` is on by default; the request goes to the public GitHub API with a
+/// six second budget at most once per `interval_hours`. `feed` exists for
+/// mirrors and for tests.
+#[derive(Debug, Clone)]
+pub struct UpdateConfig {
+    pub check: bool,
+    pub feed: Option<String>,
+    pub interval_hours: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            feed: None,
+            interval_hours: 24,
+        }
+    }
 }
 
 /// Where optional posters and descriptions come from.
@@ -260,6 +284,7 @@ impl Default for Config {
                 strict: false,
                 stop_timeout: Duration::from_secs(5),
             },
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -491,6 +516,18 @@ impl Config {
         }
         if let Some(value) = file.plugin_runtime.stop_timeout_secs {
             self.plugin_runtime.stop_timeout = Duration::from_secs(value);
+        }
+        if let Some(value) = file.update.check {
+            self.update.check = value;
+        }
+        if let Some(value) = file.update.feed {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                self.update.feed = Some(trimmed.to_string());
+            }
+        }
+        if let Some(value) = file.update.interval_hours {
+            self.update.interval_hours = value.max(1);
         }
         Ok(())
     }
@@ -780,6 +817,16 @@ struct ConfigFile {
     plugins: Vec<PluginFile>,
     #[serde(default)]
     plugin_runtime: PluginRuntimeFile,
+    #[serde(default)]
+    update: UpdateFile,
+}
+
+/// `[update]` in the configuration file.
+#[derive(Debug, Default, Deserialize)]
+struct UpdateFile {
+    check: Option<bool>,
+    feed: Option<String>,
+    interval_hours: Option<u64>,
 }
 
 /// `[plugin_runtime]` in the configuration file.

@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 httpdate.workspace = true
 mime_guess.workspace = true
+ureq.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
