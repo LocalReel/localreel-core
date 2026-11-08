@@ -320,8 +320,38 @@ impl Config {
             }
         }
 
+        config.resolve_paths(source_path.as_deref());
         config.validate()?;
         Ok((config, source_path))
+    }
+
+    /// Make every configured path absolute.
+    ///
+    /// A relative `[data] dir` used to be interpreted against the process
+    /// working directory, which changes with the launch method: a shortcut, a
+    /// double-click and a terminal all differ, so the library (and every cache
+    /// under it) could land in a different place each time. The config file is
+    /// the stable reference point: `dir = "data"` next to a portable package
+    /// stays next to that package.
+    fn resolve_paths(&mut self, source: Option<&Path>) {
+        let base = source
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        let Some(base) = base else {
+            return;
+        };
+        self.data_dir = anchored(&base, self.data_dir.clone());
+        self.db_path = anchored(&base, self.db_path.clone());
+        self.log_dir = anchored(&base, self.log_dir.clone());
+        if let Some(web) = &self.web_dir {
+            self.web_dir = Some(anchored(&base, web.clone()));
+        }
+        self.media.thumbnail_dir = anchored(&base, self.media.thumbnail_dir.clone());
+        self.media.transcode_dir = anchored(&base, self.media.transcode_dir.clone());
+        self.media.hls_dir = anchored(&base, self.media.hls_dir.clone());
+        self.media.preview_dir = anchored(&base, self.media.preview_dir.clone());
+        self.media.poster_dir = anchored(&base, self.media.poster_dir.clone());
     }
 
     /// Convenience wrapper for callers that do not need the config origin.
@@ -882,6 +912,15 @@ fn adopt_legacy_data_dir(platform_data: &Path) -> Option<PathBuf> {
     adopt_from(platform_data, candidates)
 }
 
+/// Join `path` onto `base` when it is relative; leave absolute paths alone.
+fn anchored(base: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() || path.as_os_str().is_empty() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
 fn adopt_from(platform_data: &Path, candidates: Vec<PathBuf>) -> Option<PathBuf> {
     if platform_data.join("localreel.db").is_file() {
         return None;
@@ -1084,6 +1123,49 @@ enabled = false
         assert_eq!(HwAccel::parse("QSV"), Some(HwAccel::Qsv));
         assert_eq!(HwAccel::parse("off"), Some(HwAccel::None));
         assert!(HwAccel::parse("nvdec").is_none());
+    }
+
+    #[test]
+    fn relative_paths_are_anchored_to_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("localreel.toml");
+        std::fs::write(&config_path, "[data]\ndir = \"library\"\n").unwrap();
+
+        let parsed: ConfigFile = toml::from_str("[data]\ndir = \"library\"").unwrap();
+        let mut config = Config::default();
+        config.apply_file(parsed).unwrap();
+        config.resolve_paths(Some(&config_path));
+
+        assert_eq!(config.data_dir, dir.path().join("library"));
+        assert_eq!(config.db_path, dir.path().join("library/localreel.db"));
+        assert_eq!(
+            config.media.thumbnail_dir,
+            dir.path().join("library/thumbnails")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_survive_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().join("library");
+        let text = format!(
+            "[data]\ndir = \"{}\"",
+            absolute.to_string_lossy().replace('\\', "/")
+        );
+        let parsed: ConfigFile = toml::from_str(&text).unwrap();
+        let mut config = Config::default();
+        config.apply_file(parsed).unwrap();
+        config.resolve_paths(Some(Path::new("C:/somewhere/localreel.toml")));
+
+        assert_eq!(config.data_dir, absolute);
+    }
+
+    #[test]
+    fn anchored_keeps_absolute_paths_and_joins_relative_ones() {
+        let base = Path::new("C:/base");
+        assert_eq!(anchored(base, PathBuf::from("data")), base.join("data"));
+        let absolute = std::env::temp_dir().join("library");
+        assert_eq!(anchored(base, absolute.clone()), absolute);
     }
 
     #[test]

@@ -10,6 +10,9 @@ allow_remote = false
 # web_dir = "../localreel-web/dist"
 
 [data]
+# Relative paths are resolved against this file's directory, not the working
+# directory the server happened to start in. Prefer an absolute path here when
+# the config lives in %APPDATA% and the library on another drive.
 dir = "data"
 # db = "data/localreel.db"
 

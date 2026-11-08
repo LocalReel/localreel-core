@@ -651,6 +651,9 @@ async fn serve(
     if let Some(path) = &source {
         info!("loaded configuration from {}", path.display());
     }
+    // Print the resolved directory, not the configured one: "data" says
+    // nothing about where the library and its caches actually live.
+    info!(data = %config.data_dir.display(), "data directory");
 
     // Desktop: a second double click means "show me the app", not "fail".
     if config.mode.is_desktop() {
