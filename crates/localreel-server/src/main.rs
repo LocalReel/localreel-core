@@ -957,6 +957,16 @@ async fn serve(
 
     let open_ui = launch::should_open_ui(&config, no_open);
 
+    // A shortcut goes through localreel-desktop.exe, which passes --tray. A
+    // double-click on the server itself does not, so the console stays and is
+    // the only way out. When that console is ours alone, treat the double-click
+    // like the shortcut: tray in, console out.
+    let tray_icon = tray::wants_tray(
+        tray_icon,
+        config.mode.is_desktop(),
+        tray::console_is_exclusive(),
+    );
+
     // The tray is the desktop persona's way to stop the server without the
     // console. It is only installed when asked for, and the console is only
     // hidden once the icon really exists.

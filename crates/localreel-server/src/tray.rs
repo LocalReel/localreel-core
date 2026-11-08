@@ -8,6 +8,18 @@
 //! Only Windows has an implementation. Elsewhere the API is a no-op so the
 //! server code stays platform-neutral.
 
+/// Whether the desktop persona should show the tray icon even though nobody
+/// asked for it.
+///
+/// A double-click on `localreel.exe` lands here with no arguments: desktop mode,
+/// no `--tray`, and a console window that is the only way to stop the server.
+/// When that console belongs to the process alone it is the double-click case,
+/// not a terminal, so the tray takes over and the console can go away. A
+/// terminal launch keeps its console because the console is shared.
+pub fn wants_tray(requested: bool, desktop: bool, console_exclusive: bool) -> bool {
+    requested || (desktop && console_exclusive)
+}
+
 /// What happened to the console window when the tray was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Windows can report all three; on other platforms only absent/kept occur.
@@ -124,12 +136,7 @@ mod platform {
             if console.is_null() {
                 return ConsoleState::Absent;
             }
-            let mut attached = [0u32; 8];
-            let count = windows_sys::Win32::System::Console::GetConsoleProcessList(
-                attached.as_mut_ptr(),
-                attached.len() as u32,
-            );
-            if count != 1 {
+            if !console_is_exclusive() {
                 return ConsoleState::Kept;
             }
             let hidden = windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
@@ -141,6 +148,25 @@ mod platform {
             } else {
                 ConsoleState::Kept
             }
+        }
+    }
+
+    /// Whether this process is the only one attached to its console.
+    ///
+    /// A terminal shares its console with the shell, so `false` keeps the
+    /// console visible there; a double-click creates one for us alone.
+    pub fn console_is_exclusive() -> bool {
+        // SAFETY: the buffer length is passed together with the pointer.
+        unsafe {
+            if GetConsoleWindow().is_null() {
+                return false;
+            }
+            let mut attached = [0u32; 8];
+            let count = windows_sys::Win32::System::Console::GetConsoleProcessList(
+                attached.as_mut_ptr(),
+                attached.len() as u32,
+            );
+            count == 1
         }
     }
 
@@ -354,7 +380,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::{hide_console, spawn, Tray};
+pub use platform::{console_is_exclusive, hide_console, spawn, Tray};
 
 #[cfg(not(windows))]
 mod stub {
@@ -371,10 +397,33 @@ mod stub {
         None
     }
 
+    /// No Win32 console to ask about; the caller keeps its terminal.
+    pub fn console_is_exclusive() -> bool {
+        false
+    }
+
     pub fn hide_console() -> ConsoleState {
         ConsoleState::Absent
     }
 }
 
 #[cfg(not(windows))]
-pub use stub::{hide_console, spawn, Tray};
+pub use stub::{console_is_exclusive, hide_console, spawn, Tray};
+
+#[cfg(test)]
+mod tests {
+    use super::wants_tray;
+
+    #[test]
+    fn a_shortcut_always_requests_the_tray() {
+        assert!(wants_tray(true, true, false));
+        assert!(wants_tray(true, false, false));
+    }
+
+    #[test]
+    fn a_double_clicked_server_gets_a_tray_but_a_terminal_does_not() {
+        assert!(wants_tray(false, true, true));
+        assert!(!wants_tray(false, true, false));
+        assert!(!wants_tray(false, false, true));
+    }
+}
