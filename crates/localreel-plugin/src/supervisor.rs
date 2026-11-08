@@ -222,6 +222,29 @@ fn start_entry(shared: &Arc<Shared>, sink: &Arc<dyn ProviderSink>, id: &str) {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    if let Some(store) = shared.verifications.as_ref() {
+        if let Ok(package_sha256) = digest(&spec.package) {
+            let mut verified = false;
+            let mut used_key = None;
+            if let Some(signature) = &spec.expected_signature {
+                for key in &spec.publisher_public_keys {
+                    if verify_signature(&spec.package, signature, key).is_ok() {
+                        verified = true;
+                        used_key = Some(key.as_str());
+                        break;
+                    }
+                }
+            }
+            let _ = store.record(
+                &spec.manifest.id,
+                &spec.manifest.version,
+                &package_sha256,
+                spec.publisher.as_deref(),
+                used_key,
+                verified,
+            );
+        }
+    }
     match spawn(&spec, &install_root, roots, host_url, shared.limits) {
         Ok(runtime) => {
             let gate = Gate::new();

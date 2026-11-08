@@ -48,6 +48,7 @@ use crate::runtime::PluginRuntime;
 use crate::schedule::{PluginSchedule, ScheduleStore};
 use crate::secrets::SecretStore;
 use crate::supervisor::{self, Intent, ProviderSink};
+use crate::verification::VerificationStore;
 
 /// Upper bound on a proxied response, so one plugin cannot fill the disk.
 pub const MAX_PROXY_BYTES: u64 = 32 * 1024 * 1024;
@@ -288,6 +289,7 @@ pub(crate) struct Shared {
     pub(crate) catalog: Option<CatalogDraftStore>,
     pub(crate) schedules: Option<ScheduleStore>,
     pub(crate) blobs: Option<BlobStore>,
+    pub(crate) verifications: Option<VerificationStore>,
     pub(crate) limits: PluginLimits,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
@@ -378,6 +380,7 @@ impl Default for PluginHost {
             None,
             None,
             None,
+            None,
             PluginLimits::default(),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
@@ -393,7 +396,8 @@ impl PluginHost {
             Some(SecretStore::new(db.clone())),
             Some(CatalogDraftStore::new(db.clone())),
             Some(ScheduleStore::new(db.clone())),
-            Some(BlobStore::new(db)),
+            Some(BlobStore::new(db.clone())),
+            Some(VerificationStore::new(db)),
             PluginLimits::default(),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
@@ -418,7 +422,8 @@ impl PluginHost {
             Some(SecretStore::new(db.clone())),
             Some(CatalogDraftStore::new(db.clone())),
             Some(ScheduleStore::new(db.clone())),
-            Some(BlobStore::new(db)),
+            Some(BlobStore::new(db.clone())),
+            Some(VerificationStore::new(db)),
             limits,
             install_root,
             stop_timeout,
@@ -433,6 +438,7 @@ impl PluginHost {
         catalog: Option<CatalogDraftStore>,
         schedules: Option<ScheduleStore>,
         blobs: Option<BlobStore>,
+        verifications: Option<VerificationStore>,
         limits: PluginLimits,
         install_root: PathBuf,
         stop_timeout: Duration,
@@ -446,6 +452,7 @@ impl PluginHost {
                 catalog,
                 schedules,
                 blobs,
+                verifications,
                 limits,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
@@ -479,6 +486,10 @@ impl PluginHost {
 
     pub fn blobs(&self) -> Option<&BlobStore> {
         self.shared.blobs.as_ref()
+    }
+
+    pub fn verifications(&self) -> Option<&VerificationStore> {
+        self.shared.verifications.as_ref()
     }
 
     /// Tell newly started plugins where the host's capability broker lives.

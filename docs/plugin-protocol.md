@@ -409,8 +409,17 @@ not_after = 1798761600
 
 Only keys that are neither revoked nor past `not_after` verify a package; a
 plugin whose publisher has no active key is rejected at config validation. This
-is rotation/revocation by configuration, not a transparency log: there is no
-append-only record of which key signed which release.
+is rotation/revocation by configuration, not a public transparency log. The host
+does keep a local append-only record:
+
+```text
+GET /api/v1/plugins/verifications?plugin=collector&limit=50
+```
+
+Each row carries plugin id/version, package SHA-256, publisher, a key
+fingerprint (SHA-256 of the public key text) and whether the signature verified.
+The supervisor writes it before extraction; restarts append another row. It is
+an operator audit trail, not a public log.
 
 ## Resource ceilings (phase 3.3)
 

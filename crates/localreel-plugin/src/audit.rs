@@ -87,6 +87,11 @@ pub fn migrations() -> &'static [Migration] {
             name: "plugin_blobs",
             sql: include_str!("../migrations/0006_plugin_blobs.sql"),
         },
+        Migration {
+            version: 7,
+            name: "plugin_package_verifications",
+            sql: include_str!("../migrations/0007_plugin_package_verifications.sql"),
+        },
     ]
 }
 

@@ -105,6 +105,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route(
+            "/api/v1/plugins/verifications",
+            get(plugin_verifications),
+        )
+        .route(
             "/api/v1/plugins/:id/capabilities",
             get(plugin_capabilities).post(grant_plugin_capability),
         )
@@ -601,6 +605,21 @@ async fn plugin_audit(
         .plugins
         .audit()
         .map(|audit| audit.recent(query.plugin.as_deref(), limit))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+/// Append-only package verification records: which key verified which artifact.
+async fn plugin_verifications(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let entries = state
+        .plugins
+        .verifications()
+        .map(|store| store.recent(query.plugin.as_deref(), limit as usize))
         .transpose()?
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "entries": entries })))
@@ -3117,6 +3136,39 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    #[tokio::test]
+    async fn package_verifications_are_listed_for_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        state
+            .plugins
+            .verifications()
+            .unwrap()
+            .record(
+                "collector",
+                "0.1.0",
+                &"a".repeat(64),
+                Some("acme"),
+                Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                true,
+            )
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/verifications", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["entries"][0]["plugin_id"], "collector");
+        assert_eq!(value["entries"][0]["publisher"], "acme");
+        assert_eq!(value["entries"][0]["signature_verified"], true);
     }
 
     #[tokio::test]

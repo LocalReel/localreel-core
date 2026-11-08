@@ -109,6 +109,15 @@ fn fixture() -> Fixture {
         failures.is_empty(),
         "the demo plugin must start: {failures:?}"
     );
+    let verifications = host
+        .verifications()
+        .unwrap()
+        .recent(Some("demo"), 10)
+        .unwrap();
+    assert!(
+        !verifications.is_empty(),
+        "starting a plugin must leave a package-verification record"
+    );
     Fixture {
         _dir: dir,
         host,

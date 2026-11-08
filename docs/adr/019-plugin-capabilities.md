@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records)
 - Date: 2026-11-08
 
 ## Context
@@ -87,7 +87,11 @@ The CMS/collector probe made the gap concrete:
     may share an id; only keys with `revoked = false` and a future `not_after`
     verify. Config validation requires at least one active key for a publisher a
     plugin references. This is configuration lifecycle, not a transparency log.
-16. **`fs.read` remains legacy** (source roots handed directly) and is not
+16. **Phase 3.6 records package verification.** `plugin_package_verifications`
+    stores plugin/version, package digest, publisher, key fingerprint, result and
+    time. The supervisor appends before extraction; admins read it at
+    `/api/v1/plugins/verifications`. It is a local audit trail, not a public log.
+17. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation.
 

@@ -32,6 +32,7 @@ pub mod server;
 pub mod stdio;
 pub mod storage;
 mod supervisor;
+pub mod verification;
 
 pub use audit::{AuditEntry, AuditEvent, AuditLog};
 pub use blob::{BlobMeta, BlobStore};
@@ -58,3 +59,4 @@ pub use schedule::{PluginSchedule, ScheduleStore};
 pub use secrets::{SecretHandle, SecretStore};
 pub use storage::PluginStorage;
 pub use supervisor::ProviderSink;
+pub use verification::{PackageVerification, VerificationStore};
