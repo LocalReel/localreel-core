@@ -199,7 +199,7 @@ pub struct TranscodeOptions {
     pub hwaccel: HwAccel,
     /// ffmpeg stream index of the audio track to keep.
     ///
-    /// `None` means "the first audio track" 鈥?the behaviour every earlier
+    /// `None` means "the first audio track" — the behaviour every earlier
     /// release had, which keeps the existing variant names valid.
     pub audio_stream: Option<usize>,
 }
@@ -1100,7 +1100,7 @@ pub fn build_transcode_args(
         .collect();
     args.push(input.as_os());
     // Keep the web output clean: video + one audio track. Subtitles, data
-    // streams and chapters are dropped 鈥?the mp4 muxer otherwise writes
+    // streams and chapters are dropped — the mp4 muxer otherwise writes
     // chapters as an extra `text` track that no browser player needs.
     args.extend(["-map", "0:v:0", "-map"].iter().map(|value| text(value)));
     args.push(text(&audio_map(options.audio_stream)));
