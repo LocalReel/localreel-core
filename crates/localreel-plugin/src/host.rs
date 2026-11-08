@@ -644,15 +644,36 @@ impl PluginHost {
 
     /// Remember an entry that the configuration switched off.
     pub fn record_disabled(&self, package: &Path) {
+        self.record_disabled_with_sandbox(package, false);
+    }
+
+    pub fn record_disabled_with_sandbox(&self, package: &Path, sandbox: bool) {
         let manifest = inspect(package).ok();
-        let descriptor = descriptor_for(package, manifest.as_ref(), PluginState::Disabled, None);
+        let descriptor = descriptor_for(
+            package,
+            manifest.as_ref(),
+            PluginState::Disabled,
+            None,
+            sandbox,
+        );
         self.insert(descriptor, None, None, None);
     }
 
     /// Remember an entry that failed to load before it reached the supervisor
     /// (an unusable package, discovered while building the spec list).
     pub fn record_failed(&self, package: &Path, manifest: Option<&Manifest>, error: &str) {
-        let descriptor = descriptor_for(package, manifest, PluginState::Failed, Some(error));
+        self.record_failed_with_sandbox(package, manifest, error, false);
+    }
+
+    pub fn record_failed_with_sandbox(
+        &self,
+        package: &Path,
+        manifest: Option<&Manifest>,
+        error: &str,
+        sandbox: bool,
+    ) {
+        let descriptor =
+            descriptor_for(package, manifest, PluginState::Failed, Some(error), sandbox);
         self.shared
             .record_audit(&descriptor.id, "start.failed", error);
         // Keep the inspected manifest so the admin page can still show what the
@@ -1679,6 +1700,7 @@ fn descriptor_for(
     manifest: Option<&Manifest>,
     state: PluginState,
     error: Option<&str>,
+    sandbox: bool,
 ) -> PluginDescriptor {
     match manifest {
         Some(manifest) => PluginDescriptor {
@@ -1696,7 +1718,11 @@ fn descriptor_for(
             started_at: None,
             package: package.display().to_string(),
             transport: manifest.entry.transport.clone(),
-            sandbox: "none".to_string(),
+            sandbox: if sandbox {
+                "appcontainer".to_string()
+            } else {
+                "none".to_string()
+            },
         },
         None => PluginDescriptor {
             // Inspection failed: the manifest id is unknown, so use the file
@@ -1715,7 +1741,11 @@ fn descriptor_for(
             started_at: None,
             package: package.display().to_string(),
             transport: String::new(),
-            sandbox: "none".to_string(),
+            sandbox: if sandbox {
+                "appcontainer".to_string()
+            } else {
+                "none".to_string()
+            },
         },
     }
 }
@@ -1811,11 +1841,12 @@ mod tests {
     fn a_failed_entry_is_reported_with_its_reason() {
         let host = PluginHost::default();
         let manifest = manifest(vec!["network"]);
-        host.record_failed(&package(), Some(&manifest), "handshake timed out");
+        host.record_failed_with_sandbox(&package(), Some(&manifest), "handshake timed out", true);
         let summaries = host.summaries();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, "demo");
         assert_eq!(summaries[0].state, PluginState::Failed);
+        assert_eq!(summaries[0].sandbox, "appcontainer");
         assert!(!summaries[0].running);
         assert_eq!(summaries[0].error.as_deref(), Some("handshake timed out"));
         // The effective permissions are still reported: the entry exists.

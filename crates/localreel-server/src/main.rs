@@ -764,7 +764,14 @@ async fn serve(
             }
             Err(error) if plugin.enabled => {
                 error!(package = %package.display(), "plugin package is unusable: {error}");
-                plugin_host.record_failed(package, None, &error.to_string());
+                plugin_host.record_failed_with_sandbox(
+                    package,
+                    None,
+                    &error.to_string(),
+                    plugin
+                        .app_container
+                        .unwrap_or(config.plugin_runtime.app_container),
+                );
                 plugin_failures.push(localreel_plugin::PluginFailure {
                     id: package.display().to_string(),
                     error: error.to_string(),
@@ -773,7 +780,12 @@ async fn serve(
             Err(_) => {
                 // A disabled package that cannot even be read is still just
                 // disabled: nothing asked the host to load it.
-                plugin_host.record_disabled(package);
+                plugin_host.record_disabled_with_sandbox(
+                    package,
+                    plugin
+                        .app_container
+                        .unwrap_or(config.plugin_runtime.app_container),
+                );
             }
         }
     }
