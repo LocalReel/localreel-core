@@ -282,6 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_a_v1_audit_table_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("upgrade.db").to_str().unwrap(), 1).unwrap();
+        // A host that ran before capabilities existed has only migration 1.
+        localreel_kernel::migrations::apply(&db, "plugin", &migrations()[..1]).unwrap();
+        db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO plugin_audit (plugin_id, permission, action, detail, at)
+                 VALUES ('webdav', 'network', 'network.allowed', 'nas.local', 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        localreel_kernel::migrations::apply(&db, "plugin", migrations()).unwrap();
+        let log = AuditLog::new(db);
+        let entries = log.recent(Some("webdav"), 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].permission.as_deref(), Some("network"));
+        assert_eq!(entries[0].capability, None);
+        assert_eq!(entries[0].result, None);
+    }
+
+    #[test]
     fn pruning_drops_only_old_rows() {
         let (_dir, log) = setup();
         log.record("webdav", None, "start", "old").unwrap();
