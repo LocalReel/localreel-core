@@ -217,8 +217,8 @@ pub struct PluginRuntimeConfig {
     pub max_memory_bytes: u64,
     /// Process-count ceiling (Windows Job Object; Unix enforced elsewhere).
     pub max_processes: u32,
-    /// Windows-only: launch plugins inside an AppContainer with no network
-    /// capabilities. Requires the `plugin-sandbox` wrapper beside the server.
+    /// OS network isolation: AppContainer on Windows, netns via `unshare` on
+    /// Linux. macOS is rejected; there is no fallback to ambient networking.
     pub app_container: bool,
 }
 
@@ -815,9 +815,9 @@ impl Config {
                 "plugin stop timeout must be greater than 0".into(),
             ));
         }
-        if self.plugin_runtime.app_container && !cfg!(windows) {
+        if self.plugin_runtime.app_container && !cfg!(windows) && !cfg!(target_os = "linux") {
             return Err(KernelError::Config(
-                "plugin_runtime.app_container is Windows-only".into(),
+                "plugin_runtime.app_container is supported on Windows (AppContainer) and Linux (netns) only".into(),
             ));
         }
         let memory = self.plugin_runtime.max_memory_bytes;

@@ -442,20 +442,24 @@ app_container = true
 - Defaults: 512 MiB and 16 processes; config validation bounds memory to
   16 MiB–16 GiB and processes to 1–256.
 
-`app_container = true` is the Windows network boundary (phase 3.9). A
-`[[plugins]]` entry may override the global switch with its own
+`app_container = true` is the OS network boundary: Windows uses AppContainer,
+Linux uses `unshare -Urn` (network namespace) for stdio plugins; macOS is
+rejected. A `[[plugins]]` entry may override the global switch with its own
 `app_container = true/false`; when absent it inherits `[plugin_runtime]`.
 
-- only `transport = "stdio"` and native binaries are accepted; scripts are
-  rejected because the interpreter lives outside the container;
-- the host runs `plugin-sandbox`, which copies the install directory into a
-  per-run AppContainer profile folder and starts it with no capabilities;
+- only `transport = "stdio"` is accepted;
+- Windows: native binaries only (scripts are rejected because the interpreter
+  lives outside the container); the host runs `plugin-sandbox`, which copies the
+  install directory into a per-run AppContainer profile folder and starts it
+  with no capabilities;
+- Linux: the host runs `unshare -Urn -- <program>`; the plugin gets a fresh
+  network namespace (loopback is not the host's) and no route to the internet;
 - the plugin gets its broker over stdio, so it needs no loopback; a direct
-  `TcpStream` connect fails with `WSAEACCES`;
-- a missing wrapper or profile failure is fail-closed. The wrapper deletes the
-  profile on normal exit, and the runtime cleans it up again when it has to kill
-  the wrapper. On startup, a sweep removes profiles whose `localreel.pid` marker
-  points at a dead process; live wrappers are kept.
+  outbound connect fails (`WSAEACCES` on Windows);
+- a missing wrapper/unshare or profile failure is fail-closed. On Windows the
+  wrapper deletes the profile on normal exit, the runtime cleans it up after a
+  kill, and startup sweeps profiles whose `localreel.pid` marker points at a
+  dead process.
 
 These limits do not apply to HTTP-transport plugins, which still use loopback
 and can open their own socket. `fs.read` now has a broker endpoint, but storage

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns)
 - Date: 2026-11-08
 
 ## Context
@@ -134,6 +134,11 @@ The CMS/collector probe made the gap concrete:
     `transport` and `sandbox` so the admin UI can distinguish HTTP/stdio and
     none/AppContainer without reading logs. Failed/disabled entries keep the
     configured sandbox intent when the server resolves it.
+25. **Phase 3.18 extends the OS boundary to Linux.** `app_container = true`
+    runs stdio plugins under `unshare -Urn`, giving them a fresh network
+    namespace with the stdio broker as their only channel. macOS is rejected;
+    the Linux mechanism is validated at the shell level in WSL, not by a Rust
+    test yet.
 
 ## Consequences
 

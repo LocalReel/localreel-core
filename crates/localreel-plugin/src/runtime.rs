@@ -94,8 +94,8 @@ pub struct PluginSandbox {
     pub host_url: Option<String>,
     /// Resource ceilings applied to the plugin process tree.
     pub limits: crate::limits::PluginLimits,
-    /// Windows-only: run the plugin inside an AppContainer with no network
-    /// capabilities. Requires `sandbox_program` (the `plugin-sandbox` wrapper).
+    /// OS network isolation: AppContainer on Windows, `unshare -Urn` on Linux.
+    /// Requires `sandbox_program` on Windows (the `plugin-sandbox` wrapper).
     pub app_container: bool,
     /// Path to the `plugin-sandbox` wrapper; defaults to a sibling executable.
     pub sandbox_program: Option<std::path::PathBuf>,
@@ -203,7 +203,53 @@ fn appcontainer_profile_name(manifest: &Manifest, token: &str) -> String {
     format!("localreel-{profile}-{suffix}")
 }
 
-fn appcontainer_command(
+fn isolated_command(
+    program: &Path,
+    manifest: &Manifest,
+    token: &str,
+    config: &str,
+    sandbox: &PluginSandbox,
+    profile: &str,
+) -> Result<Command, PluginError> {
+    #[cfg(windows)]
+    {
+        windows_appcontainer_command(program, manifest, token, config, sandbox, profile)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_netns_command(program, manifest, token, config, sandbox)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (program, manifest, token, config, sandbox, profile);
+        Err(PluginError::NotReady(
+            "OS network isolation is not supported on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_netns_command(
+    program: &Path,
+    manifest: &Manifest,
+    token: &str,
+    config: &str,
+    sandbox: &PluginSandbox,
+) -> Result<Command, PluginError> {
+    let mut command = Command::new("unshare");
+    command
+        .arg("-Urn")
+        .arg("--")
+        .arg(program)
+        .args(&manifest.entry.args);
+    if let Some(dir) = &sandbox.working_dir {
+        command.current_dir(dir);
+    }
+    Ok(apply_plugin_env(command, manifest, token, config, sandbox))
+}
+
+#[cfg(windows)]
+fn windows_appcontainer_command(
     program: &Path,
     manifest: &Manifest,
     token: &str,
@@ -380,10 +426,12 @@ impl PluginRuntime {
     ) -> Result<Self, PluginError> {
         let (mut command, appcontainer_profile) = if sandbox.app_container {
             let profile = appcontainer_profile_name(manifest, &token);
-            (
-                appcontainer_command(program, manifest, &token, config, sandbox, &profile)?,
-                Some(profile),
-            )
+            let command = isolated_command(program, manifest, &token, config, sandbox, &profile)?;
+            #[cfg(windows)]
+            let profile = Some(profile);
+            #[cfg(not(windows))]
+            let profile = None;
+            (command, profile)
         } else {
             (
                 sandboxed_command(program, manifest, &token, config, sandbox),
