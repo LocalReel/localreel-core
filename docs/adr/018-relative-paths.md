@@ -1,4 +1,4 @@
-# ADR-018: Relative paths belong to the config file
+# ADR-018: Relative paths belong to the install directory
 
 - Status: Accepted
 - Date: 2026-11-08
@@ -17,27 +17,37 @@ old one looks like it vanished. Launch methods differ by user: a shortcut with
 "Start in", a double-click (the executable's folder), a terminal (its current
 directory), a service manager, a scheduled task.
 
+A household server is also expected to behave like a folder of software: copy
+the installed folder to another drive and it keeps working, library included.
+That is what the portable layout already did, and what the per-user install
+should do too.
+
 ## Decision
 
-Every configured path is made absolute once, at load time.
+Every configured path is made absolute once, at load time, against a stable
+base.
 
-- A value from the config file is resolved against **the config file's
-  directory**. `dir = "data"` next to a portable `localreel.toml` stays next to
-  that package; a config in `%APPDATA%` keeps its data beside itself.
+- A relative path from the config file is resolved against **the program's
+  directory**, the folder that contains `localreel.exe`.
 - A value from `LOCALREEL_*` is resolved against the working directory once, as
   a command-line argument would be, and is then absolute.
 - Absolute values pass through untouched.
 - The resolved `data_dir` is logged at startup and shown in the banner, so the
   effective location is never inferred from the configured spelling.
+- The program directory is the reference point even when the config lives in
+  `%APPDATA%`: an installed copy keeps its library next to itself.
 
 ## Consequences
 
-- Starting the server from any folder now yields the same library.
-- A portable package keeps working: its config sits next to the executable, so
-  file-relative values point where they always did.
-- Moving the config file moves the relative paths with it. An operator who wants
-  a location pinned to a drive writes an absolute path; the installer and the
-  documentation recommend that when the library is on another volume.
+- Starting the server from any folder yields the same library.
+- Moving or copying the installed folder moves the library with it.
+- The installer must not treat the install folder as purely its own: uninstall
+  removes only the files recorded in `install.json` and leaves everything else,
+  which is how a library under `<install>\data` survives. The zip uninstaller
+  moves that folder aside and back.
+- An all-users install under `C:\Program Files` cannot write next to itself; a
+  relative `[data] dir` there fails to create the library, so the documentation
+  recommends an absolute path for machine-wide installs.
 - The remaining working-directory dependency is deliberate: legacy adoption
   (`<exe dir>/data`, `<cwd>/data`) only runs when no data directory was
   configured and the platform location is empty, and ffmpeg discovery also

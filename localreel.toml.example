@@ -10,9 +10,9 @@ allow_remote = false
 # web_dir = "../localreel-web/dist"
 
 [data]
-# Relative paths are resolved against this file's directory, not the working
-# directory the server happened to start in. Prefer an absolute path here when
-# the config lives in %APPDATA% and the library on another drive.
+# Relative paths are resolved against the program's directory (the install
+# folder), so the library follows the installation. Use an absolute path to pin
+# it somewhere else.
 dir = "data"
 # db = "data/localreel.db"
 

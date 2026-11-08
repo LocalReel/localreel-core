@@ -328,15 +328,14 @@ impl Config {
     /// Make every configured path absolute.
     ///
     /// A relative `[data] dir` used to be interpreted against the process
-    /// working directory, which changes with the launch method: a shortcut, a
-    /// double-click and a terminal all differ, so the library (and every cache
-    /// under it) could land in a different place each time. The config file is
-    /// the stable reference point: `dir = "data"` next to a portable package
-    /// stays next to that package.
+    /// working directory, which changes with the launch method and moved the
+    /// library with it. It is anchored to the program's own directory instead:
+    /// the library follows the installation, so moving or copying the installed
+    /// folder takes the library along, which is how a self-contained household
+    /// server is expected to behave.
     fn resolve_paths(&mut self, source: Option<&Path>) {
-        let base = source
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
+        let base = paths::exe_dir()
+            .or_else(|| source.and_then(Path::parent).map(Path::to_path_buf))
             .or_else(|| std::env::current_dir().ok());
         let Some(base) = base else {
             return;
@@ -1130,7 +1129,7 @@ enabled = false
     }
 
     #[test]
-    fn relative_paths_are_anchored_to_the_config_file() {
+    fn relative_paths_are_anchored_to_the_install_directory() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("localreel.toml");
         std::fs::write(&config_path, "[data]\ndir = \"library\"\n").unwrap();
@@ -1140,11 +1139,12 @@ enabled = false
         config.apply_file(parsed).unwrap();
         config.resolve_paths(Some(&config_path));
 
-        assert_eq!(config.data_dir, dir.path().join("library"));
-        assert_eq!(config.db_path, dir.path().join("library/localreel.db"));
+        let install = crate::paths::exe_dir().expect("the test binary has a directory");
+        assert_eq!(config.data_dir, install.join("library"));
+        assert_eq!(config.db_path, install.join("library/localreel.db"));
         assert_eq!(
             config.media.thumbnail_dir,
-            dir.path().join("library/thumbnails")
+            install.join("library/thumbnails")
         );
     }
 
