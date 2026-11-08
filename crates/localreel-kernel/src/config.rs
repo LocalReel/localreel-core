@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::error::{KernelError, Result};
 use crate::paths::{self, Dirs, Env, Os};
+use crate::time::now_secs;
 
 /// How this process should present itself.
 ///
@@ -183,6 +184,17 @@ pub struct PluginPublisherConfig {
     pub id: String,
     /// Ed25519 public key, 32 bytes as 64 hex characters.
     pub public_key: String,
+    /// Unix timestamp after which this key is no longer trusted.
+    pub not_after: Option<i64>,
+    /// Explicit revocation. The key stays in the file for history but is not
+    /// used for verification.
+    pub revoked: bool,
+}
+
+impl PluginPublisherConfig {
+    pub fn is_active_at(&self, now: i64) -> bool {
+        !self.revoked && self.not_after.is_none_or(|expires| expires > now)
+    }
 }
 
 /// How the host treats plugins that fail to start.
@@ -545,6 +557,8 @@ impl Config {
                 .map(|publisher| PluginPublisherConfig {
                     id: publisher.id,
                     public_key: publisher.public_key,
+                    not_after: publisher.not_after,
+                    revoked: publisher.revoked,
                 })
                 .collect();
         }
@@ -736,9 +750,14 @@ impl Config {
                         "plugin publisher must not be empty".into(),
                     ));
                 }
-                if !self.publishers.iter().any(|known| &known.id == publisher) {
+                let now = now_secs();
+                if !self
+                    .publishers
+                    .iter()
+                    .any(|known| &known.id == publisher && known.is_active_at(now))
+                {
                     return Err(KernelError::Config(format!(
-                        "plugin references unknown publisher '{publisher}'"
+                        "plugin references publisher '{publisher}' with no active key"
                     )));
                 }
                 let Some(signature) = &plugin.signature else {
@@ -773,10 +792,10 @@ impl Config {
             }
             if self.publishers[..index]
                 .iter()
-                .any(|known| known.id == publisher.id)
+                .any(|known| known.id == publisher.id && known.public_key == publisher.public_key)
             {
                 return Err(KernelError::Config(format!(
-                    "duplicate publisher id '{}'",
+                    "duplicate publisher key for '{}'",
                     publisher.id
                 )));
             }
@@ -970,6 +989,10 @@ struct PluginFile {
 struct PluginPublisherFile {
     id: String,
     public_key: String,
+    #[serde(default)]
+    not_after: Option<i64>,
+    #[serde(default)]
+    revoked: bool,
 }
 
 fn default_true() -> bool {
@@ -1207,6 +1230,39 @@ mod tests {
         .unwrap();
         let mut config = Config::default();
         config.apply_file(file).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_rotated_publisher_keys_and_requires_an_active_one() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+            [[publishers]]
+            id = "acme"
+            public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            revoked = true
+
+            [[publishers]]
+            id = "acme"
+            public_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [[plugins]]
+            package = "C:/plugins/demo.lrplug"
+            publisher = "acme"
+            signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.publishers.len(), 2);
+
+        config.publishers[1].revoked = true;
+        assert!(config.validate().is_err());
+
+        config.publishers[1].revoked = false;
+        config.publishers[1].not_after = Some(1);
         assert!(config.validate().is_err());
     }
 

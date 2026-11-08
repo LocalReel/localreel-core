@@ -392,8 +392,25 @@ the trusted key **before** inspect/extract; a missing key, malformed signature
 or mismatch is a permanent start failure.
 
 The trust anchor is the configuration file: an attacker who can rewrite it can
-also replace the publisher key. Key rotation, revocation and a transparency log
-are not implemented; the host does not claim those properties.
+also replace the publisher key. Key rotation is supported by listing several
+keys with the same publisher id:
+
+```toml
+[[publishers]]
+id = "acme"
+public_key = "old key"
+revoked = true
+
+[[publishers]]
+id = "acme"
+public_key = "new key"
+not_after = 1798761600
+```
+
+Only keys that are neither revoked nor past `not_after` verify a package; a
+plugin whose publisher has no active key is rejected at config validation. This
+is rotation/revocation by configuration, not a transparency log: there is no
+append-only record of which key signed which release.
 
 ## Resource ceilings (phase 3.3)
 

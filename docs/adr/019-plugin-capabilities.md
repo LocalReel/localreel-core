@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation)
 - Date: 2026-11-08
 
 ## Context
@@ -73,8 +73,7 @@ The CMS/collector probe made the gap concrete:
 12. **Phase 3.2 adds publisher signatures.** `[[publishers]]` stores trusted
     Ed25519 public keys; a plugin may name `publisher` and `signature` over the
     package digest. The supervisor verifies before extraction; the config file is
-    the trust anchor. Key rotation, revocation and a transparency log are not
-    implemented.
+    the trust anchor. A transparency log is not implemented.
 13. **Phase 3.3 adds resource ceilings.** `[plugin_runtime] max_memory_mb` and
     `max_processes` bound one plugin tree: Windows applies both to the Job Object,
     Unix applies `RLIMIT_AS` (process count is not enforced on Unix yet). This is
@@ -84,7 +83,11 @@ The CMS/collector probe made the gap concrete:
     The storage adapter and SDK support both transports. This removes the need
     for a listening port, not the ability to open one: OS network isolation is
     still required.
-15. **`fs.read` remains legacy** (source roots handed directly) and is not
+15. **Phase 3.5 adds key rotation/revocation.** Several `[[publishers]]` entries
+    may share an id; only keys with `revoked = false` and a future `not_after`
+    verify. Config validation requires at least one active key for a publisher a
+    plugin references. This is configuration lifecycle, not a transparency log.
+16. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation.
 

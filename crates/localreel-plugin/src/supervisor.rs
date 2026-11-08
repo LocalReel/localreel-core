@@ -294,14 +294,29 @@ fn spawn(
         }
     }
     if let Some(signature) = &spec.expected_signature {
-        let Some(public_key) = &spec.publisher_public_key else {
+        if spec.publisher_public_keys.is_empty() {
             return Err((
                 "signed plugin has no trusted publisher key".to_string(),
                 true,
             ));
-        };
-        verify_signature(&spec.package, signature, public_key)
-            .map_err(|error| (error.to_string(), true))?;
+        }
+        let mut last_error = None;
+        let mut verified = false;
+        for public_key in &spec.publisher_public_keys {
+            match verify_signature(&spec.package, signature, public_key) {
+                Ok(()) => {
+                    verified = true;
+                    break;
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if !verified {
+            return Err((
+                last_error.unwrap_or_else(|| "signature did not verify".to_string()),
+                true,
+            ));
+        }
     }
     let version_dir = install_root.join(&spec.manifest.version);
     let manifest = extract(&spec.package, &version_dir)
@@ -623,7 +638,7 @@ mod tests {
         let spec = PluginSpec::new(package, manifest, serde_json::json!({}), true).with_signature(
             Some("acme".into()),
             Some("00".repeat(64)),
-            Some(public_key),
+            vec![public_key],
         );
         let result = spawn(
             &spec,

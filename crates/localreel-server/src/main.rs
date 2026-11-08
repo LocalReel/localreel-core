@@ -718,13 +718,19 @@ async fn serve(
                 // starts, so a source that points at it can answer
                 // "unavailable" instead of "unknown".
                 storage.declare(manifest.id.clone());
-                let publisher_key = plugin.publisher.as_ref().and_then(|id| {
-                    config
-                        .publishers
-                        .iter()
-                        .find(|publisher| &publisher.id == id)
-                        .map(|publisher| publisher.public_key.clone())
-                });
+                let publisher_keys = plugin
+                    .publisher
+                    .as_ref()
+                    .map(|id| {
+                        let now = localreel_kernel::time::now_secs();
+                        config
+                            .publishers
+                            .iter()
+                            .filter(|publisher| &publisher.id == id && publisher.is_active_at(now))
+                            .map(|publisher| publisher.public_key.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 specs.push(
                     localreel_plugin::PluginSpec::new(
                         package.clone(),
@@ -736,7 +742,7 @@ async fn serve(
                     .with_signature(
                         plugin.publisher.clone(),
                         plugin.signature.clone(),
-                        publisher_key,
+                        publisher_keys,
                     ),
                 );
                 if !plugin.enabled {

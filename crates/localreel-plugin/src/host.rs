@@ -196,7 +196,8 @@ pub struct PluginSpec {
     /// Optional publisher id and its Ed25519 signature over the package digest.
     pub publisher: Option<String>,
     pub expected_signature: Option<String>,
-    pub publisher_public_key: Option<String>,
+    /// Active trusted keys for `publisher`; rotation may leave several here.
+    pub publisher_public_keys: Vec<String>,
     /// `false` means "present in the configuration, switched off". The spec is
     /// kept so an admin can enable it later without a restart.
     pub enabled: bool,
@@ -217,7 +218,7 @@ impl PluginSpec {
             expected_sha256: None,
             publisher: None,
             expected_signature: None,
-            publisher_public_key: None,
+            publisher_public_keys: Vec::new(),
             enabled,
         }
     }
@@ -231,11 +232,11 @@ impl PluginSpec {
         mut self,
         publisher: Option<String>,
         signature: Option<String>,
-        public_key: Option<String>,
+        public_keys: Vec<String>,
     ) -> Self {
         self.publisher = publisher;
         self.expected_signature = signature;
-        self.publisher_public_key = public_key;
+        self.publisher_public_keys = public_keys;
         self
     }
 }
