@@ -50,5 +50,7 @@ loopback is needed.
   `1.1.1.1:80` connect is denied.
 - Interpreter plugins are rejected (the interpreter is outside the package).
 - The wrapper deletes the profile on normal exit; `PluginRuntime::drop` repeats
-  the cleanup after a kill. Crashes before either path can still leave a profile.
+  the cleanup after a kill. Server startup sweeps profiles whose
+  `localreel.pid` marker points at a dead process; a crash before the marker is
+  written can still leave one behind.
 - Unix/macOS network isolation is still absent.

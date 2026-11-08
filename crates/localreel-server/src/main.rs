@@ -692,6 +692,13 @@ async fn serve(
     // Start configured sidecar plugins before anything resolves a source.
     // The plugin audit table has its own migration stream.
     migrations::apply(&db, "plugin", localreel_plugin::audit::migrations())?;
+    if config.plugin_runtime.app_container {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            localreel_plugin::runtime::sweep_stale_appcontainers(
+                &std::path::PathBuf::from(local).join("Packages"),
+            );
+        }
+    }
     let storage = Arc::new(localreel_media::StorageRegistry::new());
     let plugin_host = localreel_plugin::PluginHost::with_options_and_limits(
         db.clone(),

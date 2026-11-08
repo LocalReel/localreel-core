@@ -101,6 +101,12 @@ pub struct PluginSandbox {
     pub sandbox_program: Option<std::path::PathBuf>,
 }
 
+/// Sweep AppContainer profiles left behind by a crash. `root` is normally
+/// `%LOCALAPPDATA%\Packages`; profiles whose wrapper PID is still alive are kept.
+pub fn sweep_stale_appcontainers(root: &Path) {
+    platform::sweep_stale_appcontainers(root);
+}
+
 /// A bounded tail of the plugin's stderr.
 #[derive(Default)]
 struct StderrRing {

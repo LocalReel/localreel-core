@@ -40,9 +40,83 @@ pub fn cleanup_appcontainer(profile: &str) {
 #[cfg(not(windows))]
 pub fn cleanup_appcontainer(_profile: &str) {}
 
+/// Remove AppContainer profiles whose wrapper is no longer running.
+///
+/// `root` is normally `%LOCALAPPDATA%\Packages`. A profile is only touched when
+/// it has a `localreel.pid` marker and that PID is gone; a live wrapper (another
+/// server, or this one) is left alone. The marker is written by `plugin-sandbox`
+/// before the child starts.
+#[cfg(windows)]
+pub fn sweep_stale_appcontainers(root: &std::path::Path) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("localreel-") {
+            continue;
+        }
+        let path = entry.path();
+        let marker = path.join("localreel.pid");
+        let Ok(pid) = std::fs::read_to_string(&marker) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if !handle.is_null() {
+            let mut code = 0u32;
+            let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+            unsafe { CloseHandle(handle) };
+            if ok != 0 && code == 259 {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        let profile = wide(name);
+        unsafe {
+            DeleteAppContainerProfile(profile.as_ptr());
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn sweep_stale_appcontainers(_root: &std::path::Path) {}
+
 #[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_removes_dead_profiles_and_keeps_live_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let dead = root.path().join("localreel-dead-test");
+        let alive = root.path().join("localreel-alive-test");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&alive).unwrap();
+        std::fs::write(dead.join("localreel.pid"), u32::MAX.to_string()).unwrap();
+        std::fs::write(alive.join("localreel.pid"), std::process::id().to_string()).unwrap();
+
+        sweep_stale_appcontainers(root.path());
+
+        assert!(!dead.exists());
+        assert!(alive.exists());
+    }
 }
 
 /// Prepare a command for tree-aware lifecycle handling and resource ceilings.

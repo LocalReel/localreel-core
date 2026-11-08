@@ -119,6 +119,11 @@ fn run() -> Result<(), String> {
     }
     let profile_dir = std::path::PathBuf::from(pwstr_to_string(folder));
     unsafe { LocalFree(folder as *mut c_void) };
+    let marker_dir = profile_dir.parent().unwrap_or(&profile_dir);
+    let _ = std::fs::write(
+        marker_dir.join("localreel.pid"),
+        std::process::id().to_string(),
+    );
 
     let plugin_dir = profile_dir.join("plugin");
     if plugin_dir.exists() {

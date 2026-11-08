@@ -107,8 +107,9 @@ The CMS/collector probe made the gap concrete:
     `plugin-sandbox`, which copies the install directory into a per-run
     AppContainer profile and starts the child with no capabilities. Tests prove
     the broker works over stdio and a raw `1.1.1.1:80` connect is denied. The
-    wrapper and the runtime both delete the profile on normal exit/kill;
-    interpreter scripts are rejected.
+    wrapper and the runtime both delete the profile on normal exit/kill; a
+    startup sweep removes profiles whose marker PID is no longer alive.
+    Interpreter scripts are rejected.
 20. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation on other platforms and profile lifecycle.

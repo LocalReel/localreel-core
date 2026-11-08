@@ -450,7 +450,8 @@ app_container = true
   `TcpStream` connect fails with `WSAEACCES`;
 - a missing wrapper or profile failure is fail-closed. The wrapper deletes the
   profile on normal exit, and the runtime cleans it up again when it has to kill
-  the wrapper.
+  the wrapper. On startup, a sweep removes profiles whose `localreel.pid` marker
+  points at a dead process; live wrappers are kept.
 
 These limits do not apply to HTTP-transport plugins, which still use loopback
 and can open their own socket. `fs.read` source roots are also still handed
