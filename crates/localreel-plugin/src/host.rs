@@ -41,6 +41,7 @@ use crate::capability::{
 use crate::catalog::CatalogDraftStore;
 use crate::gate::Gate;
 use crate::grants::{CapabilityGrant, GrantStore};
+use crate::limits::PluginLimits;
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
 use crate::package::inspect;
 use crate::runtime::PluginRuntime;
@@ -286,6 +287,7 @@ pub(crate) struct Shared {
     pub(crate) catalog: Option<CatalogDraftStore>,
     pub(crate) schedules: Option<ScheduleStore>,
     pub(crate) blobs: Option<BlobStore>,
+    pub(crate) limits: PluginLimits,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
     pub(crate) host_url: RwLock<Option<String>>,
@@ -375,6 +377,7 @@ impl Default for PluginHost {
             None,
             None,
             None,
+            PluginLimits::default(),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -390,6 +393,7 @@ impl PluginHost {
             Some(CatalogDraftStore::new(db.clone())),
             Some(ScheduleStore::new(db.clone())),
             Some(BlobStore::new(db)),
+            PluginLimits::default(),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -398,6 +402,15 @@ impl PluginHost {
     /// The server's constructor: where generations install, and how long a stop
     /// waits for in-flight requests.
     pub fn with_options(db: Database, install_root: PathBuf, stop_timeout: Duration) -> Self {
+        Self::with_options_and_limits(db, install_root, stop_timeout, PluginLimits::default())
+    }
+
+    pub fn with_options_and_limits(
+        db: Database,
+        install_root: PathBuf,
+        stop_timeout: Duration,
+        limits: PluginLimits,
+    ) -> Self {
         Self::build(
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
@@ -405,6 +418,7 @@ impl PluginHost {
             Some(CatalogDraftStore::new(db.clone())),
             Some(ScheduleStore::new(db.clone())),
             Some(BlobStore::new(db)),
+            limits,
             install_root,
             stop_timeout,
         )
@@ -418,6 +432,7 @@ impl PluginHost {
         catalog: Option<CatalogDraftStore>,
         schedules: Option<ScheduleStore>,
         blobs: Option<BlobStore>,
+        limits: PluginLimits,
         install_root: PathBuf,
         stop_timeout: Duration,
     ) -> Self {
@@ -430,6 +445,7 @@ impl PluginHost {
                 catalog,
                 schedules,
                 blobs,
+                limits,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
                 install_root,

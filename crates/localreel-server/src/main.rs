@@ -693,10 +693,14 @@ async fn serve(
     // The plugin audit table has its own migration stream.
     migrations::apply(&db, "plugin", localreel_plugin::audit::migrations())?;
     let storage = Arc::new(localreel_media::StorageRegistry::new());
-    let plugin_host = localreel_plugin::PluginHost::with_options(
+    let plugin_host = localreel_plugin::PluginHost::with_options_and_limits(
         db.clone(),
         config.data_dir.join("plugins"),
         config.plugin_runtime.stop_timeout,
+        localreel_plugin::PluginLimits {
+            max_memory_bytes: config.plugin_runtime.max_memory_bytes,
+            max_processes: config.plugin_runtime.max_processes,
+        },
     );
     let broker_host = match config.host.as_str() {
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1",

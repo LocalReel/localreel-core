@@ -199,6 +199,10 @@ pub struct PluginRuntimeConfig {
     /// How long a stop waits for in-flight plugin requests before the process
     /// is killed. Also used by the shutdown path.
     pub stop_timeout: Duration,
+    /// Address-space ceiling for one plugin process tree.
+    pub max_memory_bytes: u64,
+    /// Process-count ceiling (Windows Job Object; Unix enforced elsewhere).
+    pub max_processes: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +305,8 @@ impl Default for Config {
             plugin_runtime: PluginRuntimeConfig {
                 strict: false,
                 stop_timeout: Duration::from_secs(5),
+                max_memory_bytes: 512 * 1024 * 1024,
+                max_processes: 16,
             },
             update: UpdateConfig::default(),
         }
@@ -548,6 +554,12 @@ impl Config {
         if let Some(value) = file.plugin_runtime.stop_timeout_secs {
             self.plugin_runtime.stop_timeout = Duration::from_secs(value);
         }
+        if let Some(value) = file.plugin_runtime.max_memory_mb {
+            self.plugin_runtime.max_memory_bytes = value.saturating_mul(1024 * 1024);
+        }
+        if let Some(value) = file.plugin_runtime.max_processes {
+            self.plugin_runtime.max_processes = value;
+        }
         if let Some(value) = file.update.check {
             self.update.check = value;
         }
@@ -774,6 +786,17 @@ impl Config {
                 "plugin stop timeout must be greater than 0".into(),
             ));
         }
+        let memory = self.plugin_runtime.max_memory_bytes;
+        if !(16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&memory) {
+            return Err(KernelError::Config(
+                "plugin max_memory_mb must be 16..=16384".into(),
+            ));
+        }
+        if !(1..=256).contains(&self.plugin_runtime.max_processes) {
+            return Err(KernelError::Config(
+                "plugin max_processes must be 1..=256".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -924,6 +947,8 @@ struct UpdateFile {
 struct PluginRuntimeFile {
     strict: Option<bool>,
     stop_timeout_secs: Option<u64>,
+    max_memory_mb: Option<u64>,
+    max_processes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1242,6 +1267,8 @@ enabled = false
             [plugin_runtime]
             strict = true
             stop_timeout_secs = 2
+            max_memory_mb = 256
+            max_processes = 8
             "#,
         )
         .unwrap();
@@ -1249,6 +1276,8 @@ enabled = false
         config.apply_file(file).unwrap();
         assert!(config.plugin_runtime.strict);
         assert_eq!(config.plugin_runtime.stop_timeout, Duration::from_secs(2));
+        assert_eq!(config.plugin_runtime.max_memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.plugin_runtime.max_processes, 8);
     }
 
     #[test]

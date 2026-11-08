@@ -45,6 +45,7 @@ fn probe_can_open_a_raw_socket_until_sandboxed() {
             working_dir: None,
             roots: Vec::new(),
             host_url: None,
+            limits: Default::default(),
         },
     )
     .expect("probe plugin starts");

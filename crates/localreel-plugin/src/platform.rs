@@ -14,20 +14,42 @@
 
 use std::process::{Child, Command};
 
-/// Prepare a command for tree-aware lifecycle handling.
-pub fn configure(_command: &mut Command) {
+use crate::limits::PluginLimits;
+
+/// Prepare a command for tree-aware lifecycle handling and resource ceilings.
+pub fn configure(command: &mut Command, limits: PluginLimits) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // The child becomes the leader of a new process group; signalling
         // `-pid` then reaches every helper it spawns.
-        _command.process_group(0);
+        command.process_group(0);
+        // Address-space ceiling before exec. `RLIMIT_NPROC` is per-user, not
+        // per-tree, so process-count enforcement stays a Windows Job Object
+        // property for now; the Unix side at least stops memory blow-ups.
+        let max = limits.max_memory_bytes as libc::rlim_t;
+        unsafe {
+            command.pre_exec(move || {
+                let limit = libc::rlimit {
+                    rlim_cur: max,
+                    rlim_max: max,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, limits);
     }
 }
 
 /// Attach the freshly spawned child to the host's lifecycle guard.
-pub fn attach(child: &mut Child) -> Guard {
-    Guard::new(child)
+pub fn attach(child: &mut Child, limits: PluginLimits) -> Guard {
+    Guard::new(child, limits)
 }
 
 /// Terminate the child and everything it spawned.
@@ -54,17 +76,17 @@ pub struct Guard {
 
 impl Guard {
     #[cfg(windows)]
-    fn new(child: &mut Child) -> Self {
+    fn new(child: &mut Child, limits: PluginLimits) -> Self {
         // A job whose handle is closed kills everything inside it. Attaching
         // fails only when the process already has a job that forbids nesting;
         // the entry process is still killed by `terminate`, just not its
         // helpers.
-        let job = JobHandle::create().and_then(|job| job.assign(child).then_some(job));
+        let job = JobHandle::create(limits).and_then(|job| job.assign(child).then_some(job));
         Self { job }
     }
 
     #[cfg(not(windows))]
-    fn new(_child: &mut Child) -> Self {
+    fn new(_child: &mut Child, _limits: PluginLimits) -> Self {
         Self {}
     }
 
@@ -89,11 +111,12 @@ struct JobHandle {
 
 #[cfg(windows)]
 impl JobHandle {
-    fn create() -> Option<Self> {
+    fn create(limits: PluginLimits) -> Option<Self> {
         use std::sync::atomic::AtomicBool;
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         };
 
         unsafe {
@@ -101,12 +124,17 @@ impl JobHandle {
             if handle.is_null() {
                 return None;
             }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let mut limits_struct: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits_struct.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits_struct.BasicLimitInformation.ActiveProcessLimit = limits.max_processes;
+            limits_struct.ProcessMemoryLimit =
+                usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX);
             let assigned = SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const core::ffi::c_void,
+                &limits_struct as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
             if assigned == 0 {

@@ -21,6 +21,7 @@ mod gate;
 pub mod grants;
 pub mod host;
 pub mod http;
+pub mod limits;
 pub mod manifest;
 pub mod package;
 mod platform;
@@ -46,6 +47,7 @@ pub use host::{
     CapabilityReport, PluginDescriptor, PluginFailure, PluginHost, PluginSpec, PluginState,
     ProxyResponse,
 };
+pub use limits::PluginLimits;
 pub use manifest::{
     Manifest, PluginError, PluginKind, API_VERSION, PERMISSION_NETWORK, PERMISSION_STORAGE_READ,
 };

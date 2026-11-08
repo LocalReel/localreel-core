@@ -75,6 +75,8 @@ pub struct PluginSandbox {
     /// Base URL of the host, for plugins that need to call the capability
     /// broker. Loopback in phase 2; phase 3 replaces it with a non-TCP channel.
     pub host_url: Option<String>,
+    /// Resource ceilings applied to the plugin process tree.
+    pub limits: crate::limits::PluginLimits,
 }
 
 /// A bounded tail of the plugin's stderr.
@@ -177,7 +179,7 @@ impl PluginRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        platform::configure(&mut command);
+        platform::configure(&mut command, sandbox.limits);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -188,7 +190,7 @@ impl PluginRuntime {
             .spawn()
             .map_err(|error| PluginError::NotReady(format!("cannot start plugin: {error}")))?;
         // Attach the tree before the plugin can fork helpers of its own.
-        let guard = platform::attach(&mut child);
+        let guard = platform::attach(&mut child, sandbox.limits);
         let stdout = child
             .stdout
             .take()
@@ -404,6 +406,7 @@ mod tests {
             working_dir: Some(std::path::PathBuf::from("data/plugins/example")),
             roots: vec!["https://nas/dav".to_string()],
             host_url: Some("http://127.0.0.1:3001".to_string()),
+            limits: Default::default(),
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin.js"),
@@ -452,6 +455,7 @@ mod tests {
             working_dir: None,
             roots: vec!["/library".to_string(), "https://nas/dav".to_string()],
             host_url: None,
+            limits: Default::default(),
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin"),

@@ -395,6 +395,24 @@ The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation, revocation and a transparency log
 are not implemented; the host does not claim those properties.
 
+## Resource ceilings (phase 3.3)
+
+```toml
+[plugin_runtime]
+max_memory_mb = 512
+max_processes = 16
+```
+
+- Windows: both limits are set on the plugin's Job Object
+  (`JOB_OBJECT_LIMIT_PROCESS_MEMORY` and `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`).
+- Unix: `RLIMIT_AS` is applied before exec; the process-count limit is **not**
+  enforced there yet (`RLIMIT_NPROC` is per-user, not per-tree).
+- Defaults: 512 MiB and 16 processes; config validation bounds memory to
+  16 MiB–16 GiB and processes to 1–256.
+
+These limits do not block network access. A plugin can still open its own
+socket; transport/OS isolation remains the next phase.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it

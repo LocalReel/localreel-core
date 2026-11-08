@@ -71,6 +71,7 @@ fn sidecar_serves_stat_list_walk_and_ranges() {
                 working_dir: Some(install.clone()),
                 roots: vec![library.to_string_lossy().into_owned()],
                 host_url: None,
+                limits: Default::default(),
             },
         )
         .unwrap(),

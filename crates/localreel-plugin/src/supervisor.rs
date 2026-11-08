@@ -9,7 +9,7 @@
 //! Copied from Cordis: the state machine, the "one transition at a time"
 //! discipline, and the rule that a plugin is not torn down while its callers
 //! are still inside it. Not copied from Cordis: everything that only makes
-//! sense when the plugin cannot die — backoff, crash detection, and the fact
+//! sense when the plugin cannot die 鈥?backoff, crash detection, and the fact
 //! that a failure is a state rather than an exception.
 
 use std::path::Path;
@@ -222,7 +222,7 @@ fn start_entry(shared: &Arc<Shared>, sink: &Arc<dyn ProviderSink>, id: &str) {
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    match spawn(&spec, &install_root, roots, host_url) {
+    match spawn(&spec, &install_root, roots, host_url, shared.limits) {
         Ok(runtime) => {
             let gate = Gate::new();
             sink.register(
@@ -282,6 +282,7 @@ fn spawn(
     install_root: &Path,
     roots: Vec<String>,
     host_url: Option<String>,
+    limits: crate::limits::PluginLimits,
 ) -> std::result::Result<Arc<PluginRuntime>, (String, bool)> {
     if let Some(expected) = &spec.expected_sha256 {
         let actual = digest(&spec.package).map_err(|error| (error.to_string(), true))?;
@@ -314,6 +315,7 @@ fn spawn(
             working_dir: Some(install_root.to_path_buf()),
             roots,
             host_url,
+            limits,
         },
     )
     .map_err(|error| (error.to_string(), is_permanent(&error)))?;
@@ -623,7 +625,13 @@ mod tests {
             Some("00".repeat(64)),
             Some(public_key),
         );
-        let result = spawn(&spec, &dir.path().join("install"), Vec::new(), None);
+        let result = spawn(
+            &spec,
+            &dir.path().join("install"),
+            Vec::new(),
+            None,
+            crate::limits::PluginLimits::default(),
+        );
         let error = match result {
             Ok(_) => panic!("a bad signature must not start"),
             Err(error) => error,
@@ -650,7 +658,13 @@ mod tests {
         .unwrap();
         let spec = PluginSpec::new(package, manifest, serde_json::json!({}), true)
             .with_sha256(Some("00".repeat(32)));
-        let result = spawn(&spec, &dir.path().join("install"), Vec::new(), None);
+        let result = spawn(
+            &spec,
+            &dir.path().join("install"),
+            Vec::new(),
+            None,
+            crate::limits::PluginLimits::default(),
+        );
         let error = match result {
             Ok(_) => panic!("a mismatched package must not start"),
             Err(error) => error,
