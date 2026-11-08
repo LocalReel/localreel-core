@@ -32,9 +32,10 @@ use serde_json::Value;
 use url::Url;
 
 use crate::audit::{AuditEvent, AuditLog};
+use crate::blob::{BlobMeta, BlobStore};
 use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
 use crate::capability::{
-    self, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, NetFetchScope,
+    self, BlobScope, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, NetFetchScope,
     RequestedCapability, ScheduleScope, SecretUseScope, CAPABILITIES,
 };
 use crate::catalog::CatalogDraftStore;
@@ -251,6 +252,7 @@ pub(crate) struct Shared {
     pub(crate) secrets: Option<SecretStore>,
     pub(crate) catalog: Option<CatalogDraftStore>,
     pub(crate) schedules: Option<ScheduleStore>,
+    pub(crate) blobs: Option<BlobStore>,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
     pub(crate) host_url: RwLock<Option<String>>,
@@ -339,6 +341,7 @@ impl Default for PluginHost {
             None,
             None,
             None,
+            None,
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -352,7 +355,8 @@ impl PluginHost {
             Some(GrantStore::new(db.clone())),
             Some(SecretStore::new(db.clone())),
             Some(CatalogDraftStore::new(db.clone())),
-            Some(ScheduleStore::new(db)),
+            Some(ScheduleStore::new(db.clone())),
+            Some(BlobStore::new(db)),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -366,18 +370,21 @@ impl PluginHost {
             Some(GrantStore::new(db.clone())),
             Some(SecretStore::new(db.clone())),
             Some(CatalogDraftStore::new(db.clone())),
-            Some(ScheduleStore::new(db)),
+            Some(ScheduleStore::new(db.clone())),
+            Some(BlobStore::new(db)),
             install_root,
             stop_timeout,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         audit: Option<AuditLog>,
         grants: Option<GrantStore>,
         secrets: Option<SecretStore>,
         catalog: Option<CatalogDraftStore>,
         schedules: Option<ScheduleStore>,
+        blobs: Option<BlobStore>,
         install_root: PathBuf,
         stop_timeout: Duration,
     ) -> Self {
@@ -389,6 +396,7 @@ impl PluginHost {
                 secrets,
                 catalog,
                 schedules,
+                blobs,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
                 install_root,
@@ -417,6 +425,10 @@ impl PluginHost {
 
     pub fn schedules(&self) -> Option<&ScheduleStore> {
         self.shared.schedules.as_ref()
+    }
+
+    pub fn blobs(&self) -> Option<&BlobStore> {
+        self.shared.blobs.as_ref()
     }
 
     /// Tell newly started plugins where the host's capability broker lives.
@@ -1151,6 +1163,166 @@ impl PluginHost {
         Ok(ran)
     }
 
+    pub fn blob_write(&self, token: &str, name: &str, bytes: &[u8]) -> Result<BlobMeta> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.blob_write_for(&plugin_id, &version, name, bytes)
+    }
+
+    fn blob_write_for(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<BlobMeta> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "blob.write");
+        let Some(grant) = grant else {
+            let _ = audit.record(plugin_id, None, "capability.blob.denied", name);
+            return Err(KernelError::PermissionDenied(
+                "blob.write is not granted for this plugin version".to_string(),
+            ));
+        };
+        let scope: BlobScope = serde_json::from_value(grant.scope.clone()).map_err(|error| {
+            KernelError::InvalidInput(format!("stored blob.write scope is invalid: {error}"))
+        })?;
+        let store = self.shared.blobs.as_ref().ok_or_else(|| {
+            KernelError::StorageUnavailable("the blob store is unavailable".to_string())
+        })?;
+        let meta = store.put(plugin_id, name, bytes, scope.quota_bytes)?;
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id,
+            capability: Some("blob.write"),
+            action: "capability.blob.write",
+            result: "allowed",
+            detail: Some(name),
+            scope_digest: Some(&grant.scope_digest),
+            bytes_in: Some(bytes.len() as i64),
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: None,
+        });
+        Ok(meta)
+    }
+
+    pub fn blob_read(&self, token: &str, name: &str) -> Result<Vec<u8>> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.blob_read_for(&plugin_id, &version, name)
+    }
+
+    fn blob_read_for(&self, plugin_id: &str, version: &str, name: &str) -> Result<Vec<u8>> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "blob.read");
+        let Some(grant) = grant else {
+            let _ = audit.record(plugin_id, None, "capability.blob.denied", name);
+            return Err(KernelError::PermissionDenied(
+                "blob.read is not granted for this plugin version".to_string(),
+            ));
+        };
+        let _scope: BlobScope = serde_json::from_value(grant.scope.clone()).map_err(|error| {
+            KernelError::InvalidInput(format!("stored blob.read scope is invalid: {error}"))
+        })?;
+        let store = self.shared.blobs.as_ref().ok_or_else(|| {
+            KernelError::StorageUnavailable("the blob store is unavailable".to_string())
+        })?;
+        let bytes = store
+            .get(plugin_id, name)?
+            .ok_or_else(|| KernelError::NotFound(format!("blob '{name}'")))?;
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id,
+            capability: Some("blob.read"),
+            action: "capability.blob.read",
+            result: "allowed",
+            detail: Some(name),
+            scope_digest: Some(&grant.scope_digest),
+            bytes_in: None,
+            bytes_out: Some(bytes.len() as i64),
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: None,
+        });
+        Ok(bytes)
+    }
+
+    pub fn blob_delete(&self, token: &str, name: &str) -> Result<bool> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.blob_delete_for(&plugin_id, &version, name)
+    }
+
+    fn blob_delete_for(&self, plugin_id: &str, version: &str, name: &str) -> Result<bool> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "blob.write");
+        let Some(grant) = grant else {
+            return Err(KernelError::PermissionDenied(
+                "blob.write is not granted for this plugin version".to_string(),
+            ));
+        };
+        let store = self.shared.blobs.as_ref().ok_or_else(|| {
+            KernelError::StorageUnavailable("the blob store is unavailable".to_string())
+        })?;
+        let removed = store.delete(plugin_id, name)?;
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id,
+            capability: Some("blob.write"),
+            action: "capability.blob.delete",
+            result: if removed { "allowed" } else { "not_found" },
+            detail: Some(name),
+            scope_digest: Some(&grant.scope_digest),
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: None,
+        });
+        Ok(removed)
+    }
+
     fn apply_secret(
         &self,
         plugin_id: &str,
@@ -1796,6 +1968,65 @@ mod tests {
                 |entry| entry.capability.as_deref() == Some("schedule.request")
                     && entry.result.as_deref() == Some("allowed")
             ));
+    }
+
+    #[test]
+    fn blob_write_read_and_delete_are_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("blob.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+        host.grants()
+            .unwrap()
+            .grant(
+                "collector",
+                "0.1.0",
+                "blob.write",
+                serde_json::json!({"quota_bytes": 1024 * 1024}),
+                None,
+                None,
+            )
+            .unwrap();
+        host.grants()
+            .unwrap()
+            .grant(
+                "collector",
+                "0.1.0",
+                "blob.read",
+                serde_json::json!({"quota_bytes": 1024 * 1024}),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            host.blob_read_for("collector", "0.1.0", "missing"),
+            Err(KernelError::NotFound(_))
+        ));
+        let meta = host
+            .blob_write_for("collector", "0.1.0", "page-1.json", b"hello")
+            .unwrap();
+        assert_eq!(meta.size, 5);
+        assert_eq!(
+            host.blob_read_for("collector", "0.1.0", "page-1.json")
+                .unwrap(),
+            b"hello".as_slice()
+        );
+        assert!(host
+            .blob_write_for("collector", "0.1.0", "../escape", b"x")
+            .is_err());
+        assert!(host
+            .blob_delete_for("collector", "0.1.0", "page-1.json")
+            .unwrap());
+        assert!(!host
+            .blob_delete_for("collector", "0.1.0", "page-1.json")
+            .unwrap());
+
+        // A different version has no grant.
+        assert!(matches!(
+            host.blob_write_for("collector", "0.2.0", "x", b"x"),
+            Err(KernelError::PermissionDenied(_))
+        ));
     }
 
     #[test]

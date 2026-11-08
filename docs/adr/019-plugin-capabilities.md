@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`, 2.4 `schedule.request`)
+- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`, 2.4 `schedule.request`, 2.5 `blob.read/write`)
 - Date: 2026-11-08
 
 ## Context
@@ -64,9 +64,13 @@ The CMS/collector probe made the gap concrete:
    `GET /v1/schedule?payload=...`, advances the next run even on failure, and
    audits `schedule.run`. The plugin cannot run its own timer through this
    capability.
-10. **Other capabilities remain disclosure-only** until their broker exists. The
-    control channel is still loopback HTTP; phase 3 replaces it and adds OS
-    isolation.
+10. **Phase 2.5 adds `blob.read`/`blob.write`.** The host owns the namespace,
+   per-blob cap (16 MiB) and total quota; names cannot traverse paths. Reads and
+   writes are separate grants; deletes need write. Blob contents are not written
+   to audit rows.
+11. **`fs.read` remains legacy** (source roots handed directly) and is not
+   brokered. The control channel is still loopback HTTP; phase 3 replaces it and
+   adds OS isolation.
 
 ## Consequences
 

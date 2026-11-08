@@ -12,6 +12,7 @@
 //! the host.
 
 pub mod audit;
+pub mod blob;
 pub mod broker;
 pub mod broker_client;
 pub mod capability;
@@ -31,6 +32,7 @@ pub mod storage;
 mod supervisor;
 
 pub use audit::{AuditEntry, AuditEvent, AuditLog};
+pub use blob::{BlobMeta, BlobStore};
 pub use broker::{BrokerError, BrokerRequest, BrokerResponse};
 pub use broker_client::{BrokerClient, BrokerReply};
 pub use capability::{

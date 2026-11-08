@@ -156,6 +156,94 @@ impl BrokerClient {
             .map_err(|error| format!("schedule.response is not JSON: {error}"))
     }
 
+    /// Upload one blob into the host-managed namespace.
+    pub fn put_blob(&self, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
+        let response = match self
+            .agent
+            .put(&endpoint)
+            .set("x-localreel-plugin", &self.token)
+            .set("content-type", "application/octet-stream")
+            .send_bytes(bytes)
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(format!(
+                    "blob.write refused the blob ({status}): {}",
+                    broker_error_message(&read_error_body(response))
+                ));
+            }
+            Err(error) => return Err(format!("blob.write failed: {error}")),
+        };
+        let mut text = String::new();
+        response
+            .into_reader()
+            .take(1024 * 1024)
+            .read_to_string(&mut text)
+            .map_err(|error| format!("blob.write response could not be read: {error}"))?;
+        serde_json::from_str(&text)
+            .map_err(|error| format!("blob.write response is not JSON: {error}"))
+    }
+
+    pub fn get_blob(&self, name: &str) -> Result<Vec<u8>, String> {
+        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
+        match self
+            .agent
+            .get(&endpoint)
+            .set("x-localreel-plugin", &self.token)
+            .call()
+        {
+            Ok(response) => {
+                let mut bytes = Vec::new();
+                response
+                    .into_reader()
+                    .take(16 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("blob.read body could not be read: {error}"))?;
+                if bytes.len() as u64 > 16 * 1024 * 1024 {
+                    return Err("blob.read exceeded the 16 MiB client cap".to_string());
+                }
+                Ok(bytes)
+            }
+            Err(ureq::Error::Status(status, response)) => Err(format!(
+                "blob.read refused the call ({status}): {}",
+                broker_error_message(&read_error_body(response))
+            )),
+            Err(error) => Err(format!("blob.read failed: {error}")),
+        }
+    }
+
+    pub fn delete_blob(&self, name: &str) -> Result<bool, String> {
+        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
+        let response = match self
+            .agent
+            .delete(&endpoint)
+            .set("x-localreel-plugin", &self.token)
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(format!(
+                    "blob.delete refused the call ({status}): {}",
+                    broker_error_message(&read_error_body(response))
+                ));
+            }
+            Err(error) => return Err(format!("blob.delete failed: {error}")),
+        };
+        let mut text = String::new();
+        response
+            .into_reader()
+            .take(1024 * 1024)
+            .read_to_string(&mut text)
+            .map_err(|error| format!("blob.delete response could not be read: {error}"))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("blob.delete response is not JSON: {error}"))?;
+        Ok(value
+            .get("deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
     pub fn fetch_json<T: DeserializeOwned>(
         &self,
         url: &str,
@@ -229,6 +317,15 @@ fn parse_reply(text: &str) -> Result<BrokerReply, String> {
         content_type,
         body,
     })
+}
+
+fn read_error_body(response: ureq::Response) -> String {
+    let mut text = String::new();
+    let _ = response
+        .into_reader()
+        .take(8 * 1024)
+        .read_to_string(&mut text);
+    text
 }
 
 fn broker_error_message(text: &str) -> String {

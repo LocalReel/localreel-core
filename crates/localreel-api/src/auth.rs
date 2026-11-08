@@ -39,6 +39,7 @@ const PUBLIC_PATHS: &[&str] = &[
     "/api/v1/plugin-broker/fetch",
     "/api/v1/plugin-broker/catalog",
     "/api/v1/plugin-broker/schedule",
+    "/api/v1/plugin-broker/blob",
 ];
 
 /// The page's bootstrap answer: who is signed in, and whether first-run setup

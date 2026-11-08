@@ -111,14 +111,14 @@ owned by the host; the plugin chooses only from the published vocabulary:
 
   The response mixes `source: "manifest"` (declared) with `source: "legacy"`
   (the old `storage:read`/`network` permissions, shown for compatibility).
-- **Enforcement status (phase 2.4):** `net.fetch`, `secret.use`,
-  `catalog.write(draft)` and `schedule.request` are enforced by the host broker:
-  the plugin's per-run token, the active grant for its exact version, the
-  declared scope and the SSRF/redirect policy are checked before any side effect,
-  and every allow/deny is audited. The remaining capabilities (`fs.read`,
-  `blob.*`) are still disclosure + grants; they do not have a runtime broker yet.
-  None of this is an OS sandbox: a plugin can still open its own socket, which is
-  why phase 3 replaces the transport and adds OS isolation (ADR-019).
+- **Enforcement status (phase 2.5):** `net.fetch`, `secret.use`,
+  `catalog.write(draft)`, `schedule.request` and `blob.read`/`blob.write` are
+  enforced by the host broker: the plugin's per-run token, the active grant for
+  its exact version, the declared scope and the SSRF/redirect policy are checked
+  before any side effect, and every allow/deny is audited. `fs.read` remains the
+  legacy storage-root path; it is disclosed but not brokered. None of this is an
+  OS sandbox: a plugin can still open its own socket, which is why phase 3
+  replaces the transport and adds OS isolation (ADR-019).
 
 ## Broker: `net.fetch` (phase 2.1)
 
@@ -265,6 +265,37 @@ port. The plugin's SDK `Handler::schedule` default returns 404; a collector can
 implement it to run one collection. A failing callback still advances the next
 run, so a broken plugin cannot create a hot retry loop. Run outcomes are audited
 as `schedule.run` with the schedule id; the callback carries no browser session.
+
+## Broker: `blob.read` / `blob.write` (phase 2.5)
+
+A plugin gets a host-managed namespace instead of a writable directory:
+
+```text
+PUT    /api/v1/plugin-broker/blob/:name    raw bytes, blob.write
+GET    /api/v1/plugin-broker/blob/:name    raw bytes, blob.read
+DELETE /api/v1/plugin-broker/blob/:name    blob.write
+```
+
+The manifest scope supplies the total quota:
+
+```json
+{"name": "blob.write", "scope": {"quota_bytes": 104857600}}
+```
+
+Rules:
+
+- the namespace is the plugin id; names are 1–128 bytes of
+  `[A-Za-z0-9._-]` and may not contain `/`, `\` or `..`;
+- one blob is at most 16 MiB; replacing a blob counts only the size delta;
+- the total quota is checked before the write; over-quota is `400`;
+- `blob.write` and `blob.read` are separate grants; deleting needs
+  `blob.write`;
+- metadata and usage are shown to admins at
+  `GET /api/v1/plugins/:id/blobs`; blob bytes never appear in the audit row
+  (only name and byte count).
+
+Phase 2 stores blobs in SQLite. Moving them to files under the data directory
+must keep the same quota/namespace checks.
 
 ### Reference collector (phase 2.1)
 

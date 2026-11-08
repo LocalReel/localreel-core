@@ -6,7 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse, Response,
@@ -23,6 +23,7 @@ use tower_http::services::ServeDir;
 use localreel_kernel::jobs::JobRecord;
 use localreel_kernel::storage::{MediaUri, Storage};
 use localreel_kernel::time::now_secs;
+use localreel_media::model::SeriesSummary;
 use localreel_media::playback::{direct_play_supported, is_hls, preferred_preset};
 use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, CurrentUser, DeleteSourceReport, FeedItem,
@@ -62,6 +63,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/plugin-broker/schedule",
             post(plugin_broker_schedule),
+        )
+        .route(
+            "/api/v1/plugin-broker/blob/:name",
+            put(plugin_broker_blob_put)
+                .get(plugin_broker_blob_get)
+                .delete(plugin_broker_blob_delete),
         );
 
     // Any signed-in account: the shared library plus that account's own state.
@@ -69,6 +76,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/media", get(list_media))
         .route("/api/v1/feed", get(feed))
+        .route("/api/v1/series", get(list_series))
+        .route("/api/v1/series/:id", get(series_detail))
         .route("/api/v1/search", get(search_media))
         .route("/api/v1/media/:id", get(get_media))
         .route("/api/v1/media/:id/tracks", get(list_tracks))
@@ -113,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins/:id/disable", post(plugin_disable))
         .route("/api/v1/plugins/:id/logs", get(plugin_logs))
         .route("/api/v1/catalog/drafts", get(list_catalog_drafts))
+        .route("/api/v1/plugins/:id/blobs", get(list_plugin_blobs))
         .route("/api/v1/metadata", get(metadata_status))
         .route("/api/v1/metadata/match", post(match_metadata))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
@@ -174,6 +184,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     }
 
     router
+        .fallback(spa_fallback)
         .layer(DefaultBodyLimit::max(
             usize::try_from(localreel_media::MAX_BACKUP_BYTES).unwrap_or(32 * 1024 * 1024),
         ))
@@ -277,6 +288,38 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
         }
     }
     Html(INDEX_HTML).into_response()
+}
+
+/// Serve the SPA shell for client-side routes so a refresh does not 404.
+///
+/// Wildcard asset routes (`/assets/*`, `/icons/*`, the media directories,
+/// `/hls/*`) are registered before this fallback and therefore still win. API
+/// paths keep the JSON error envelope so a stale endpoint never answers with
+/// HTML; other paths only get the shell when the client asked for HTML.
+async fn spa_fallback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if uri.path().starts_with("/api/") {
+        return ApiError::not_found("no such endpoint").into_response();
+    }
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/html"));
+    if !wants_html {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let mut response = if crate::web::is_embedded() {
+        embedded_index().await
+    } else {
+        index(State(state)).await
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 #[derive(Debug, Serialize)]
@@ -465,6 +508,76 @@ async fn plugin_broker_schedule(
     Ok(Json(serde_json::to_value(schedule).map_err(|error| {
         ApiError::internal(format!("failed to encode schedule: {error}"))
     })?))
+}
+
+async fn plugin_broker_blob_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = plugin_token(&headers)?;
+    let meta = state.plugins.blob_write(token, &name, &body)?;
+    Ok(Json(serde_json::json!({
+        "name": meta.name,
+        "size": meta.size,
+        "digest": meta.digest,
+    })))
+}
+
+async fn plugin_broker_blob_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let token = plugin_token(&headers)?;
+    let bytes = state.plugins.blob_read(token, &name)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn plugin_broker_blob_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = plugin_token(&headers)?;
+    let deleted = state.plugins.blob_delete(token, &name)?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+fn plugin_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    Ok(token)
+}
+
+async fn list_plugin_blobs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.plugins.blobs().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the blob store is not available",
+        )
+    })?;
+    let blobs = store.list(&id)?;
+    let usage = store.usage(&id)?;
+    Ok(Json(serde_json::json!({ "blobs": blobs, "usage": usage })))
 }
 
 /// Installed plugins with the permissions that actually apply to them.
@@ -1309,6 +1422,41 @@ async fn search_media(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<MediaPage>, ApiError> {
     list_media(State(state), Extension(current), Query(query)).await
+}
+
+#[derive(Debug, Serialize)]
+struct SeriesPage {
+    items: Vec<SeriesSummary>,
+    total: i64,
+}
+
+/// Shows grouped from the flat media list, newest activity first.
+async fn list_series(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Json<SeriesPage>, ApiError> {
+    let items = state.media.list_series(current.user.id)?;
+    let total = items.len() as i64;
+    Ok(Json(SeriesPage { items, total }))
+}
+
+#[derive(Debug, Serialize)]
+struct SeriesDetail {
+    series: SeriesSummary,
+    episodes: Vec<Media>,
+}
+
+/// One show plus its episodes in episode order.
+async fn series_detail(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<SeriesDetail>, ApiError> {
+    let (series, episodes) = state
+        .media
+        .series_detail(current.user.id, &id)?
+        .ok_or_else(|| ApiError::not_found(format!("series {id} not found")))?;
+    Ok(Json(SeriesDetail { series, episodes }))
 }
 
 /// One media item plus whatever external metadata matched it.
@@ -2628,6 +2776,42 @@ mod tests {
                     .header("x-localreel-plugin", "not-a-token")
                     .header("content-type", "application/json")
                     .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_blob_broker_requires_a_plugin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/plugin-broker/blob/x")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/plugin-broker/blob/x")
+                    .header("host", "127.0.0.1:3001")
+                    .header("x-localreel-plugin", "not-a-token")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from("hello"))
                     .unwrap(),
             )
             .await
