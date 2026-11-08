@@ -111,11 +111,94 @@ owned by the host; the plugin chooses only from the published vocabulary:
 
   The response mixes `source: "manifest"` (declared) with `source: "legacy"`
   (the old `storage:read`/`network` permissions, shown for compatibility).
-- **Phase 1 does not enforce capabilities at call time.** There is no broker yet;
-  a grant is a disclosed and attributable intent, not a privilege that has been
-  exercised. The admin page must say so, and the protocol must not describe a
-  grant as an OS sandbox. Phase 2 adds the broker, phase 3 the transport/OS
-  isolation (ADR-019).
+- **Enforcement status (phase 2.1):** `net.fetch` is enforced by the host broker:
+  the plugin's per-run token, the active grant for its exact version, the declared
+  host/method/byte/timeout/redirect/rate scope and the SSRF policy are checked
+  before a socket is opened, and every allow/deny is audited. The other
+  capabilities (`fs.read`, `secret.use`, `schedule.request`, `catalog.write`,
+  `blob.*`) are still disclosure + grants; they do not have a runtime broker yet.
+  None of this is an OS sandbox: a plugin can still open its own socket, which is
+  why phase 3 replaces the transport and adds OS isolation (ADR-019).
+
+## Broker: `net.fetch` (phase 2.1)
+
+The plugin receives `LOCALREEL_PLUGIN_HOST_URL` and its per-run token. It calls:
+
+```http
+POST /api/v1/plugin-broker/fetch
+x-localreel-plugin: <LOCALREEL_PLUGIN_TOKEN>
+content-type: application/json
+
+{"url": "https://api.example.com/vod?ac=detail&pg=1", "method": "GET",
+ "headers": {"referer": "https://site/", "user-agent": "..."}}
+```
+
+The host:
+
+1. authenticates the token;
+2. finds the **active** `net.fetch` grant for this plugin id and version;
+3. checks `hosts` (exact or `*.suffix`), `methods` (GET/HEAD), `max_bytes`,
+   `timeout_secs`, `redirects` and `rate_per_min`;
+4. resolves the destination and refuses loopback/private/link-local/multicast/
+   documentation/CGNAT addresses, validating every redirect hop;
+5. forwards only `accept`, `accept-language`, `user-agent` and `referer`;
+   Cookie/Authorization belong to `secret.use`, not to this endpoint;
+6. writes an audit row (`capability.fetch`, result, scope digest, bytes, duration,
+   request id) and only then returns.
+
+A successful response is a JSON envelope; the body is base64 so binary responses
+survive:
+
+```json
+{"status": 200, "content_type": "application/json", "body_b64": "eyJ..."}
+```
+
+The plugin SDK offers `BrokerClient::from_env()` and `fetch_json()`. A missing
+grant, an out-of-scope host/method, a forbidden header or a non-public
+destination is a `403`; invalid input is `400`; upstream/timeout conditions are
+`503`. The legacy `/api/v1/plugin-proxy` endpoint remains for old storage plugins;
+new code should use the broker.
+
+### Reference collector (phase 2.1)
+
+`plugin-collector-demo` is the first consumer that uses only the broker. Its
+manifest asks for one allowlisted host:
+
+```json
+{
+  "id": "collector-demo",
+  "name": "Collector demo",
+  "version": "0.1.0",
+  "api_version": "localreel.plugin/v1",
+  "kind": "storage",
+  "entry": { "program": "plugin-collector-demo" },
+  "capabilities": [
+    {
+      "name": "net.fetch",
+      "scope": {
+        "hosts": ["api.example.com"],
+        "methods": ["GET"],
+        "max_bytes": 16777216,
+        "timeout_secs": 30,
+        "redirects": 0,
+        "rate_per_min": 60
+      }
+    }
+  ]
+}
+```
+
+Its config names the request URL and output file:
+
+```json
+{ "url": "https://api.example.com/api.php/provide/vod/?ac=detail&pg=1", "out": "collected.json" }
+```
+
+After the host grants `net.fetch`, the plugin calls the broker, parses the
+MacCMS `list` into `{remote_id,name,lines:[{source_tag,episodes}]}` and writes
+`collected.json` into its working directory. It does not open an outbound socket
+itself. There is no CMS catalog yet; this slice exists to keep the broker
+contract honest before the catalog schema is committed.
 
 ## Permissions
 
