@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`, 2.4 `schedule.request`, 2.5 `blob.read/write`)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 package pinning)
 - Date: 2026-11-08
 
 ## Context
@@ -68,9 +68,12 @@ The CMS/collector probe made the gap concrete:
    per-blob cap (16 MiB) and total quota; names cannot traverse paths. Reads and
    writes are separate grants; deletes need write. Blob contents are not written
    to audit rows.
-11. **`fs.read` remains legacy** (source roots handed directly) and is not
-   brokered. The control channel is still loopback HTTP; phase 3 replaces it and
-   adds OS isolation.
+11. **Phase 3.1 pins the package artifact.** A configured `sha256` is checked
+    before inspect/extract; a mismatch is a permanent start failure. This is
+    artifact pinning, not publisher signing.
+12. **`fs.read` remains legacy** (source roots handed directly) and is not
+    brokered. The control channel is still loopback HTTP; the next phase replaces
+    it and adds OS isolation.
 
 ## Consequences
 

@@ -189,6 +189,9 @@ pub struct PluginSpec {
     pub package: PathBuf,
     pub config: serde_json::Value,
     pub manifest: Manifest,
+    /// Optional SHA-256 pin from the configuration. When set, the supervisor
+    /// verifies the package bytes before extraction.
+    pub expected_sha256: Option<String>,
     /// `false` means "present in the configuration, switched off". The spec is
     /// kept so an admin can enable it later without a restart.
     pub enabled: bool,
@@ -206,8 +209,14 @@ impl PluginSpec {
             package,
             config,
             manifest,
+            expected_sha256: None,
             enabled,
         }
+    }
+
+    pub fn with_sha256(mut self, expected: Option<String>) -> Self {
+        self.expected_sha256 = expected;
+        self
     }
 }
 

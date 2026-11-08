@@ -25,6 +25,30 @@ pub fn inspect(path: &Path) -> Result<Manifest, PluginError> {
     Ok(manifest)
 }
 
+/// SHA-256 of the package bytes, used for the optional configuration pin.
+///
+/// This is the whole-file digest, not a signature: it proves the host loads the
+/// exact artifact an operator approved, but it does not establish who built it.
+pub fn digest(path: &Path) -> Result<String, PluginError> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(path)
+        .map_err(|error| PluginError::Io(format!("cannot open {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| PluginError::Io(format!("cannot read {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Extract a package into `destination`, returning its validated manifest.
 ///
 /// The destination is created by the caller; an existing directory is reused so
@@ -467,6 +491,7 @@ mod tests {
         assert_eq!(report.manifest.id, "demo");
         assert_eq!(report.files, 3);
         assert_eq!(report.sha256.len(), 64);
+        assert_eq!(digest(&output).unwrap(), report.sha256);
         assert!(output.is_file());
 
         let manifest = inspect(&output).unwrap();

@@ -354,6 +354,25 @@ it serves health and nothing else, so it must not be pointed at a source. A
 `kind: "catalog"` (or a collector capability) is a separate protocol decision
 and is deliberately not smuggled into this slice.
 
+## Package pinning (phase 3.1)
+
+An operator can pin the exact artifact they approved:
+
+```toml
+[[plugins]]
+package = "plugins/collector.lrplug"
+sha256 = "64 lowercase or uppercase hex characters"
+```
+
+When `sha256` is present, the supervisor computes the whole-file SHA-256
+**before inspecting or extracting** the package and refuses a mismatch as a
+permanent failure. `localreel-plugin-pack` prints the digest, so the pin can be
+copied from the build output.
+
+This is artifact pinning, not a signature: it proves the host loaded the bytes
+the operator approved, but it does not establish who built them. Publisher
+signing and a trust store remain phase 3 work.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it

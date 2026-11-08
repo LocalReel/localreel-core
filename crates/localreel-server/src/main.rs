@@ -714,12 +714,15 @@ async fn serve(
                 // starts, so a source that points at it can answer
                 // "unavailable" instead of "unknown".
                 storage.declare(manifest.id.clone());
-                specs.push(localreel_plugin::PluginSpec::new(
-                    package.clone(),
-                    manifest,
-                    plugin.config.clone(),
-                    plugin.enabled,
-                ));
+                specs.push(
+                    localreel_plugin::PluginSpec::new(
+                        package.clone(),
+                        manifest,
+                        plugin.config.clone(),
+                        plugin.enabled,
+                    )
+                    .with_sha256(plugin.sha256.clone()),
+                );
                 if !plugin.enabled {
                     info!(package = %package.display(), "plugin is disabled in the configuration");
                 }

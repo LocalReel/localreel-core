@@ -164,6 +164,9 @@ pub struct PluginConfig {
     /// Path to the `.lrplug` package.
     pub package: PathBuf,
     pub enabled: bool,
+    /// Optional SHA-256 pin. When present, the package bytes must match
+    /// before the plugin is inspected or extracted.
+    pub sha256: Option<String>,
     /// JSON handed to the plugin via `LOCALREEL_PLUGIN_CONFIG`.
     pub config: serde_json::Value,
 }
@@ -507,6 +510,7 @@ impl Config {
                 .map(|plugin| PluginConfig {
                     package: plugin.package,
                     enabled: plugin.enabled,
+                    sha256: plugin.sha256,
                     config: plugin.config,
                 })
                 .collect();
@@ -680,6 +684,13 @@ impl Config {
                     "plugin package path must not be empty".into(),
                 ));
             }
+            if let Some(digest) = &plugin.sha256 {
+                if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    return Err(KernelError::Config(
+                        "plugin sha256 must be 64 hexadecimal characters".into(),
+                    ));
+                }
+            }
         }
         if self.plugin_runtime.stop_timeout.is_zero() {
             return Err(KernelError::Config(
@@ -841,6 +852,8 @@ struct PluginFile {
     package: PathBuf,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    sha256: Option<String>,
     #[serde(default)]
     config: serde_json::Value,
 }
@@ -1039,6 +1052,7 @@ mod tests {
             [[plugins]]
             package = "C:/plugins/demo.lrplug"
             enabled = false
+            sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             [plugins.config]
             root = "D:/library"
             "#,
@@ -1048,9 +1062,28 @@ mod tests {
         config.apply_file(file).unwrap();
         assert_eq!(config.plugins.len(), 1);
         assert!(!config.plugins[0].enabled);
+        assert_eq!(
+            config.plugins[0].sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(config.plugins[0].config["root"], "D:/library");
         // Failure isolation is the default; strictness is opt-in.
         assert!(!config.plugin_runtime.strict);
+    }
+
+    #[test]
+    fn rejects_a_malformed_sha256_pin() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+            [[plugins]]
+            package = "C:/plugins/demo.lrplug"
+            sha256 = "not-a-digest"
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
