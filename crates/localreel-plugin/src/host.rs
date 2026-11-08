@@ -175,6 +175,10 @@ pub struct PluginDescriptor {
     pub started_at: Option<i64>,
     /// The package this entry came from, for diagnostics.
     pub package: String,
+    /// `http` or `stdio`.
+    pub transport: String,
+    /// `none` or `appcontainer`.
+    pub sandbox: String,
 }
 
 /// A response fetched on a plugin's behalf.
@@ -1660,6 +1664,12 @@ fn descriptor_for_spec(
         generation: 0,
         started_at: None,
         package: spec.package.display().to_string(),
+        transport: spec.manifest.entry.transport.clone(),
+        sandbox: if spec.app_container {
+            "appcontainer".to_string()
+        } else {
+            "none".to_string()
+        },
     }
 }
 
@@ -1685,6 +1695,8 @@ fn descriptor_for(
             generation: 0,
             started_at: None,
             package: package.display().to_string(),
+            transport: manifest.entry.transport.clone(),
+            sandbox: "none".to_string(),
         },
         None => PluginDescriptor {
             // Inspection failed: the manifest id is unknown, so use the file
@@ -1702,6 +1714,8 @@ fn descriptor_for(
             generation: 0,
             started_at: None,
             package: package.display().to_string(),
+            transport: String::new(),
+            sandbox: "none".to_string(),
         },
     }
 }
@@ -1834,6 +1848,15 @@ mod tests {
         assert_eq!(summaries[0].state, PluginState::Disabled);
         assert!(!summaries[0].enabled);
         assert!(!summaries[0].running);
+    }
+
+    #[test]
+    fn descriptor_reports_transport_and_sandbox() {
+        let spec = PluginSpec::new(package(), manifest(vec![]), serde_json::json!({}), true)
+            .with_app_container(true, None);
+        let descriptor = descriptor_for_spec(&spec, PluginState::Running, None);
+        assert_eq!(descriptor.transport, "http");
+        assert_eq!(descriptor.sandbox, "appcontainer");
     }
 
     #[test]

@@ -585,7 +585,9 @@ ignored); diagnostics belong on stderr, whose tail the host keeps for errors.
 ### When a plugin cannot start
 
 A configured plugin that fails at any step above does **not** take the server
-down. The entry stays in `GET /api/v1/plugins` with a state:
+down. The entry stays in `GET /api/v1/plugins` with a state; each row also
+reports its `transport` (`http`/`stdio`) and `sandbox` (`none`/`appcontainer`)
+so the admin page can show the effective execution mode:
 
 | State | Meaning |
 |---|---|
