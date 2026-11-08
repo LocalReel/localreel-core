@@ -139,6 +139,11 @@ fn fetch_inner(
             )));
         }
     }
+    if request.headers.len() > 16 {
+        return Err(BrokerError::Invalid(
+            "net.fetch accepts at most 16 request headers".to_string(),
+        ));
+    }
     for (name, value) in &request.headers {
         if value.len() > 2048 || value.contains(['\r', '\n', '\0']) {
             return Err(BrokerError::Invalid(format!(
