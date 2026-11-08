@@ -56,7 +56,12 @@ impl BrokerProxy {
             .request(method, &url)
             .set("x-localreel-plugin", &self.token);
         if !body.is_empty() {
-            request = request.set("content-type", "application/octet-stream");
+            let content_type = if path.contains("/blob/") {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            };
+            request = request.set("content-type", content_type);
         }
         let response = match request.send_bytes(body) {
             Ok(response) => response,
@@ -304,6 +309,9 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.contains("POST /api/v1/plugin-broker/fetch"));
         assert!(request.contains("x-localreel-plugin: run-token"));
+        assert!(request
+            .to_lowercase()
+            .contains("content-type: application/json"));
         assert!(request.contains("https://example.com"));
     }
 }

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain)
 - Date: 2026-11-08
 
 ## Context
@@ -121,6 +121,11 @@ The CMS/collector probe made the gap concrete:
     serves stat/list/read this way. Third-party plugins that omit the mode still
     use legacy direct roots until migrated. The HTTP transport remains the
     default; phase 3 continues with Unix isolation and broader migration.
+22. **Phase 3.12 proves the full host/API chain.** An API integration test starts
+    a real `PluginHost`, a real router, resolves a real `fs.read` grant and calls
+    `PluginStorage` against a stdio storage plugin. The test also caught a
+    content-type mismatch in the stdio broker proxy (`/fs` and JSON calls are now
+    `application/json`, blobs remain octet-stream).
 
 ## Consequences
 
