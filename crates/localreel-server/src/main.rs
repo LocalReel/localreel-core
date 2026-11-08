@@ -974,15 +974,28 @@ async fn serve(
     // console. It is only installed when asked for, and the console is only
     // hidden once the icon really exists.
     let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Once per library: Windows 11 files a new tray icon under the hidden
+    // icons, so the first run says where it went instead of looking silent.
+    let hint_marker = config.data_dir.join(".tray-hint");
+    let show_tray_hint = !hint_marker.exists();
     let tray_handle: Option<tray::Tray> = if tray_icon && config.mode.is_desktop() {
         let tray_url = url.clone();
-        tray::spawn(tray_url, move || {
-            let _ = quit_tx.send(());
-        })
+        tray::spawn(
+            tray_url,
+            move || {
+                let _ = quit_tx.send(());
+            },
+            show_tray_hint,
+        )
     } else {
         None
     };
     let tray_active = tray_handle.is_some();
+    if tray_active && show_tray_hint {
+        // The marker only keeps the balloon from repeating; failing to write
+        // it is not worth failing startup for.
+        let _ = std::fs::write(&hint_marker, b"shown\n");
+    }
     if tray_active {
         let console = tray::hide_console();
         info!(

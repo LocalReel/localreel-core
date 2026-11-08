@@ -44,7 +44,8 @@ mod platform {
     use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+        NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -69,6 +70,44 @@ mod platform {
     struct Context {
         url: String,
         on_quit: Box<dyn Fn() + Send>,
+        open: String,
+        quit: String,
+    }
+
+    /// The two menu items and the tooltip, in the language Windows uses.
+    ///
+    /// The tray is the whole interface when the console is gone, so it must not
+    /// be the one English-only corner of a Chinese installation.
+    struct UiText {
+        tooltip: String,
+        open: &'static str,
+        quit: &'static str,
+        hint_title: &'static str,
+        hint_body: &'static str,
+    }
+
+    fn ui_text() -> UiText {
+        // SAFETY: the call takes no arguments and only reads the system locale.
+        let chinese = unsafe {
+            windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff == 0x04
+        };
+        if chinese {
+            UiText {
+                tooltip: format!("LocalReel {} - 运行中", localreel_kernel::VERSION),
+                open: "打开 LocalReel",
+                quit: "退出",
+                hint_title: "LocalReel 正在后台运行",
+                hint_body: "点击托盘图标打开界面。Windows 可能把它收进任务栏的隐藏图标，可以把它拖到任务栏上常驻。",
+            }
+        } else {
+            UiText {
+                tooltip: format!("LocalReel {} - running", localreel_kernel::VERSION),
+                open: "Open LocalReel",
+                quit: "Quit",
+                hint_title: "LocalReel is running in the background",
+                hint_body: "Click the tray icon to open it. Windows may keep it in the hidden icons area; drag it onto the taskbar to keep it visible.",
+            }
+        }
     }
 
     /// A live tray icon. Dropping it removes the icon and stops the thread.
@@ -99,14 +138,14 @@ mod platform {
 
     /// Show the tray icon. Returns `None` when Windows refuses to install it,
     /// in which case the caller must keep the console visible.
-    pub fn spawn(url: String, on_quit: impl Fn() + Send + 'static) -> Option<Tray> {
+    pub fn spawn(url: String, on_quit: impl Fn() + Send + 'static, hint: bool) -> Option<Tray> {
         let (ready_tx, ready_rx) = mpsc::channel::<isize>();
         let hwnd_slot = Arc::new(AtomicIsize::new(0));
         let slot = Arc::clone(&hwnd_slot);
 
         let thread = std::thread::Builder::new()
             .name("localreel-tray".into())
-            .spawn(move || run(url, Box::new(on_quit), slot, ready_tx))
+            .spawn(move || run(url, Box::new(on_quit), slot, ready_tx, hint))
             .ok()?;
 
         let hwnd = ready_rx.recv_timeout(Duration::from_secs(5)).ok()?;
@@ -175,8 +214,10 @@ mod platform {
         on_quit: Box<dyn Fn() + Send>,
         slot: Arc<AtomicIsize>,
         ready: mpsc::Sender<isize>,
+        hint: bool,
     ) {
         let _ = slot;
+        let text = ui_text();
         // SAFETY: the calls below follow the documented Win32 sequence for a
         // hidden message window plus a notification-area icon.
         unsafe {
@@ -199,7 +240,12 @@ mod platform {
                 return;
             }
 
-            let context = Box::into_raw(Box::new(Context { url, on_quit }));
+            let context = Box::into_raw(Box::new(Context {
+                url,
+                on_quit,
+                open: text.open.to_string(),
+                quit: text.quit.to_string(),
+            }));
             let hwnd = CreateWindowExW(
                 0,
                 class_name.as_ptr(),
@@ -221,12 +267,15 @@ mod platform {
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize);
 
-            if !add_icon(hwnd) {
+            if !add_icon(hwnd, &text.tooltip) {
                 DestroyWindow(hwnd);
                 let _ = ready.send(0);
                 return;
             }
             let _ = ready.send(hwnd as isize);
+            if hint {
+                show_hint(hwnd, text.hint_title, text.hint_body);
+            }
 
             let mut message: MSG = std::mem::zeroed();
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
@@ -238,7 +287,7 @@ mod platform {
         }
     }
 
-    unsafe fn add_icon(hwnd: HWND) -> bool {
+    unsafe fn add_icon(hwnd: HWND, tooltip: &str) -> bool {
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
@@ -246,10 +295,28 @@ mod platform {
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
         data.hIcon = app_icon();
-        let tip = to_wide("LocalReel");
+        let tip = to_wide(tooltip);
         let room = data.szTip.len().min(tip.len() - 1);
         data.szTip[..room].copy_from_slice(&tip[..room]);
         Shell_NotifyIconW(NIM_ADD, &data) != 0
+    }
+
+    /// One-time balloon: Windows 11 starts new icons in the overflow area, and
+    /// a server that hid its console would otherwise look like nothing happened.
+    unsafe fn show_hint(hwnd: HWND, title: &str, body: &str) {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = TRAY_ICON_ID;
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        let title = to_wide(title);
+        let body = to_wide(body);
+        let title_room = data.szInfoTitle.len().min(title.len() - 1);
+        data.szInfoTitle[..title_room].copy_from_slice(&title[..title_room]);
+        let body_room = data.szInfo.len().min(body.len() - 1);
+        data.szInfo[..body_room].copy_from_slice(&body[..body_room]);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
     /// The icon embedded in the executable (resource id 1), falling back to the
@@ -285,8 +352,14 @@ mod platform {
         if menu.is_null() {
             return;
         }
-        let open = to_wide("Open LocalReel");
-        let quit = to_wide("Quit");
+        let context = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Context;
+        let (open, quit) = match context.as_ref() {
+            Some(context) => (to_wide(&context.open), to_wide(&context.quit)),
+            None => {
+                DestroyMenu(menu);
+                return;
+            }
+        };
         AppendMenuW(menu, MF_STRING, ID_OPEN, open.as_ptr());
         AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
@@ -393,7 +466,7 @@ mod stub {
     }
 
     /// The tray is a Windows feature; other platforms keep the console.
-    pub fn spawn(_url: String, _on_quit: impl Fn() + Send + 'static) -> Option<Tray> {
+    pub fn spawn(_url: String, _on_quit: impl Fn() + Send + 'static, _hint: bool) -> Option<Tray> {
         None
     }
 
