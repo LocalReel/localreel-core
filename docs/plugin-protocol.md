@@ -265,6 +265,9 @@ port. The plugin's SDK `Handler::schedule` default returns 404; a collector can
 implement it to run one collection. A failing callback still advances the next
 run, so a broken plugin cannot create a hot retry loop. Run outcomes are audited
 as `schedule.run` with the schedule id; the callback carries no browser session.
+Admins can list and remove schedules with
+`GET /api/v1/plugin-schedules` and
+`DELETE /api/v1/plugin-schedules/:plugin/:version`.
 
 ## Broker: `blob.read` / `blob.write` (phase 2.5)
 
