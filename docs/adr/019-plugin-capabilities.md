@@ -104,12 +104,12 @@ The CMS/collector probe made the gap concrete:
     This is what lets an AppContainer plugin use `net.fetch` without loopback.
 19. **Phase 3.9 wires AppContainer into the runtime.** `[plugin_runtime]
     app_container = true` launches stdio/native plugins through
-    `plugin-sandbox`, which copies the install directory into a per-run
-    AppContainer profile and starts the child with no capabilities. Tests prove
-    the broker works over stdio and a raw `1.1.1.1:80` connect is denied. The
-    wrapper and the runtime both delete the profile on normal exit/kill; a
-    startup sweep removes profiles whose marker PID is no longer alive.
-    Interpreter scripts are rejected.
+    `plugin-sandbox`; a `[[plugins]]` entry can override it. The wrapper copies
+    the install directory into a per-run AppContainer profile and starts the
+    child with no capabilities. Tests prove the broker works over stdio and a raw
+    `1.1.1.1:80` connect is denied. The wrapper and the runtime both delete the
+    profile on normal exit/kill; a startup sweep removes profiles whose marker
+    PID is no longer alive. Interpreter scripts are rejected.
 20. **Phase 3.10 brokers `fs.read`.** A plugin sends `file://` URIs to
     `POST /api/v1/plugin-broker/fs`; the host checks the active `fs.read` grant,
     canonicalises each root and the target, refuses targets outside all roots,

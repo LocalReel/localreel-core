@@ -442,7 +442,9 @@ app_container = true
 - Defaults: 512 MiB and 16 processes; config validation bounds memory to
   16 MiB–16 GiB and processes to 1–256.
 
-`app_container = true` is the Windows network boundary (phase 3.9):
+`app_container = true` is the Windows network boundary (phase 3.9). A
+`[[plugins]]` entry may override the global switch with its own
+`app_container = true/false`; when absent it inherits `[plugin_runtime]`.
 
 - only `transport = "stdio"` and native binaries are accepted; scripts are
   rejected because the interpreter lives outside the container;

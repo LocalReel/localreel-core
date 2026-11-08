@@ -176,6 +176,8 @@ pub struct PluginConfig {
     pub signature: Option<String>,
     /// JSON handed to the plugin via `LOCALREEL_PLUGIN_CONFIG`.
     pub config: serde_json::Value,
+    /// Per-plugin override for `[plugin_runtime] app_container`.
+    pub app_container: Option<bool>,
 }
 
 /// A trusted publisher public key.
@@ -551,6 +553,7 @@ impl Config {
                     publisher: plugin.publisher,
                     signature: plugin.signature,
                     config: plugin.config,
+                    app_container: plugin.app_container,
                 })
                 .collect();
         }
@@ -996,6 +999,8 @@ struct PluginFile {
     signature: Option<String>,
     #[serde(default)]
     config: serde_json::Value,
+    #[serde(default)]
+    app_container: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1209,6 +1214,7 @@ mod tests {
             sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             publisher = "acme"
             signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            app_container = true
             [plugins.config]
             root = "D:/library"
             "#,
@@ -1225,6 +1231,7 @@ mod tests {
         );
         assert_eq!(config.plugins[0].publisher.as_deref(), Some("acme"));
         assert_eq!(config.plugins[0].config["root"], "D:/library");
+        assert_eq!(config.plugins[0].app_container, Some(true));
         assert_eq!(config.publishers.len(), 1);
         assert_eq!(config.publishers[0].id, "acme");
         // Failure isolation is the default; strictness is opt-in.
