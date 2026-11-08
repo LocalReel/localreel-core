@@ -192,6 +192,10 @@ pub struct PluginSpec {
     /// Optional SHA-256 pin from the configuration. When set, the supervisor
     /// verifies the package bytes before extraction.
     pub expected_sha256: Option<String>,
+    /// Optional publisher id and its Ed25519 signature over the package digest.
+    pub publisher: Option<String>,
+    pub expected_signature: Option<String>,
+    pub publisher_public_key: Option<String>,
     /// `false` means "present in the configuration, switched off". The spec is
     /// kept so an admin can enable it later without a restart.
     pub enabled: bool,
@@ -210,12 +214,27 @@ impl PluginSpec {
             config,
             manifest,
             expected_sha256: None,
+            publisher: None,
+            expected_signature: None,
+            publisher_public_key: None,
             enabled,
         }
     }
 
     pub fn with_sha256(mut self, expected: Option<String>) -> Self {
         self.expected_sha256 = expected;
+        self
+    }
+
+    pub fn with_signature(
+        mut self,
+        publisher: Option<String>,
+        signature: Option<String>,
+        public_key: Option<String>,
+    ) -> Self {
+        self.publisher = publisher;
+        self.expected_signature = signature;
+        self.publisher_public_key = public_key;
         self
     }
 }

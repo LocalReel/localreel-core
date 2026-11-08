@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 package pinning)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 publisher signatures)
 - Date: 2026-11-08
 
 ## Context
@@ -69,9 +69,13 @@ The CMS/collector probe made the gap concrete:
    writes are separate grants; deletes need write. Blob contents are not written
    to audit rows.
 11. **Phase 3.1 pins the package artifact.** A configured `sha256` is checked
-    before inspect/extract; a mismatch is a permanent start failure. This is
-    artifact pinning, not publisher signing.
-12. **`fs.read` remains legacy** (source roots handed directly) and is not
+    before inspect/extract; a mismatch is a permanent start failure.
+12. **Phase 3.2 adds publisher signatures.** `[[publishers]]` stores trusted
+    Ed25519 public keys; a plugin may name `publisher` and `signature` over the
+    package digest. The supervisor verifies before extraction; the config file is
+    the trust anchor. Key rotation, revocation and a transparency log are not
+    implemented.
+13. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The control channel is still loopback HTTP; the next phase replaces
     it and adds OS isolation.
 

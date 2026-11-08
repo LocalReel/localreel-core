@@ -25,7 +25,7 @@ use crate::host::{
     Desired, Inner, PluginDescriptor, PluginFailure, PluginSpec, PluginState, Shared,
 };
 use crate::manifest::PluginError;
-use crate::package::{digest, extract};
+use crate::package::{digest, extract, verify_signature};
 use crate::runtime::{PluginRuntime, PluginSandbox};
 use crate::storage::PluginStorage;
 
@@ -292,6 +292,16 @@ fn spawn(
             ));
         }
     }
+    if let Some(signature) = &spec.expected_signature {
+        let Some(public_key) = &spec.publisher_public_key else {
+            return Err((
+                "signed plugin has no trusted publisher key".to_string(),
+                true,
+            ));
+        };
+        verify_signature(&spec.package, signature, public_key)
+            .map_err(|error| (error.to_string(), true))?;
+    }
     let version_dir = install_root.join(&spec.manifest.version);
     let manifest = extract(&spec.package, &version_dir)
         .map_err(|error| (error.to_string(), is_permanent(&error)))?;
@@ -322,6 +332,7 @@ fn is_permanent(error: &PluginError) -> bool {
             | PluginError::TooManyEntries
             | PluginError::ExtractedTooLarge
             | PluginError::UnsafeEntry(_)
+            | PluginError::Signature(_)
             | PluginError::Missing(_)
             | PluginError::Archive(_)
     )
@@ -580,6 +591,45 @@ mod tests {
         assert!(is_permanent(&PluginError::Missing("bin/plugin".into())));
         assert!(!is_permanent(&PluginError::NotReady("timeout".into())));
         assert!(!is_permanent(&PluginError::Request("refused".into())));
+    }
+
+    #[test]
+    fn a_bad_publisher_signature_is_permanent() {
+        use ed25519_dalek::SigningKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo.lrplug");
+        std::fs::write(&package, b"not a zip").unwrap();
+        let manifest = crate::manifest::Manifest::parse(
+            br#"{
+                "id": "demo",
+                "name": "Demo",
+                "version": "0.1.0",
+                "api_version": "localreel.plugin/v1",
+                "kind": "storage",
+                "entry": { "program": "plugin" }
+            }"#,
+        )
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let public_key: String = signing
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let spec = PluginSpec::new(package, manifest, serde_json::json!({}), true).with_signature(
+            Some("acme".into()),
+            Some("00".repeat(64)),
+            Some(public_key),
+        );
+        let result = spawn(&spec, &dir.path().join("install"), Vec::new(), None);
+        let error = match result {
+            Ok(_) => panic!("a bad signature must not start"),
+            Err(error) => error,
+        };
+        assert!(error.1, "a bad signature is permanent");
+        assert!(error.0.contains("signature"), "{}", error.0);
     }
 
     #[test]

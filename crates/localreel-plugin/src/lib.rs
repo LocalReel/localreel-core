@@ -49,7 +49,7 @@ pub use host::{
 pub use manifest::{
     Manifest, PluginError, PluginKind, API_VERSION, PERMISSION_NETWORK, PERMISSION_STORAGE_READ,
 };
-pub use package::{digest, extract, inspect};
+pub use package::{digest, extract, inspect, sign_package, verify_signature};
 pub use runtime::{PluginRuntime, PluginSandbox};
 pub use schedule::{PluginSchedule, ScheduleStore};
 pub use secrets::{SecretHandle, SecretStore};

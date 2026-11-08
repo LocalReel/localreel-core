@@ -93,6 +93,8 @@ pub enum PluginError {
     Io(String),
     #[error("plugin package error: {0}")]
     Archive(String),
+    #[error("plugin signature error: {0}")]
+    Signature(String),
     #[error("plugin did not become ready: {0}")]
     NotReady(String),
     #[error("plugin request failed: {0}")]

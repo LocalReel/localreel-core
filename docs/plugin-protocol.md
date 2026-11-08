@@ -371,7 +371,29 @@ copied from the build output.
 
 This is artifact pinning, not a signature: it proves the host loaded the bytes
 the operator approved, but it does not establish who built them. Publisher
-signing and a trust store remain phase 3 work.
+signing is layered on top:
+
+```toml
+[[publishers]]
+id = "acme"
+public_key = "64 hex characters"
+
+[[plugins]]
+package = "plugins/collector.lrplug"
+sha256 = "64 hex characters"
+publisher = "acme"
+signature = "128 hex characters"
+```
+
+`localreel-plugin-pack --signing-key publisher.seed` prints the public key and
+the Ed25519 signature over the package SHA-256 digest; the seed file is 32 hex
+bytes. When `publisher` is present the supervisor verifies the signature against
+the trusted key **before** inspect/extract; a missing key, malformed signature
+or mismatch is a permanent start failure.
+
+The trust anchor is the configuration file: an attacker who can rewrite it can
+also replace the publisher key. Key rotation, revocation and a transparency log
+are not implemented; the host does not claim those properties.
 
 ## Permissions
 

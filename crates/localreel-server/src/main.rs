@@ -714,6 +714,13 @@ async fn serve(
                 // starts, so a source that points at it can answer
                 // "unavailable" instead of "unknown".
                 storage.declare(manifest.id.clone());
+                let publisher_key = plugin.publisher.as_ref().and_then(|id| {
+                    config
+                        .publishers
+                        .iter()
+                        .find(|publisher| &publisher.id == id)
+                        .map(|publisher| publisher.public_key.clone())
+                });
                 specs.push(
                     localreel_plugin::PluginSpec::new(
                         package.clone(),
@@ -721,7 +728,12 @@ async fn serve(
                         plugin.config.clone(),
                         plugin.enabled,
                     )
-                    .with_sha256(plugin.sha256.clone()),
+                    .with_sha256(plugin.sha256.clone())
+                    .with_signature(
+                        plugin.publisher.clone(),
+                        plugin.signature.clone(),
+                        publisher_key,
+                    ),
                 );
                 if !plugin.enabled {
                     info!(package = %package.display(), "plugin is disabled in the configuration");

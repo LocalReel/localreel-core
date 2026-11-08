@@ -30,6 +30,10 @@ pub fn inspect(path: &Path) -> Result<Manifest, PluginError> {
 /// This is the whole-file digest, not a signature: it proves the host loads the
 /// exact artifact an operator approved, but it does not establish who built it.
 pub fn digest(path: &Path) -> Result<String, PluginError> {
+    Ok(hex(&digest_bytes(path)?))
+}
+
+fn digest_bytes(path: &Path) -> Result<[u8; 32], PluginError> {
     use sha2::{Digest, Sha256};
 
     let mut file = File::open(path)
@@ -46,7 +50,66 @@ pub fn digest(path: &Path) -> Result<String, PluginError> {
         hasher.update(&buffer[..read]);
     }
     let digest = hasher.finalize();
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+/// Sign the package digest with an Ed25519 seed (32 hex bytes).
+///
+/// Returns `(public_key_hex, signature_hex)`. The signature covers the
+/// SHA-256 digest, not the whole file: the digest is already the artifact pin.
+pub fn sign_package(path: &Path, seed_hex: &str) -> Result<(String, String), PluginError> {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let seed = decode_hex::<32>(seed_hex, "signing seed")?;
+    let signing = SigningKey::from_bytes(&seed);
+    let digest = digest_bytes(path)?;
+    let signature = signing.sign(&digest);
+    Ok((
+        hex(signing.verifying_key().as_bytes()),
+        hex(&signature.to_bytes()),
+    ))
+}
+
+/// Verify `signature_hex` over the package digest with `public_key_hex`.
+pub fn verify_signature(
+    path: &Path,
+    signature_hex: &str,
+    public_key_hex: &str,
+) -> Result<(), PluginError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let digest = digest_bytes(path)?;
+    let signature_bytes = decode_hex::<64>(signature_hex, "signature")?;
+    let key_bytes = decode_hex::<32>(public_key_hex, "publisher public key")?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    let key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| PluginError::Signature(format!("invalid publisher key: {error}")))?;
+    key.verify(&digest, &signature)
+        .map_err(|_| PluginError::Signature("signature does not match the package".into()))
+}
+
+fn decode_hex<const N: usize>(text: &str, what: &str) -> Result<[u8; N], PluginError> {
+    let text = text.trim();
+    if text.len() != N * 2 {
+        return Err(PluginError::Signature(format!(
+            "{what} must be {} hexadecimal characters",
+            N * 2
+        )));
+    }
+    let mut bytes = [0u8; N];
+    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|_| PluginError::Signature(format!("{what} is not hex")))?;
+        bytes[index] = u8::from_str_radix(pair, 16)
+            .map_err(|_| PluginError::Signature(format!("{what} is not hex")))?;
+    }
+    Ok(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Extract a package into `destination`, returning its validated manifest.
@@ -502,6 +565,24 @@ mod tests {
             std::fs::read(extracted.join("data/readme.txt")).unwrap(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn signs_and_verifies_a_package_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_directory(temp.path());
+        let output = temp.path().join("signed.lrplug");
+        pack(&dir, &output).unwrap();
+        let seed = "11".repeat(32);
+        let (public_key, signature) = sign_package(&output, &seed).unwrap();
+        verify_signature(&output, &signature, &public_key).unwrap();
+
+        // Any byte change invalidates the digest the signature covers.
+        let tampered = temp.path().join("tampered.lrplug");
+        let mut bytes = std::fs::read(&output).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&tampered, bytes).unwrap();
+        assert!(verify_signature(&tampered, &signature, &public_key).is_err());
     }
 
     #[test]

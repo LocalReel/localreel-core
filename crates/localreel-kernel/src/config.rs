@@ -80,6 +80,8 @@ pub struct Config {
     pub metadata: MetadataConfig,
     /// Sidecar plugins to start with the server (packages on disk).
     pub plugins: Vec<PluginConfig>,
+    /// Trusted publisher keys used by `plugins[].publisher`.
+    pub publishers: Vec<PluginPublisherConfig>,
     /// What happens when one of them cannot start.
     pub plugin_runtime: PluginRuntimeConfig,
     /// Whether the admin page may ask GitHub for the latest release.
@@ -167,8 +169,20 @@ pub struct PluginConfig {
     /// Optional SHA-256 pin. When present, the package bytes must match
     /// before the plugin is inspected or extracted.
     pub sha256: Option<String>,
+    /// Publisher id from `[[plugin_publishers]]`.
+    pub publisher: Option<String>,
+    /// Ed25519 signature (128 hex chars) over the package SHA-256 digest.
+    pub signature: Option<String>,
     /// JSON handed to the plugin via `LOCALREEL_PLUGIN_CONFIG`.
     pub config: serde_json::Value,
+}
+
+/// A trusted publisher public key.
+#[derive(Debug, Clone)]
+pub struct PluginPublisherConfig {
+    pub id: String,
+    /// Ed25519 public key, 32 bytes as 64 hex characters.
+    pub public_key: String,
 }
 
 /// How the host treats plugins that fail to start.
@@ -283,6 +297,7 @@ impl Default for Config {
                 language: "zh-CN".to_string(),
             },
             plugins: Vec::new(),
+            publishers: Vec::new(),
             plugin_runtime: PluginRuntimeConfig {
                 strict: false,
                 stop_timeout: Duration::from_secs(5),
@@ -511,7 +526,19 @@ impl Config {
                     package: plugin.package,
                     enabled: plugin.enabled,
                     sha256: plugin.sha256,
+                    publisher: plugin.publisher,
+                    signature: plugin.signature,
                     config: plugin.config,
+                })
+                .collect();
+        }
+        if !file.publishers.is_empty() {
+            self.publishers = file
+                .publishers
+                .into_iter()
+                .map(|publisher| PluginPublisherConfig {
+                    id: publisher.id,
+                    public_key: publisher.public_key,
                 })
                 .collect();
         }
@@ -691,6 +718,56 @@ impl Config {
                     ));
                 }
             }
+            if let Some(publisher) = &plugin.publisher {
+                if publisher.trim().is_empty() {
+                    return Err(KernelError::Config(
+                        "plugin publisher must not be empty".into(),
+                    ));
+                }
+                if !self.publishers.iter().any(|known| &known.id == publisher) {
+                    return Err(KernelError::Config(format!(
+                        "plugin references unknown publisher '{publisher}'"
+                    )));
+                }
+                let Some(signature) = &plugin.signature else {
+                    return Err(KernelError::Config(format!(
+                        "plugin publisher '{publisher}' requires a signature"
+                    )));
+                };
+                if signature.len() != 128 || !signature.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    return Err(KernelError::Config(
+                        "plugin signature must be 128 hexadecimal characters".into(),
+                    ));
+                }
+            } else if plugin.signature.is_some() {
+                return Err(KernelError::Config(
+                    "plugin signature requires a publisher".into(),
+                ));
+            }
+        }
+        for (index, publisher) in self.publishers.iter().enumerate() {
+            if publisher.id.trim().is_empty() {
+                return Err(KernelError::Config("publisher id must not be empty".into()));
+            }
+            if publisher.public_key.len() != 64
+                || !publisher
+                    .public_key
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit())
+            {
+                return Err(KernelError::Config(
+                    "publisher public_key must be 64 hexadecimal characters".into(),
+                ));
+            }
+            if self.publishers[..index]
+                .iter()
+                .any(|known| known.id == publisher.id)
+            {
+                return Err(KernelError::Config(format!(
+                    "duplicate publisher id '{}'",
+                    publisher.id
+                )));
+            }
         }
         if self.plugin_runtime.stop_timeout.is_zero() {
             return Err(KernelError::Config(
@@ -827,6 +904,8 @@ struct ConfigFile {
     #[serde(default)]
     plugins: Vec<PluginFile>,
     #[serde(default)]
+    publishers: Vec<PluginPublisherFile>,
+    #[serde(default)]
     plugin_runtime: PluginRuntimeFile,
     #[serde(default)]
     update: UpdateFile,
@@ -855,7 +934,17 @@ struct PluginFile {
     #[serde(default)]
     sha256: Option<String>,
     #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
     config: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PluginPublisherFile {
+    id: String,
+    public_key: String,
 }
 
 fn default_true() -> bool {
@@ -1049,10 +1138,16 @@ mod tests {
     fn parses_plugin_entries() {
         let file: ConfigFile = toml::from_str(
             r#"
+            [[publishers]]
+            id = "acme"
+            public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
             [[plugins]]
             package = "C:/plugins/demo.lrplug"
             enabled = false
             sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            publisher = "acme"
+            signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             [plugins.config]
             root = "D:/library"
             "#,
@@ -1060,13 +1155,17 @@ mod tests {
         .unwrap();
         let mut config = Config::default();
         config.apply_file(file).unwrap();
+        config.validate().unwrap();
         assert_eq!(config.plugins.len(), 1);
         assert!(!config.plugins[0].enabled);
         assert_eq!(
             config.plugins[0].sha256.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert_eq!(config.plugins[0].publisher.as_deref(), Some("acme"));
         assert_eq!(config.plugins[0].config["root"], "D:/library");
+        assert_eq!(config.publishers.len(), 1);
+        assert_eq!(config.publishers[0].id, "acme");
         // Failure isolation is the default; strictness is opt-in.
         assert!(!config.plugin_runtime.strict);
     }
@@ -1078,6 +1177,22 @@ mod tests {
             [[plugins]]
             package = "C:/plugins/demo.lrplug"
             sha256 = "not-a-digest"
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_plugin_with_an_unknown_publisher() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+            [[plugins]]
+            package = "C:/plugins/demo.lrplug"
+            publisher = "nobody"
+            signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             "#,
         )
         .unwrap();
