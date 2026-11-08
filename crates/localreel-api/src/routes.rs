@@ -410,6 +410,15 @@ async fn grant_plugin_capability(
     if body.capability.trim().is_empty() {
         return Err(ApiError::bad_request("capability must not be empty"));
     }
+    let requested = state
+        .plugins
+        .manifest(&id)
+        .is_some_and(|manifest| manifest.has_declared_capability(&body.capability));
+    if !requested {
+        return Err(ApiError::bad_request(
+            "the plugin manifest does not request this capability",
+        ));
+    }
     if body.expires_at.is_some_and(|expires| expires <= now_secs()) {
         return Err(ApiError::bad_request("expires_at must be in the future"));
     }
