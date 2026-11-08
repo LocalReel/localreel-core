@@ -125,19 +125,56 @@ down. The entry stays in `GET /api/v1/plugins` with a state:
 
 | State | Meaning |
 |---|---|
+| `starting` | The supervisor is extracting or waiting for the handshake. |
 | `running` | The sidecar is up and its provider is registered. |
+| `unhealthy` | The process is up but `GET /v1/health` keeps failing. |
 | `failed` | Loading failed; `error` carries the reason (also recorded as a `start.failed` audit row). |
 | `disabled` | `enabled = false` in the configuration; never loaded. |
-| `stopped` | Stopped on purpose at runtime (a supervisor milestone). |
+| `stopped` | Stopped on purpose (admin action, or waiting to restart). |
 
 Sources whose `kind` matches a configured but not-running plugin answer `503`
 (`storage_unavailable`) instead of the generic `500`, so a client can tell
 "temporarily down" from "this source is wrong".
 
 Operators who prefer the old behaviour — refuse to start at all — set
-`[plugin_runtime] strict = true`. The stop path waits
-`[plugin_runtime] stop_timeout_secs` (default 5) for in-flight requests before
-killing the process.
+`[plugin_runtime] strict = true`.
+
+### Supervision
+
+The host does not merely start a plugin once; it keeps it alive:
+
+- **Crash detection.** The supervisor polls the child every 250 ms. A process
+  that exits on its own is unregistered, reported as `failed` with its exit
+  status, and retried after 1, 2, 4, 8 and 16 seconds. After five attempts the
+  entry stays `failed` until an operator restarts it.
+- **Permanent failures are not retried.** An unreadable package, an invalid
+  manifest or a rejected API version is reported once; retrying cannot change
+  it.
+- **Health.** `GET /v1/health` runs every 10 seconds with a 2 s budget. Three
+  consecutive failures mark the plugin `unhealthy`; six replace the process.
+  Three health-driven restarts in a row give up.
+- **Stops drain.** A stop stops accepting calls, waits up to
+  `[plugin_runtime] stop_timeout_secs` (default 5) for in-flight requests,
+  unregisters the provider, closes the child's stdin (the graceful path), and
+  only then kills the process tree.
+- **No orphans.** On Windows the child belongs to a Job Object with
+  `KILL_ON_JOB_CLOSE`; on Unix it leads its own process group. A host crash
+  takes the plugin down with it.
+
+### Control API
+
+Administrators can drive the lifecycle without editing `localreel.toml`:
+
+| Request | Effect |
+|---|---|
+| `POST /api/v1/plugins/:id/restart` | Stop the current generation, start a new one. |
+| `POST /api/v1/plugins/:id/disable?persist=false` | Stop it now; the configuration is untouched. |
+| `POST /api/v1/plugins/:id/disable?persist=true` | Also write `enabled = false` into the matching `[[plugins]]` entry. |
+| `POST /api/v1/plugins/:id/enable?persist=…` | The inverse. |
+| `GET /api/v1/plugins/:id/logs?bytes=N` | The last N bytes of the plugin's stderr (≤ 64 KiB). |
+
+Every transition publishes `plugin_state_changed` on the event stream and writes
+an audit row (`start`, `stop`, `crash`, `start.failed`).
 
 ## HTTP contract
 

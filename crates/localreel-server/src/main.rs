@@ -596,6 +596,29 @@ async fn wait_for_ctrl_c() {
         std::future::pending::<()>().await;
     }
 }
+
+/// `systemctl stop`, `docker stop` and a plain `kill` send SIGTERM; without a
+/// handler the process would die with its destructors unrun, which in turn
+/// means the plugin supervisor never drains or kills its children.
+#[cfg(unix)]
+async fn wait_for_terminate() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(error) => {
+            warn!("cannot listen for SIGTERM: {error}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminate() {
+    std::future::pending::<()>().await;
+}
+
 async fn serve(
     mode: RunMode,
     no_open: bool,
@@ -1033,6 +1056,9 @@ async fn serve(
     .with_graceful_shutdown(async move {
         tokio::select! {
             _ = wait_for_ctrl_c() => {}
+            _ = wait_for_terminate() => {
+                info!("shutdown requested by SIGTERM");
+            }
             _ = tray_shutdown => {}
             _ = shutdown_notify.notified() => {
                 info!("shutdown requested from the admin page");

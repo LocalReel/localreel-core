@@ -546,3 +546,23 @@ fn stop_all(shared: &Arc<Shared>, sink: &Arc<dyn ProviderSink>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_then_saturates() {
+        let seconds: Vec<u64> = (1..=6).map(|attempt| backoff(attempt).as_secs()).collect();
+        assert_eq!(seconds, vec![1, 2, 4, 8, 16, 16]);
+    }
+
+    #[test]
+    fn packaging_errors_are_permanent_but_handshakes_are_not() {
+        assert!(is_permanent(&PluginError::Manifest("bad".into())));
+        assert!(is_permanent(&PluginError::ApiVersion("v9".into())));
+        assert!(is_permanent(&PluginError::Missing("bin/plugin".into())));
+        assert!(!is_permanent(&PluginError::NotReady("timeout".into())));
+        assert!(!is_permanent(&PluginError::Request("refused".into())));
+    }
+}
