@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification)
 - Date: 2026-11-08
 
 ## Context
@@ -113,9 +113,9 @@ The CMS/collector probe made the gap concrete:
 20. **Phase 3.10 brokers `fs.read`.** A plugin sends `file://` URIs to
     `POST /api/v1/plugin-broker/fs`; the host checks the active `fs.read` grant,
     canonicalises each root and the target, refuses targets outside all roots,
-    caps reads at 8 MiB and audits allow/deny. Existing storage plugins still
-    use the legacy direct roots until migrated; the check/open TOCTOU gap is
-    documented.
+    caps reads at 8 MiB and audits allow/deny. On Windows, `read` verifies the
+    final path from the opened handle, closing the symlink-swap TOCTOU for reads;
+    `stat`/`list` and non-Windows reads remain path-based.
 21. **Phase 3.11 migrates the reference storage plugin.** `fs_mode =
     "broker"` forwards URIs to the fs broker; the AppContainer storage test
     serves stat/list/read this way. Third-party plugins that omit the mode still

@@ -100,6 +100,7 @@ pub fn execute(roots: &[String], request: &FsRequest) -> Result<Value> {
             let len = request.len.min(MAX_READ_BYTES);
             let mut file = std::fs::File::open(&target)
                 .map_err(|error| KernelError::Storage(format!("open failed: {error}")))?;
+            verify_open_handle(&file, &roots)?;
             file.seek(SeekFrom::Start(request.start))
                 .map_err(|error| KernelError::Storage(format!("seek failed: {error}")))?;
             let mut body = Vec::new();
@@ -174,12 +175,52 @@ fn under_any_root(target: &Path, roots: &[PathBuf]) -> bool {
 }
 
 fn comparable(path: &Path) -> String {
-    let text = path.to_string_lossy();
+    let mut text = path.to_string_lossy().into_owned();
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        text = stripped.to_string();
+    }
     if cfg!(windows) {
         text.to_lowercase()
     } else {
-        text.into_owned()
+        text
     }
+}
+
+#[cfg(windows)]
+fn verify_open_handle(file: &std::fs::File, roots: &[PathBuf]) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let mut buffer = vec![0u16; 4096];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle() as _,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err(KernelError::PermissionDenied(
+            "cannot verify the opened file path".into(),
+        ));
+    }
+    let path = String::from_utf16_lossy(&buffer[..length as usize]);
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    if under_any_root(Path::new(path), roots) {
+        Ok(())
+    } else {
+        Err(KernelError::PermissionDenied(format!(
+            "opened file escaped the granted roots: {path:?} not under {roots:?}"
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn verify_open_handle(_file: &std::fs::File, _roots: &[PathBuf]) -> Result<()> {
+    Ok(())
 }
 
 fn modified(metadata: &std::fs::Metadata) -> Option<i64> {
@@ -292,5 +333,16 @@ mod tests {
             &request
         )
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handle_final_path_must_stay_under_the_roots() {
+        let (dir, outside, _root_uri) = root();
+        let file = std::fs::File::open(dir.path().join("a.txt")).unwrap();
+        let roots = vec![std::fs::canonicalize(outside.path()).unwrap()];
+        assert!(verify_open_handle(&file, &roots).is_err());
+        let roots = vec![std::fs::canonicalize(dir.path()).unwrap()];
+        verify_open_handle(&file, &roots).unwrap();
     }
 }
