@@ -10,6 +10,8 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::capability::{validate_request, CapabilityRequest};
+
 /// Protocol version a host understands. A plugin with any other value is
 /// rejected, never best-effort interpreted.
 pub const API_VERSION: &str = "localreel.plugin/v1";
@@ -32,7 +34,7 @@ pub const PERMISSION_STORAGE_READ: &str = "storage:read";
 
 pub const ALLOWED_PERMISSIONS: &[&str] = &[PERMISSION_STORAGE_READ, PERMISSION_NETWORK];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub id: String,
     pub name: String,
@@ -42,6 +44,10 @@ pub struct Manifest {
     pub entry: Entry,
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// Capabilities the plugin asks for, with typed scopes. Old manifests keep
+    /// using `permissions`; the host maps those to legacy requests for display.
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityRequest>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -164,10 +170,53 @@ impl Manifest {
                 )));
             }
         }
+        let mut capabilities = std::collections::BTreeSet::new();
+        for capability in &self.capabilities {
+            validate_request(capability)?;
+            if !capabilities.insert(capability.name.clone()) {
+                return Err(PluginError::Manifest(format!(
+                    "duplicate capability {:?}",
+                    capability.name
+                )));
+            }
+        }
         // A storage plugin that cannot read its roots cannot do its job, but
         // the permission is implied by the kind: a package written before the
         // permission existed keeps loading. `network` is never implied.
         Ok(())
+    }
+
+    /// Capabilities the manifest explicitly declares.
+    pub fn declared_capabilities(&self) -> &[CapabilityRequest] {
+        &self.capabilities
+    }
+
+    pub fn has_declared_capability(&self, name: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability.name == name)
+    }
+
+    /// Old `permissions` mapped to the capability vocabulary, for display.
+    ///
+    /// These are not validated as manifest requests: an old package may ask
+    /// for `network` without knowing about scopes, so the host shows them as
+    /// `legacy` and does not treat the mapping as an administrator grant.
+    pub fn legacy_capability_requests(&self) -> Vec<CapabilityRequest> {
+        let mut requests = Vec::new();
+        if self.kind == PluginKind::Storage && !self.has_declared_capability("fs.read") {
+            requests.push(CapabilityRequest {
+                name: "fs.read".into(),
+                scope: serde_json::json!({}),
+            });
+        }
+        if self.has_permission(PERMISSION_NETWORK) && !self.has_declared_capability("net.fetch") {
+            requests.push(CapabilityRequest {
+                name: "net.fetch".into(),
+                scope: serde_json::json!({}),
+            });
+        }
+        requests
     }
 
     /// The permissions that actually apply to this plugin.
@@ -271,6 +320,7 @@ mod tests {
                 runtime: None,
             },
             permissions: vec![PERMISSION_NETWORK.into()],
+            capabilities: Vec::new(),
             description: None,
         }
     }
@@ -382,5 +432,61 @@ mod tests {
             value.entry.runtime = Some(runtime.into());
             assert!(value.validate().is_err(), "{runtime} should be rejected");
         }
+    }
+
+    #[test]
+    fn accepts_typed_capabilities_and_rejects_unknown_ones() {
+        let mut value = manifest();
+        value.capabilities = vec![CapabilityRequest {
+            name: "net.fetch".into(),
+            scope: serde_json::json!({"hosts": ["api.example.com"]}),
+        }];
+        let parsed = Manifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.declared_capabilities().len(), 1);
+
+        let mut unknown = manifest();
+        unknown.capabilities = vec![CapabilityRequest {
+            name: "nope".into(),
+            scope: serde_json::json!({}),
+        }];
+        assert!(Manifest::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+        let mut forbidden = manifest();
+        forbidden.capabilities = vec![CapabilityRequest {
+            name: "process.spawn".into(),
+            scope: serde_json::json!({}),
+        }];
+        assert!(Manifest::parse(&serde_json::to_vec(&forbidden).unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_and_malformed_capability_scopes() {
+        let mut duplicate = manifest();
+        duplicate.capabilities = vec![
+            CapabilityRequest {
+                name: "net.fetch".into(),
+                scope: serde_json::json!({"hosts": ["a.example.com"]}),
+            },
+            CapabilityRequest {
+                name: "net.fetch".into(),
+                scope: serde_json::json!({"hosts": ["b.example.com"]}),
+            },
+        ];
+        assert!(Manifest::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+
+        let mut malformed = manifest();
+        malformed.capabilities = vec![CapabilityRequest {
+            name: "net.fetch".into(),
+            scope: serde_json::json!({"hosts": ["api.example.com"], "unknown": 1}),
+        }];
+        assert!(Manifest::parse(&serde_json::to_vec(&malformed).unwrap()).is_err());
+    }
+
+    #[test]
+    fn legacy_permissions_are_reported_as_legacy_requests() {
+        let parsed = Manifest::parse(&serde_json::to_vec(&manifest()).unwrap()).unwrap();
+        let legacy = parsed.legacy_capability_requests();
+        assert!(legacy.iter().any(|request| request.name == "fs.read"));
+        assert!(legacy.iter().any(|request| request.name == "net.fetch"));
     }
 }

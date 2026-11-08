@@ -12,7 +12,9 @@
 //! the host.
 
 pub mod audit;
+pub mod capability;
 mod gate;
+pub mod grants;
 pub mod host;
 pub mod http;
 pub mod manifest;
@@ -23,10 +25,15 @@ pub mod server;
 pub mod storage;
 mod supervisor;
 
-pub use audit::{AuditEntry, AuditLog};
+pub use audit::{AuditEntry, AuditEvent, AuditLog};
+pub use capability::{
+    scope_digest, CapabilityDescriptor, CapabilityRequest, RequestedCapability, CAPABILITIES,
+};
 pub use gate::Gate;
+pub use grants::{CapabilityGrant, GrantStore};
 pub use host::{
-    PluginDescriptor, PluginFailure, PluginHost, PluginSpec, PluginState, ProxyResponse,
+    CapabilityReport, PluginDescriptor, PluginFailure, PluginHost, PluginSpec, PluginState,
+    ProxyResponse,
 };
 pub use manifest::{
     Manifest, PluginError, PluginKind, API_VERSION, PERMISSION_NETWORK, PERMISSION_STORAGE_READ,

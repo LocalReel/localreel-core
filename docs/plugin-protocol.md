@@ -66,6 +66,57 @@ Rules:
   implied by the kind, so a package that predates the permission keeps loading
   and `effective_permissions()` reports it anyway. `network` is never implied.
 
+### Capabilities (phase 1)
+
+A manifest may also request typed capabilities. The name and scope schema are
+owned by the host; the plugin chooses only from the published vocabulary:
+
+```json
+{
+  "capabilities": [
+    {
+      "name": "net.fetch",
+      "scope": {
+        "hosts": ["api.example.com"],
+        "methods": ["GET"],
+        "max_bytes": 16777216,
+        "timeout_secs": 30,
+        "redirects": 0,
+        "rate_per_min": 60
+      }
+    },
+    {
+      "name": "catalog.write",
+      "scope": { "mode": "draft", "max_items_per_run": 2000 }
+    }
+  ]
+}
+```
+
+- Unknown, duplicate, malformed and **forbidden** names are rejected before the
+  package is extracted. The forbidden list includes `net.listen`, `net.socket`,
+  `process.spawn`, `host.database`, `host.config`, `host.filesystem`,
+  `plugin.install`, `ui.inject` and `audit.disable`.
+- Phase 1 vocabulary: `fs.read`, `net.fetch`, `secret.use`, `schedule.request`,
+  `catalog.write`, `blob.read`, `blob.write`. Tiers (0 implicit … 3 high) and
+  scope bounds are host-side; `catalog.write` with `mode: "publish"` is tier 3.
+- A grant is **per plugin version** and lives in `plugin_grants`. An upgrade that
+  adds a capability needs a new grant. Administrators use:
+
+  ```text
+  GET    /api/v1/plugins/:id/capabilities
+  POST   /api/v1/plugins/:id/capabilities          {"capability":"net.fetch","scope":{...}}
+  DELETE /api/v1/plugins/:id/capabilities/:capability
+  ```
+
+  The response mixes `source: "manifest"` (declared) with `source: "legacy"`
+  (the old `storage:read`/`network` permissions, shown for compatibility).
+- **Phase 1 does not enforce capabilities at call time.** There is no broker yet;
+  a grant is a disclosed and attributable intent, not a privilege that has been
+  exercised. The admin page must say so, and the protocol must not describe a
+  grant as an OS sandbox. Phase 2 adds the broker, phase 3 the transport/OS
+  isolation (ADR-019).
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it

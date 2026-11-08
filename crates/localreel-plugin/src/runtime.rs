@@ -369,6 +369,7 @@ mod tests {
                 runtime: runtime.map(str::to_string),
             },
             permissions: vec![],
+            capabilities: vec![],
             description: None,
         }
     }

@@ -28,7 +28,9 @@ use localreel_kernel::error::{KernelError, Result};
 use serde::Serialize;
 
 use crate::audit::AuditLog;
+use crate::capability::{self, CapabilityDescriptor, RequestedCapability, CAPABILITIES};
 use crate::gate::Gate;
+use crate::grants::{CapabilityGrant, GrantStore};
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
 use crate::package::inspect;
 use crate::runtime::PluginRuntime;
@@ -37,6 +39,55 @@ use crate::supervisor::{self, Intent, ProviderSink};
 /// Upper bound on a proxied response, so one plugin cannot fill the disk.
 pub const MAX_PROXY_BYTES: u64 = 32 * 1024 * 1024;
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the admin page needs to answer "what does this plugin ask for, what did
+/// we grant, and what is the host's own risk description".
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilityReport {
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub requested: Vec<RequestedCapability>,
+    pub granted: Vec<CapabilityGrant>,
+    pub catalog: Vec<CapabilityDescriptor>,
+    pub forbidden: Vec<String>,
+}
+
+fn requested_capabilities(manifest: &Manifest) -> Vec<RequestedCapability> {
+    let mut requested = Vec::new();
+    for request in manifest.declared_capabilities() {
+        let Some(descriptor) = capability::descriptor(&request.name) else {
+            continue;
+        };
+        let tier = capability::validate_request(request)
+            .map(|validated| validated.tier)
+            .unwrap_or(descriptor.tier);
+        requested.push(RequestedCapability {
+            name: request.name.clone(),
+            scope: request.scope.clone(),
+            tier,
+            source: "manifest",
+            title: descriptor.title,
+            description: descriptor.description,
+            audit: descriptor.audit,
+        });
+    }
+    for request in manifest.legacy_capability_requests() {
+        let Some(descriptor) = capability::descriptor(&request.name) else {
+            continue;
+        };
+        requested.push(RequestedCapability {
+            name: request.name,
+            scope: request.scope,
+            tier: descriptor.tier,
+            source: "legacy",
+            title: descriptor.title,
+            description: descriptor.description,
+            audit: descriptor.audit,
+        });
+    }
+    requested
+}
 
 /// Lifecycle state of one configured plugin.
 ///
@@ -185,6 +236,7 @@ pub(crate) struct Inner {
 pub(crate) struct Shared {
     pub(crate) inner: RwLock<Inner>,
     pub(crate) audit: Option<AuditLog>,
+    pub(crate) grants: Option<GrantStore>,
     /// `<data>/plugins`; each generation installs under `<id>/<version>`.
     pub(crate) install_root: PathBuf,
     pub(crate) stop_timeout: Duration,
@@ -225,14 +277,15 @@ pub struct PluginHost {
 
 impl Default for PluginHost {
     fn default() -> Self {
-        Self::build(None, PathBuf::from("plugins"), Duration::from_secs(5))
+        Self::build(None, None, PathBuf::from("plugins"), Duration::from_secs(5))
     }
 }
 
 impl PluginHost {
     pub fn new(db: Database) -> Self {
         Self::build(
-            Some(AuditLog::new(db)),
+            Some(AuditLog::new(db.clone())),
+            Some(GrantStore::new(db)),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -241,14 +294,25 @@ impl PluginHost {
     /// The server's constructor: where generations install, and how long a stop
     /// waits for in-flight requests.
     pub fn with_options(db: Database, install_root: PathBuf, stop_timeout: Duration) -> Self {
-        Self::build(Some(AuditLog::new(db)), install_root, stop_timeout)
+        Self::build(
+            Some(AuditLog::new(db.clone())),
+            Some(GrantStore::new(db)),
+            install_root,
+            stop_timeout,
+        )
     }
 
-    fn build(audit: Option<AuditLog>, install_root: PathBuf, stop_timeout: Duration) -> Self {
+    fn build(
+        audit: Option<AuditLog>,
+        grants: Option<GrantStore>,
+        install_root: PathBuf,
+        stop_timeout: Duration,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inner: RwLock::new(Inner::default()),
                 audit,
+                grants,
                 install_root,
                 stop_timeout,
             }),
@@ -258,6 +322,10 @@ impl PluginHost {
 
     pub fn audit(&self) -> Option<&AuditLog> {
         self.shared.audit.as_ref()
+    }
+
+    pub fn grants(&self) -> Option<&GrantStore> {
+        self.shared.grants.as_ref()
     }
 
     /// Install the specs and start supervising them.
@@ -394,7 +462,18 @@ impl PluginHost {
         let descriptor = descriptor_for(package, manifest, PluginState::Failed, Some(error));
         self.shared
             .record_audit(&descriptor.id, "start.failed", error);
-        self.insert(descriptor, None, None, None);
+        // Keep the inspected manifest so the admin page can still show what the
+        // package asked for even though it never started. The spec is disabled:
+        // it exists for disclosure, not for a retry.
+        let spec = manifest.map(|manifest| {
+            PluginSpec::new(
+                package.to_path_buf(),
+                manifest.clone(),
+                serde_json::json!({}),
+                false,
+            )
+        });
+        self.insert(descriptor, spec, None, None);
     }
 
     fn insert(
@@ -442,6 +521,47 @@ impl PluginHost {
             .entries
             .get(id)
             .map(|entry| entry.descriptor.clone())
+    }
+
+    /// The manifest this plugin was inspected from, if the package was usable.
+    pub fn manifest(&self, id: &str) -> Option<Manifest> {
+        self.shared
+            .read()
+            .entries
+            .get(id)
+            .and_then(|entry| entry.spec.as_ref().map(|spec| spec.manifest.clone()))
+    }
+
+    /// Disclosed request, granted scope and the host's risk descriptions.
+    pub fn capability_report(&self, id: &str) -> Option<CapabilityReport> {
+        let (name, version, manifest) = {
+            let inner = self.shared.read();
+            let entry = inner.entries.get(id)?;
+            (
+                entry.descriptor.name.clone(),
+                entry.descriptor.version.clone(),
+                entry.spec.as_ref().map(|spec| spec.manifest.clone()),
+            )
+        };
+        let requested = manifest
+            .as_ref()
+            .map(requested_capabilities)
+            .unwrap_or_default();
+        let granted = self
+            .shared
+            .grants
+            .as_ref()
+            .and_then(|grants| grants.list(Some(id)).ok())
+            .unwrap_or_default();
+        Some(CapabilityReport {
+            plugin_id: id.to_string(),
+            name,
+            version,
+            requested,
+            granted,
+            catalog: CAPABILITIES.to_vec(),
+            forbidden: capability::forbidden(),
+        })
     }
 
     /// The package path as written in the configuration, used to persist a
@@ -655,6 +775,7 @@ mod tests {
     use super::*;
 
     use crate::manifest::{Entry as ManifestEntry, PluginKind, API_VERSION};
+    use localreel_kernel::db::Database;
 
     fn manifest(permissions: Vec<&str>) -> Manifest {
         Manifest {
@@ -669,6 +790,7 @@ mod tests {
                 runtime: None,
             },
             permissions: permissions.into_iter().map(str::to_string).collect(),
+            capabilities: Vec::new(),
             description: None,
         }
     }
@@ -747,5 +869,48 @@ mod tests {
         assert_eq!(json, "\"failed\"");
         let json = serde_json::to_string(&PluginState::Unhealthy).unwrap();
         assert_eq!(json, "\"unhealthy\"");
+    }
+
+    #[test]
+    fn capability_report_discloses_requests_and_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("host.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+
+        let mut manifest = manifest(vec!["network"]);
+        manifest.capabilities = vec![crate::capability::CapabilityRequest {
+            name: "net.fetch".into(),
+            scope: serde_json::json!({"hosts": ["api.example.com"]}),
+        }];
+        host.record_failed(&package(), Some(&manifest), "handshake timed out");
+
+        let report = host.capability_report("demo").unwrap();
+        assert!(report
+            .requested
+            .iter()
+            .any(|request| request.name == "net.fetch" && request.source == "manifest"));
+        assert!(report
+            .requested
+            .iter()
+            .any(|request| request.name == "fs.read" && request.source == "legacy"));
+        assert!(report.granted.is_empty());
+        assert_eq!(report.catalog.len(), crate::capability::CAPABILITIES.len());
+        assert!(!report.forbidden.is_empty());
+
+        host.grants()
+            .unwrap()
+            .grant(
+                "demo",
+                "0.1.0",
+                "net.fetch",
+                serde_json::json!({"hosts": ["api.example.com"]}),
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let report = host.capability_report("demo").unwrap();
+        assert_eq!(report.granted.len(), 1);
+        assert_eq!(report.granted[0].capability, "net.fetch");
     }
 }

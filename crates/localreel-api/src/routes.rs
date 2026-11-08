@@ -11,7 +11,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, CurrentUser, DeleteSourceReport, FeedItem,
     Media, MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
+use localreel_plugin::AuditEvent;
 
 use crate::auth;
 use crate::error::ApiError;
@@ -86,6 +87,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/audit", get(plugin_audit))
+        .route(
+            "/api/v1/plugins/:id/capabilities",
+            get(plugin_capabilities).post(grant_plugin_capability),
+        )
+        .route(
+            "/api/v1/plugins/:id/capabilities/:capability",
+            delete(revoke_plugin_capability),
+        )
         .route("/api/v1/plugins/:id/restart", post(plugin_restart))
         .route("/api/v1/plugins/:id/enable", post(plugin_enable))
         .route("/api/v1/plugins/:id/disable", post(plugin_disable))
@@ -359,6 +368,127 @@ async fn plugin_audit(
         .transpose()?
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+/// What a plugin asks for, what it was granted, and the host's own risk text.
+async fn plugin_capabilities(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let report = state
+        .plugins
+        .capability_report(&id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin '{id}'")))?;
+    let body = serde_json::to_value(report)
+        .map_err(|error| ApiError::internal(format!("failed to encode capabilities: {error}")))?;
+    Ok(Json(body))
+}
+
+fn empty_capability_scope() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+#[derive(Debug, Deserialize)]
+struct GrantCapabilityRequest {
+    capability: String,
+    #[serde(default = "empty_capability_scope")]
+    scope: serde_json::Value,
+    expires_at: Option<i64>,
+}
+
+/// Grant one capability for the plugin's current version.
+async fn grant_plugin_capability(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(current): Extension<CurrentUser>,
+    Json(body): Json<GrantCapabilityRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let descriptor = state
+        .plugins
+        .descriptor(&id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin '{id}'")))?;
+    if body.capability.trim().is_empty() {
+        return Err(ApiError::bad_request("capability must not be empty"));
+    }
+    if body.expires_at.is_some_and(|expires| expires <= now_secs()) {
+        return Err(ApiError::bad_request("expires_at must be in the future"));
+    }
+    let grants = state.plugins.grants().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "capability grants are not available",
+        )
+    })?;
+    let grant = grants.grant(
+        &id,
+        &descriptor.version,
+        &body.capability,
+        body.scope,
+        Some(current.user.id),
+        body.expires_at,
+    )?;
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id: &id,
+            capability: Some(&grant.capability),
+            action: "capability.grant",
+            result: "granted",
+            detail: Some("granted by administrator"),
+            scope_digest: Some(&grant.scope_digest),
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: Some(current.user.id),
+        });
+    }
+    let body = serde_json::to_value(grant)
+        .map_err(|error| ApiError::internal(format!("failed to encode grant: {error}")))?;
+    Ok(Json(body))
+}
+
+/// Revoke one capability for the plugin's current version.
+async fn revoke_plugin_capability(
+    State(state): State<Arc<AppState>>,
+    Path((id, capability)): Path<(String, String)>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let descriptor = state
+        .plugins
+        .descriptor(&id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin '{id}'")))?;
+    let grants = state.plugins.grants().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "capability grants are not available",
+        )
+    })?;
+    let revoked = grants.revoke(&id, &descriptor.version, &capability)?;
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id: &id,
+            capability: Some(&capability),
+            action: "capability.revoke",
+            result: if revoked { "revoked" } else { "not_found" },
+            detail: Some("revoked by administrator"),
+            scope_digest: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: Some(current.user.id),
+        });
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "plugin": id,
+        "capability": capability,
+        "revoked": revoked,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1773,6 +1903,7 @@ mod tests {
         let db = Database::open(dir.join("api.db").to_str().unwrap(), 1).unwrap();
         migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
         migrations::apply(&db, "media", localreel_media::migrations::list()).unwrap();
+        migrations::apply(&db, "plugin", localreel_plugin::audit::migrations()).unwrap();
         let events = EventBus::new(16);
         let jobs = JobQueue::new(db.clone(), events.clone());
         // Keep every derived directory inside the temp dir: a test must never
@@ -1785,6 +1916,7 @@ mod tests {
             2,
             std::time::Duration::from_secs(900),
         ));
+        let plugins = Arc::new(localreel_plugin::PluginHost::new(db.clone()));
         AppState::new(crate::state::AppStateParts {
             config,
             db,
@@ -1793,7 +1925,7 @@ mod tests {
             media,
             accounts,
             transcodes,
-            plugins: Arc::new(localreel_plugin::PluginHost::default()),
+            plugins,
             config_source: None,
             metadata_provider: None,
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
@@ -1812,12 +1944,17 @@ mod tests {
     /// A state with a configured owner and one live session.
     fn signed_in(dir: &std::path::Path) -> (Arc<AppState>, String, String) {
         let state = state(dir);
+        let (session, csrf) = sign_in(&state);
+        (state, session, csrf)
+    }
+
+    fn sign_in(state: &Arc<AppState>) -> (String, String) {
         let owner = state
             .accounts
             .setup_owner("owner", "correct horse")
             .unwrap();
         let session = state.accounts.create_session(owner.id).unwrap();
-        (state, session.id, session.csrf)
+        (session.id, session.csrf)
     }
 
     fn request_as(uri: &str, session: &str) -> Request<Body> {
@@ -2216,6 +2353,115 @@ mod tests {
         assert_eq!(plugin["state"], "failed");
         assert_eq!(plugin["running"], false);
         assert_eq!(plugin["error"], "plugin did not print a ready line in time");
+    }
+
+    #[tokio::test]
+    async fn plugin_capabilities_are_disclosed_and_grantable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let (session, csrf) = sign_in(&state);
+        let manifest = localreel_plugin::Manifest::parse(
+            br#"{
+                "id": "probe",
+                "name": "Capability probe",
+                "version": "0.1.0",
+                "api_version": "localreel.plugin/v1",
+                "kind": "storage",
+                "entry": { "program": "plugin-probe", "args": [] },
+                "permissions": ["network"],
+                "capabilities": [
+                    { "name": "net.fetch", "scope": { "hosts": ["api.example.com"] } }
+                ]
+            }"#,
+        )
+        .unwrap();
+        state.plugins.record_failed(
+            &std::path::PathBuf::from("plugins/probe.lrplug"),
+            Some(&manifest),
+            "not started in this test",
+        );
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/plugins/probe/capabilities", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["plugin_id"], "probe");
+        assert!(value["requested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| request["name"] == "net.fetch" && request["source"] == "manifest"));
+        // The storage baseline still shows up as a legacy request.
+        assert!(value["requested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| request["name"] == "fs.read" && request["source"] == "legacy"));
+        assert!(!value["catalog"].as_array().unwrap().is_empty());
+
+        let grant = serde_json::json!({
+            "capability": "net.fetch",
+            "scope": { "hosts": ["api.example.com"] }
+        });
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/probe/capabilities",
+                &session,
+                &csrf,
+                grant.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["capability"], "net.fetch");
+        assert_eq!(value["tier"], 2);
+        assert_eq!(value["scope"]["hosts"][0], "api.example.com");
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "DELETE",
+                "/api/v1/plugins/probe/capabilities/net.fetch",
+                &session,
+                &csrf,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["revoked"], true);
+
+        // The grant row stays as history, but it is marked revoked.
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/probe/capabilities", &session))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["granted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["capability"] == "net.fetch" && grant["revoked_at"].is_number()));
     }
 
     #[tokio::test]
