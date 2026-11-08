@@ -200,6 +200,11 @@ MacCMS `list` into `{remote_id,name,lines:[{source_tag,episodes}]}` and writes
 itself. There is no CMS catalog yet; this slice exists to keep the broker
 contract honest before the catalog schema is committed.
 
+The demo reuses `kind: "storage"` only because protocol v1 has no collector kind;
+it serves health and nothing else, so it must not be pointed at a source. A
+`kind: "catalog"` (or a collector capability) is a separate protocol decision
+and is deliberately not smuggled into this slice.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it
