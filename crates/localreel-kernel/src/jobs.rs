@@ -237,6 +237,27 @@ impl JobQueue {
         Ok(job)
     }
 
+    /// The most recent job for a dedupe key, whatever its status.
+    ///
+    /// Callers use this to explain a failure instead of silently queueing the
+    /// same work again: once a job is finished its dedupe key is free, so a
+    /// naive retry loop would enqueue a new one on every poll.
+    pub fn latest_for_dedupe(&self, kind: &str, dedupe_key: &str) -> Result<Option<JobRecord>> {
+        self.db.with_read(|connection| {
+            Ok(connection
+                .query_row(
+                    &format!(
+                        "SELECT {JOB_COLUMNS} FROM sys_jobs
+                         WHERE kind = ?1 AND dedupe_key = ?2
+                         ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    params![kind, dedupe_key],
+                    row_to_job,
+                )
+                .optional()?)
+        })
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<JobRecord>> {
         self.db.with_read(|connection| {
             Ok(connection
@@ -610,8 +631,10 @@ impl JobQueue {
 
             let mut events = Vec::new();
             for (id, kind, attempts, max_attempts) in &rows {
-                let next_attempt = attempts + 1;
-                if next_attempt >= *max_attempts {
+                // `claim` already counted this run, so a crash must not count it
+                // again: a job allowed two attempts that dies on its first one
+                // still has its retry left.
+                if attempts >= max_attempts {
                     transaction.execute(
                         "UPDATE sys_jobs
                          SET status = 'failed', attempts = ?1,
@@ -619,7 +642,7 @@ impl JobQueue {
                              finished_at = ?2,
                              lease_owner = NULL, lease_expires_at = NULL
                          WHERE id = ?3 AND status = 'running'",
-                        params![next_attempt, now, id],
+                        params![attempts, now, id],
                     )?;
                     events.push(Event::JobFailed {
                         job_id: id.clone(),
@@ -633,7 +656,7 @@ impl JobQueue {
                              error = NULL, lease_owner = NULL,
                              lease_expires_at = NULL
                          WHERE id = ?3 AND status = 'running'",
-                        params![next_attempt, now, id],
+                        params![attempts, now, id],
                     )?;
                     events.push(Event::JobQueued {
                         job_id: id.clone(),
@@ -1203,6 +1226,39 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_does_not_consume_two_attempts() {
+        let (_dir, queue) = setup();
+        // Two attempts are allowed, so a crash on the first one must leave one.
+        let id = queue.enqueue("test", "{}", None, 2).unwrap();
+        queue.claim("worker-1", -1).unwrap().unwrap();
+        assert_eq!(queue.reclaim_expired().unwrap(), 1);
+
+        let recovered = queue.get(&id).unwrap().unwrap();
+        assert_eq!(recovered.status, status::QUEUED);
+        assert_eq!(
+            recovered.attempts, 1,
+            "the crashed run is the one already counted"
+        );
+
+        let claimed = queue.claim("worker-2", 60).unwrap().unwrap();
+        assert_eq!(claimed.attempts, 2);
+
+        // A second crash exhausts the budget for real.
+        queue
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE sys_jobs SET lease_expires_at = 0 WHERE id = ?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(queue.reclaim_expired().unwrap(), 1);
+        assert_eq!(queue.get(&id).unwrap().unwrap().status, status::FAILED);
+    }
+
+    #[test]
     fn restart_recovers_a_crashed_job_after_its_lease_expires() {
         let (dir, queue) = setup();
         let id = queue.enqueue("test", "{}", None, 3).unwrap();
@@ -1231,11 +1287,12 @@ mod tests {
         assert_eq!(restarted.reclaim_expired().unwrap(), 1);
         let recovered = restarted.get(&id).unwrap().unwrap();
         assert_eq!(recovered.status, status::QUEUED);
-        // claim already counted the first attempt, reclaim counts the retry.
-        assert_eq!(recovered.attempts, 2);
+        // The crashed run was already counted when it was claimed; the retry
+        // gets the next number when it actually starts.
+        assert_eq!(recovered.attempts, 1);
         let claimed = restarted.claim("worker-2", 60).unwrap().unwrap();
         assert_eq!(claimed.id, id);
-        assert_eq!(claimed.attempts, 3);
+        assert_eq!(claimed.attempts, 2);
         drop(dir);
     }
 
