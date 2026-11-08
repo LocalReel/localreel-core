@@ -7,7 +7,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use serde_json::json;
+use base64::Engine as _;
+use serde_json::{json, Value};
 
 /// One directory entry returned by a provider.
 #[derive(Debug, Clone)]
@@ -73,6 +74,129 @@ pub fn run(handler: Box<dyn Handler>) -> std::io::Result<()> {
         let _ = handle(stream, handler.as_ref(), &token);
     }
     Ok(())
+}
+
+/// Serve the same handlers over stdin/stdout instead of a TCP port.
+///
+/// One JSON request per line, one JSON response per line. No socket is opened
+/// by the plugin; the host owns both pipes.
+pub fn run_stdio(handler: Box<dyn Handler>) -> std::io::Result<()> {
+    let token = std::env::var("LOCALREEL_PLUGIN_TOKEN").unwrap_or_default();
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    json!({"id": null, "ok": false, "error": format!("invalid request: {error}")})
+                );
+                let _ = writer.flush();
+                continue;
+            }
+        };
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let response = if request.get("token").and_then(Value::as_str) != Some(token.as_str()) {
+            Err("forbidden".to_string())
+        } else {
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let params = request.get("params").cloned().unwrap_or(Value::Null);
+            dispatch_stdio(handler.as_ref(), method, &params)
+        };
+        let line = match response {
+            Ok(result) => json!({"id": id, "ok": true, "result": result}),
+            Err(error) => json!({"id": id, "ok": false, "error": error}),
+        };
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn dispatch_stdio(handler: &dyn Handler, method: &str, params: &Value) -> Result<Value, String> {
+    match method {
+        "health" => Ok(json!({"ok": true})),
+        "stat" => {
+            let uri = string_param(params, "uri")?;
+            handler
+                .stat(&uri)
+                .map(|stat| json!({"size": stat.size, "modified": stat.modified, "is_dir": stat.is_dir}))
+                .map_err(handler_error)
+        }
+        "list" | "walk" => {
+            let uri = string_param(params, "uri")?;
+            let recursive = params
+                .get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(method == "walk");
+            handler
+                .list(&uri, recursive)
+                .map(|entries| {
+                    json!({"entries": entries.into_iter().map(|entry| json!({
+                        "uri": entry.uri,
+                        "name": entry.name,
+                        "is_dir": entry.is_dir,
+                        "size": entry.size,
+                        "modified": entry.modified,
+                    })).collect::<Vec<_>>()})
+                })
+                .map_err(handler_error)
+        }
+        "read" => {
+            let uri = string_param(params, "uri")?;
+            let start = u64_param(params, "start").unwrap_or(0);
+            let len = u64_param(params, "len").unwrap_or(0);
+            handler
+                .read(&uri, start, len)
+                .map(|bytes| json!({"body_b64": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+                .map_err(handler_error)
+        }
+        "schedule" => {
+            let payload = params
+                .get("payload")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            handler
+                .schedule(payload)
+                .map(|()| json!({"ok": true}))
+                .map_err(handler_error)
+        }
+        other => Err(format!("unknown method {other:?}")),
+    }
+}
+
+fn string_param(params: &Value, name: &str) -> Result<String, String> {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("missing parameter {name:?}"))
+}
+
+fn u64_param(params: &Value, name: &str) -> Option<u64> {
+    params.get(name).and_then(Value::as_u64)
+}
+
+fn handler_error(error: HandlerError) -> String {
+    match error {
+        HandlerError::NotFound => "not found".to_string(),
+        HandlerError::Failed(message) => message,
+    }
 }
 
 fn handle(mut stream: TcpStream, handler: &dyn Handler, token: &str) -> std::io::Result<()> {

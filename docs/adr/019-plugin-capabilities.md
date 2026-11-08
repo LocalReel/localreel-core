@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport)
 - Date: 2026-11-08
 
 ## Context
@@ -79,9 +79,14 @@ The CMS/collector probe made the gap concrete:
     `max_processes` bound one plugin tree: Windows applies both to the Job Object,
     Unix applies `RLIMIT_AS` (process count is not enforced on Unix yet). This is
     resource containment, not network isolation.
-14. **`fs.read` remains legacy** (source roots handed directly) and is not
-    brokered. The control channel is still loopback HTTP; the next phase replaces
-    it and adds OS isolation.
+14. **Phase 3.4 adds a stdio transport.** `entry.transport = "stdio"` uses
+    newline-delimited JSON-RPC over stdin/stdout; the plugin listens on nothing.
+    The storage adapter and SDK support both transports. This removes the need
+    for a listening port, not the ability to open one: OS network isolation is
+    still required.
+15. **`fs.read` remains legacy** (source roots handed directly) and is not
+    brokered. The HTTP transport remains the default; phase 3 continues with OS
+    isolation.
 
 ## Consequences
 

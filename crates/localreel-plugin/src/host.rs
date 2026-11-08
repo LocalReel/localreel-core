@@ -1673,6 +1673,7 @@ mod tests {
                 program: "plugin".into(),
                 args: Vec::new(),
                 runtime: None,
+                transport: "http".into(),
             },
             permissions: permissions.into_iter().map(str::to_string).collect(),
             capabilities: Vec::new(),

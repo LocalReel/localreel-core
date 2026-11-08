@@ -413,6 +413,33 @@ max_processes = 16
 These limits do not block network access. A plugin can still open its own
 socket; transport/OS isolation remains the next phase.
 
+## Transports (phase 3.4)
+
+`entry.transport` selects the control channel:
+
+```json
+{"entry": {"program": "bin/plugin", "transport": "stdio"}}
+```
+
+- `http` (default): the plugin listens on `127.0.0.1`, prints one ready line and
+  serves the existing `/v1/*` endpoints.
+- `stdio`: the plugin listens on nothing. The host writes one JSON request per
+  line to stdin and reads one JSON response per line from stdout:
+
+  ```json
+  {"id":1,"token":"...","method":"stat","params":{"uri":"file:///a.mp4"}}
+  {"id":1,"ok":true,"result":{"size":6,"modified":null,"is_dir":false}}
+  ```
+
+  Methods: `health`, `stat`, `list`, `walk`, `read` (returns
+  `{"body_b64":"..."}`), `schedule`. Diagnostics go to stderr; stdout is the
+  protocol. The SDK exposes `run_stdio(handler)`.
+
+The environment tells the plugin which mode the host selected
+(`LOCALREEL_PLUGIN_TRANSPORT`). Stdio removes the *need* to listen for a port;
+it does not yet prevent a malicious plugin from opening its own socket. OS-level
+network isolation remains phase 3 work.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it
@@ -460,9 +487,12 @@ guarantee is that every sanctioned request is attributable.
    - `LOCALREEL_PLUGIN_ROOTS` — JSON array of the source roots the plugin owns;
    - `LOCALREEL_PLUGIN_HOST_URL` — base URL of the host broker
      (`http://127.0.0.1:<port>` in phase 2; phase 3 replaces the control channel).
-4. The plugin prints one line to stdout:
-   `{"ready": true, "port": 12345}` and listens on `127.0.0.1`.
-5. The host calls `GET /v1/health` until it returns 200 (bounded retries).
+4. With `transport = "http"` the plugin prints one line to stdout:
+   `{"ready": true, "port": 12345}` and listens on `127.0.0.1`. With
+   `transport = "stdio"` it prints no ready line and answers the host's health
+   RPC on stdin/stdout instead.
+5. The host calls health: `GET /v1/health` for HTTP, or the `health` JSON-RPC
+   method for stdio, until it returns success (bounded retries).
 6. On shutdown or when the host drops the runtime, the child process is killed.
 
 The plugin must not write to stdout after the ready line (stdout is drained but

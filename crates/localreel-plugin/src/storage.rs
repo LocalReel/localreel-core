@@ -8,12 +8,14 @@
 //! and kills the process. `open_range` returns a reader that holds its guard for
 //! as long as the stream lives, because that call outlives the function.
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::storage::{FileStat, MediaUri, Storage, StorageEntry};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::gate::{Gate, GuardedRead, InflightGuard};
 use crate::http;
@@ -87,6 +89,17 @@ impl PluginStorage {
         serde_json::from_slice(&body)
             .map_err(|error| KernelError::Storage(format!("invalid plugin response: {error}")))
     }
+
+    fn stdio_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T> {
+        let _guard = self.gate.enter()?;
+        let value = self.runtime.stdio_call(method, params).map_err(map_error)?;
+        serde_json::from_value(value)
+            .map_err(|error| KernelError::Storage(format!("invalid plugin response: {error}")))
+    }
 }
 
 impl Storage for PluginStorage {
@@ -95,8 +108,12 @@ impl Storage for PluginStorage {
     }
 
     fn stat(&self, uri: &MediaUri) -> Result<FileStat> {
-        let body: StatBody =
-            self.request_json(&format!("/v1/stat?uri={}", http::encode(&uri.to_uri())))?;
+        let uri = uri.to_uri();
+        let body: StatBody = if self.runtime.is_stdio() {
+            self.stdio_json("stat", json!({ "uri": uri }))?
+        } else {
+            self.request_json(&format!("/v1/stat?uri={}", http::encode(&uri)))?
+        };
         Ok(FileStat {
             size: body.size,
             modified: body.modified,
@@ -105,8 +122,12 @@ impl Storage for PluginStorage {
     }
 
     fn list(&self, uri: &MediaUri) -> Result<Vec<StorageEntry>> {
-        let body: EntriesBody =
-            self.request_json(&format!("/v1/list?uri={}", http::encode(&uri.to_uri())))?;
+        let uri = uri.to_uri();
+        let body: EntriesBody = if self.runtime.is_stdio() {
+            self.stdio_json("list", json!({ "uri": uri, "recursive": false }))?
+        } else {
+            self.request_json(&format!("/v1/list?uri={}", http::encode(&uri)))?
+        };
         Ok(body.entries.into_iter().map(entry).collect())
     }
 
@@ -114,14 +135,36 @@ impl Storage for PluginStorage {
         &self,
         root: &MediaUri,
     ) -> Result<Box<dyn Iterator<Item = Result<StorageEntry>> + Send>> {
-        let body: EntriesBody =
-            self.request_json(&format!("/v1/walk?uri={}", http::encode(&root.to_uri())))?;
+        let uri = root.to_uri();
+        let body: EntriesBody = if self.runtime.is_stdio() {
+            self.stdio_json("walk", json!({ "uri": uri, "recursive": true }))?
+        } else {
+            self.request_json(&format!("/v1/walk?uri={}", http::encode(&uri)))?
+        };
         let entries: Vec<Result<StorageEntry>> =
             body.entries.into_iter().map(entry).map(Ok).collect();
         Ok(Box::new(entries.into_iter()))
     }
 
     fn open_range(&self, uri: &MediaUri, start: u64, len: u64) -> Result<Box<dyn Read + Send>> {
+        if self.runtime.is_stdio() {
+            let _guard = self.gate.enter()?;
+            let value = self
+                .runtime
+                .stdio_call(
+                    "read",
+                    json!({ "uri": uri.to_uri(), "start": start, "len": len }),
+                )
+                .map_err(map_error)?;
+            let body = value
+                .get("body_b64")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| KernelError::Storage("plugin read response has no body".into()))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .map_err(|error| KernelError::Storage(format!("plugin read body: {error}")))?;
+            return Ok(Box::new(Cursor::new(bytes)));
+        }
         let path = format!(
             "/v1/read?uri={}&start={start}&len={len}",
             http::encode(&uri.to_uri())

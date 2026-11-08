@@ -29,6 +29,7 @@ pub mod runtime;
 pub mod schedule;
 pub mod secrets;
 pub mod server;
+pub mod stdio;
 pub mod storage;
 mod supervisor;
 

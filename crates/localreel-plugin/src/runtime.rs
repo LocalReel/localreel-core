@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::http;
 use crate::manifest::{Manifest, PluginError};
 use crate::platform;
+use crate::stdio::StdioTransport;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,6 +45,9 @@ pub struct PluginRuntime {
     child: Mutex<Child>,
     stderr: Arc<Mutex<StderrRing>>,
     guard: platform::Guard,
+    /// Present for `entry.transport = "stdio"`; the control channel is pipes,
+    /// not a listening socket.
+    stdio: Option<Arc<StdioTransport>>,
 }
 
 /// Variables a plugin may inherit.
@@ -138,6 +142,7 @@ fn sandboxed_command(
     command
         .env("LOCALREEL_PLUGIN_ID", &manifest.id)
         .env("LOCALREEL_PLUGIN_TOKEN", token)
+        .env("LOCALREEL_PLUGIN_TRANSPORT", &manifest.entry.transport)
         .env("LOCALREEL_PLUGIN_CONFIG", config)
         .env(
             "LOCALREEL_PLUGIN_ROOTS",
@@ -173,6 +178,9 @@ impl PluginRuntime {
             return Err(PluginError::Manifest("plugin config is too large".into()));
         }
         let token = uuid::Uuid::new_v4().to_string();
+        if manifest.entry.transport == "stdio" {
+            return Self::start_stdio(program, manifest, &config, sandbox, token);
+        }
 
         let mut command = sandboxed_command(program, manifest, &token, &config, sandbox);
         command
@@ -261,8 +269,76 @@ impl PluginRuntime {
             child: Mutex::new(child),
             stderr,
             guard,
+            stdio: None,
         };
         runtime.wait_until_healthy()?;
+        Ok(runtime)
+    }
+
+    fn start_stdio(
+        program: &Path,
+        manifest: &Manifest,
+        config: &str,
+        sandbox: &PluginSandbox,
+        token: String,
+    ) -> Result<Self, PluginError> {
+        let mut command = sandboxed_command(program, manifest, &token, config, sandbox);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        platform::configure(&mut command, sandbox.limits);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| PluginError::NotReady(format!("cannot start plugin: {error}")))?;
+        let guard = platform::attach(&mut child, sandbox.limits);
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PluginError::NotReady("plugin stdin is unavailable".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PluginError::NotReady("plugin stdout is unavailable".into()))?;
+        let stderr = Arc::new(Mutex::new(StderrRing::default()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = Arc::clone(&stderr);
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 1024];
+                while let Ok(read) = pipe.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    sink.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(&buffer[..read]);
+                }
+            });
+        }
+        let transport = Arc::new(StdioTransport::new(stdin, stdout, token.clone()));
+        let runtime = Self {
+            manifest: manifest.clone(),
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            token,
+            child: Mutex::new(child),
+            stderr,
+            guard,
+            stdio: Some(transport),
+        };
+        if let Err(error) = runtime.wait_until_healthy() {
+            let mut child = runtime
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            platform::terminate(&mut child, &runtime.guard);
+            return Err(error);
+        }
         Ok(runtime)
     }
 
@@ -284,6 +360,11 @@ impl PluginRuntime {
     }
 
     pub fn request(&self, path: &str) -> Result<http::Response, PluginError> {
+        if self.stdio.is_some() {
+            return Err(PluginError::Request(
+                "stdio plugins do not expose HTTP paths; use stdio_call".to_string(),
+            ));
+        }
         http::get(
             self.address,
             &self.token,
@@ -293,8 +374,29 @@ impl PluginRuntime {
         )
     }
 
+    pub fn is_stdio(&self) -> bool {
+        self.stdio.is_some()
+    }
+
+    /// One JSON-RPC call over the stdio control channel.
+    pub fn stdio_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PluginError> {
+        match &self.stdio {
+            Some(stdio) => stdio.call(method, params),
+            None => Err(PluginError::Request(
+                "plugin is not using the stdio transport".to_string(),
+            )),
+        }
+    }
+
     /// One health check with its own short budget.
     pub fn probe(&self, timeout: Duration) -> bool {
+        if let Some(stdio) = &self.stdio {
+            return stdio.health().is_ok();
+        }
         matches!(
             http::get(self.address, &self.token, "/v1/health", CONNECT_TIMEOUT, timeout),
             Ok(response) if response.status == 200
@@ -375,6 +477,7 @@ mod tests {
                 program: "plugin.js".into(),
                 args: vec!["--flag".into()],
                 runtime: runtime.map(str::to_string),
+                transport: "http".into(),
             },
             permissions: vec![],
             capabilities: vec![],

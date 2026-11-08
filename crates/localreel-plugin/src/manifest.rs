@@ -69,6 +69,14 @@ pub struct Entry {
     /// `python3`). When absent the program itself is executed.
     #[serde(default)]
     pub runtime: Option<String>,
+    /// `http` (default, loopback TCP) or `stdio` (newline-delimited JSON-RPC
+    /// over stdin/stdout). The stdio mode removes the plugin's need to listen.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+}
+
+fn default_transport() -> String {
+    "http".to_string()
 }
 
 #[derive(Debug, Error)]
@@ -153,6 +161,11 @@ impl Manifest {
                     "entry runtime must be a bare command name (no path separators)".into(),
                 ));
             }
+        }
+        if !matches!(self.entry.transport.as_str(), "http" | "stdio") {
+            return Err(PluginError::Manifest(
+                "entry transport must be 'http' or 'stdio'".into(),
+            ));
         }
         if self.entry.args.len() > 32 || self.entry.args.iter().any(|arg| arg.contains('\0')) {
             return Err(PluginError::Manifest(
@@ -320,6 +333,7 @@ mod tests {
                 program: "bin/webdav-plugin".into(),
                 args: vec!["--serve".into()],
                 runtime: None,
+                transport: "http".into(),
             },
             permissions: vec![PERMISSION_NETWORK.into()],
             capabilities: Vec::new(),

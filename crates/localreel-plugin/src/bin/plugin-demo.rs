@@ -146,7 +146,13 @@ fn main() {
             .and_then(Value::as_str)
             .map(|value| value.trim_end_matches('/').to_string()),
     };
-    if let Err(error) = server::run(Box::new(handler)) {
+    let transport = std::env::var("LOCALREEL_PLUGIN_TRANSPORT").unwrap_or_else(|_| "http".into());
+    let result = if transport == "stdio" {
+        server::run_stdio(Box::new(handler))
+    } else {
+        server::run(Box::new(handler))
+    };
+    if let Err(error) = result {
         eprintln!("reference plugin failed: {error}");
         std::process::exit(1);
     }
