@@ -469,6 +469,21 @@ The environment tells the plugin which mode the host selected
 it does not yet prevent a malicious plugin from opening its own socket. OS-level
 network isolation remains phase 3 work.
 
+### Broker over stdio
+
+Stdio plugins get the broker through the same pipes instead of loopback:
+
+```json
+{"type":"broker.request","id":7,"method":"POST",
+ "path":"/api/v1/plugin-broker/fetch","body_b64":"..."}
+{"type":"broker.reply","id":7,"status":200,"body_b64":"..."}
+```
+
+The host proxies only `/api/v1/plugin-broker/` paths and adds the per-run token;
+the plugin never learns the token or opens a socket. `BrokerClient::from_env()`
+selects this mode when `LOCALREEL_PLUGIN_BROKER=stdio`. Scheduled callbacks use
+the `schedule` JSON-RPC method over the same pipe.
+
 ## Permissions
 
 The host is not an OS sandbox, and does not pretend to be one (ADR-014). What it

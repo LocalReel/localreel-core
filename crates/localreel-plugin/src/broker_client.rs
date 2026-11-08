@@ -1,11 +1,16 @@
 //! Plugin-side client for the host's capability broker.
 //!
-//! A plugin should not grow its own HTTP policy. This client posts to the host
+//! A plugin should not grow its own HTTP policy. This client speaks to the host
 //! broker with the per-run token and decodes the base64 body; host-side grants,
 //! scope checks, SSRF policy and audit stay in one place.
+//!
+//! Two transports are supported: loopback HTTP for the default mode, and the
+//! plugin's stdin/stdout when the host marks the plugin as `stdio`. The stdio
+//! mode is what lets an AppContainer plugin reach the broker without a socket.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -13,7 +18,6 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-/// One decoded broker answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerReply {
     pub status: u16,
@@ -28,12 +32,21 @@ impl BrokerReply {
     }
 }
 
-/// A small blocking client. Clone cheaply: the `ureq::Agent` pools internally.
+#[derive(Clone)]
+enum Transport {
+    Http {
+        base_url: String,
+        agent: ureq::Agent,
+    },
+    Stdio,
+}
+
+/// A small blocking client. Clone cheaply: the HTTP agent pools internally.
 #[derive(Clone)]
 pub struct BrokerClient {
-    base_url: String,
+    transport: Transport,
     token: String,
-    agent: ureq::Agent,
+    next_id: std::sync::Arc<AtomicU64>,
 }
 
 impl BrokerClient {
@@ -43,21 +56,32 @@ impl BrokerClient {
             base_url.pop();
         }
         Self {
-            base_url,
+            transport: Transport::Http {
+                base_url,
+                agent: ureq::AgentBuilder::new()
+                    .timeout(Duration::from_secs(60))
+                    .build(),
+            },
             token: token.into(),
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(60))
-                .build(),
+            next_id: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
 
-    /// Read `LOCALREEL_PLUGIN_HOST_URL` and `LOCALREEL_PLUGIN_TOKEN`.
+    /// Read the host's environment.
     ///
-    /// Returns `None` when the host did not provide a broker URL, which is the
-    /// documented phase-1 behaviour.
+    /// `LOCALREEL_PLUGIN_BROKER=stdio` selects the inherited pipe; otherwise the
+    /// historical `LOCALREEL_PLUGIN_HOST_URL` HTTP mode is used. Returns `None`
+    /// when the host provided no broker at all.
     pub fn from_env() -> Option<Self> {
-        let base_url = std::env::var("LOCALREEL_PLUGIN_HOST_URL").ok()?;
         let token = std::env::var("LOCALREEL_PLUGIN_TOKEN").ok()?;
+        if std::env::var("LOCALREEL_PLUGIN_BROKER").as_deref() == Ok("stdio") {
+            return Some(Self {
+                transport: Transport::Stdio,
+                token,
+                next_id: std::sync::Arc::new(AtomicU64::new(1)),
+            });
+        }
+        let base_url = std::env::var("LOCALREEL_PLUGIN_HOST_URL").ok()?;
         Some(Self::new(base_url, token))
     }
 
@@ -85,37 +109,20 @@ impl BrokerClient {
             "headers": map,
         });
         if let Some(handle) = secret {
-            payload["secret"] = serde_json::Value::String(handle.to_string());
+            payload["secret"] = Value::String(handle.to_string());
         }
-        let endpoint = format!("{}/api/v1/plugin-broker/fetch", self.base_url);
-        let response = match self
-            .agent
-            .post(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .set("content-type", "application/json")
-            .send_string(&payload.to_string())
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let mut text = String::new();
-                let _ = response
-                    .into_reader()
-                    .take(8 * 1024)
-                    .read_to_string(&mut text);
-                return Err(format!(
-                    "broker refused the call ({status}): {}",
-                    broker_error_message(&text)
-                ));
-            }
-            Err(error) => return Err(format!("broker request failed: {error}")),
-        };
-        let mut text = String::new();
-        response
-            .into_reader()
-            .take(32 * 1024 * 1024)
-            .read_to_string(&mut text)
-            .map_err(|error| format!("broker response could not be read: {error}"))?;
-        parse_reply(&text)
+        let (status, body) = self.request(
+            "POST",
+            "/api/v1/plugin-broker/fetch",
+            payload.to_string().as_bytes(),
+        )?;
+        if status != 200 {
+            return Err(format!(
+                "broker refused the call ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&body))
+            ));
+        }
+        parse_reply(&String::from_utf8_lossy(&body))
     }
 
     /// Ask the host for a periodic callback (`GET /v1/schedule`).
@@ -124,119 +131,61 @@ impl BrokerClient {
             "interval_secs": interval_secs,
             "payload": payload,
         });
-        let endpoint = format!("{}/api/v1/plugin-broker/schedule", self.base_url);
-        let response = match self
-            .agent
-            .post(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .set("content-type", "application/json")
-            .send_string(&body.to_string())
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let mut text = String::new();
-                let _ = response
-                    .into_reader()
-                    .take(8 * 1024)
-                    .read_to_string(&mut text);
-                return Err(format!(
-                    "schedule.request refused the call ({status}): {}",
-                    broker_error_message(&text)
-                ));
-            }
-            Err(error) => return Err(format!("schedule.request failed: {error}")),
-        };
-        let mut text = String::new();
-        response
-            .into_reader()
-            .take(1024 * 1024)
-            .read_to_string(&mut text)
-            .map_err(|error| format!("schedule.response could not be read: {error}"))?;
-        serde_json::from_str(&text)
+        let (status, response) = self.request(
+            "POST",
+            "/api/v1/plugin-broker/schedule",
+            body.to_string().as_bytes(),
+        )?;
+        if status != 200 {
+            return Err(format!(
+                "schedule.request refused the call ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&response))
+            ));
+        }
+        serde_json::from_slice(&response)
             .map_err(|error| format!("schedule.response is not JSON: {error}"))
     }
 
     /// Upload one blob into the host-managed namespace.
     pub fn put_blob(&self, name: &str, bytes: &[u8]) -> Result<Value, String> {
-        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
-        let response = match self
-            .agent
-            .put(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .set("content-type", "application/octet-stream")
-            .send_bytes(bytes)
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                return Err(format!(
-                    "blob.write refused the blob ({status}): {}",
-                    broker_error_message(&read_error_body(response))
-                ));
-            }
-            Err(error) => return Err(format!("blob.write failed: {error}")),
-        };
-        let mut text = String::new();
-        response
-            .into_reader()
-            .take(1024 * 1024)
-            .read_to_string(&mut text)
-            .map_err(|error| format!("blob.write response could not be read: {error}"))?;
-        serde_json::from_str(&text)
+        let path = format!("/api/v1/plugin-broker/blob/{name}");
+        let (status, response) = self.request("PUT", &path, bytes)?;
+        if status != 200 {
+            return Err(format!(
+                "blob.write refused the blob ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&response))
+            ));
+        }
+        serde_json::from_slice(&response)
             .map_err(|error| format!("blob.write response is not JSON: {error}"))
     }
 
     pub fn get_blob(&self, name: &str) -> Result<Vec<u8>, String> {
-        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
-        match self
-            .agent
-            .get(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .call()
-        {
-            Ok(response) => {
-                let mut bytes = Vec::new();
-                response
-                    .into_reader()
-                    .take(16 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| format!("blob.read body could not be read: {error}"))?;
-                if bytes.len() as u64 > 16 * 1024 * 1024 {
-                    return Err("blob.read exceeded the 16 MiB client cap".to_string());
-                }
-                Ok(bytes)
+        let path = format!("/api/v1/plugin-broker/blob/{name}");
+        let (status, body) = self.request("GET", &path, &[])?;
+        if status == 200 {
+            if body.len() as u64 > 16 * 1024 * 1024 {
+                return Err("blob.read exceeded the 16 MiB client cap".to_string());
             }
-            Err(ureq::Error::Status(status, response)) => Err(format!(
+            Ok(body)
+        } else {
+            Err(format!(
                 "blob.read refused the call ({status}): {}",
-                broker_error_message(&read_error_body(response))
-            )),
-            Err(error) => Err(format!("blob.read failed: {error}")),
+                broker_error_message(&String::from_utf8_lossy(&body))
+            ))
         }
     }
 
     pub fn delete_blob(&self, name: &str) -> Result<bool, String> {
-        let endpoint = format!("{}/api/v1/plugin-broker/blob/{name}", self.base_url);
-        let response = match self
-            .agent
-            .delete(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                return Err(format!(
-                    "blob.delete refused the call ({status}): {}",
-                    broker_error_message(&read_error_body(response))
-                ));
-            }
-            Err(error) => return Err(format!("blob.delete failed: {error}")),
-        };
-        let mut text = String::new();
-        response
-            .into_reader()
-            .take(1024 * 1024)
-            .read_to_string(&mut text)
-            .map_err(|error| format!("blob.delete response could not be read: {error}"))?;
-        let value: Value = serde_json::from_str(&text)
+        let path = format!("/api/v1/plugin-broker/blob/{name}");
+        let (status, response) = self.request("DELETE", &path, &[])?;
+        if status != 200 {
+            return Err(format!(
+                "blob.delete refused the call ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&response))
+            ));
+        }
+        let value: Value = serde_json::from_slice(&response)
             .map_err(|error| format!("blob.delete response is not JSON: {error}"))?;
         Ok(value
             .get("deleted")
@@ -255,35 +204,18 @@ impl BrokerClient {
     /// Stage normalized titles through `catalog.write(draft)`.
     pub fn write_catalog<T: Serialize>(&self, items: &[T]) -> Result<usize, String> {
         let payload = serde_json::json!({ "items": items });
-        let endpoint = format!("{}/api/v1/plugin-broker/catalog", self.base_url);
-        let response = match self
-            .agent
-            .post(&endpoint)
-            .set("x-localreel-plugin", &self.token)
-            .set("content-type", "application/json")
-            .send_string(&payload.to_string())
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let mut text = String::new();
-                let _ = response
-                    .into_reader()
-                    .take(8 * 1024)
-                    .read_to_string(&mut text);
-                return Err(format!(
-                    "catalog.write refused the batch ({status}): {}",
-                    broker_error_message(&text)
-                ));
-            }
-            Err(error) => return Err(format!("catalog.write request failed: {error}")),
-        };
-        let mut text = String::new();
-        response
-            .into_reader()
-            .take(8 * 1024 * 1024)
-            .read_to_string(&mut text)
-            .map_err(|error| format!("catalog.write response could not be read: {error}"))?;
-        let value: Value = serde_json::from_str(&text)
+        let (status, response) = self.request(
+            "POST",
+            "/api/v1/plugin-broker/catalog",
+            payload.to_string().as_bytes(),
+        )?;
+        if status != 200 {
+            return Err(format!(
+                "catalog.write refused the batch ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&response))
+            ));
+        }
+        let value: Value = serde_json::from_slice(&response)
             .map_err(|error| format!("catalog.write response is not JSON: {error}"))?;
         value
             .get("written")
@@ -291,6 +223,105 @@ impl BrokerClient {
             .and_then(|written| usize::try_from(written).ok())
             .ok_or_else(|| "catalog.write response has no written count".to_string())
     }
+
+    fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+        match &self.transport {
+            Transport::Http { base_url, agent } => {
+                let url = format!("{base_url}{path}");
+                let mut request = agent
+                    .request(method, &url)
+                    .set("x-localreel-plugin", &self.token);
+                if !body.is_empty() {
+                    let content_type = if path.contains("/blob/") {
+                        "application/octet-stream"
+                    } else {
+                        "application/json"
+                    };
+                    request = request.set("content-type", content_type);
+                }
+                let response = match request.send_bytes(body) {
+                    Ok(response) => response,
+                    Err(ureq::Error::Status(status, response)) => {
+                        return Ok((status, read_body(response)));
+                    }
+                    Err(error) => return Err(format!("broker request failed: {error}")),
+                };
+                Ok((response.status(), read_body(response)))
+            }
+            Transport::Stdio => self.stdio_request(method, path, body),
+        }
+    }
+
+    fn stdio_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let line = serde_json::json!({
+            "type": "broker.request",
+            "id": id,
+            "method": method,
+            "path": path,
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
+        })
+        .to_string();
+        {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            writeln!(output, "{line}").map_err(|error| format!("broker pipe write: {error}"))?;
+            output
+                .flush()
+                .map_err(|error| format!("broker pipe flush: {error}"))?;
+        }
+
+        let stdin = std::io::stdin();
+        loop {
+            let mut response = String::new();
+            let read = stdin
+                .lock()
+                .read_line(&mut response)
+                .map_err(|error| format!("broker pipe read: {error}"))?;
+            if read == 0 {
+                return Err("broker pipe closed before a reply".to_string());
+            }
+            let value: Value = match serde_json::from_str(&response) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if value.get("type").and_then(Value::as_str) != Some("broker.reply")
+                || value.get("id").and_then(Value::as_u64) != Some(id)
+            {
+                continue;
+            }
+            let status = value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .ok_or_else(|| "broker reply has no status".to_string())?;
+            let body = value
+                .get("body_b64")
+                .and_then(Value::as_str)
+                .map(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|error| format!("broker reply body is not base64: {error}"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            return Ok((status, body));
+        }
+    }
+}
+
+fn read_body(response: ureq::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    let _ = response
+        .into_reader()
+        .take(32 * 1024 * 1024)
+        .read_to_end(&mut body);
+    body
 }
 
 fn parse_reply(text: &str) -> Result<BrokerReply, String> {
@@ -317,15 +348,6 @@ fn parse_reply(text: &str) -> Result<BrokerReply, String> {
         content_type,
         body,
     })
-}
-
-fn read_error_body(response: ureq::Response) -> String {
-    let mut text = String::new();
-    let _ = response
-        .into_reader()
-        .take(8 * 1024)
-        .read_to_string(&mut text);
-    text
 }
 
 fn broker_error_message(text: &str) -> String {
@@ -414,7 +436,10 @@ mod tests {
     #[test]
     fn new_trims_trailing_slashes() {
         let client = BrokerClient::new("http://127.0.0.1:3001/", "token");
-        assert_eq!(client.base_url, "http://127.0.0.1:3001");
+        match client.transport {
+            Transport::Http { base_url, .. } => assert_eq!(base_url, "http://127.0.0.1:3001"),
+            Transport::Stdio => panic!("expected HTTP"),
+        }
     }
 
     #[test]

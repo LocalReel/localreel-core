@@ -84,12 +84,12 @@ pub fn run_stdio(handler: Box<dyn Handler>) -> std::io::Result<()> {
     let token = std::env::var("LOCALREEL_PLUGIN_TOKEN").unwrap_or_default();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let read = stdin.lock().read_line(&mut line)?;
+        if read == 0 {
             break;
         }
         if line.trim().is_empty() {

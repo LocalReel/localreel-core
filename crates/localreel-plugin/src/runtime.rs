@@ -23,7 +23,7 @@ use serde::Deserialize;
 use crate::http;
 use crate::manifest::{Manifest, PluginError};
 use crate::platform;
-use crate::stdio::StdioTransport;
+use crate::stdio::{BrokerProxy, StdioTransport};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,6 +143,7 @@ fn sandboxed_command(
         .env("LOCALREEL_PLUGIN_ID", &manifest.id)
         .env("LOCALREEL_PLUGIN_TOKEN", token)
         .env("LOCALREEL_PLUGIN_TRANSPORT", &manifest.entry.transport)
+        .env("LOCALREEL_PLUGIN_BROKER", &manifest.entry.transport)
         .env("LOCALREEL_PLUGIN_CONFIG", config)
         .env(
             "LOCALREEL_PLUGIN_ROOTS",
@@ -321,7 +322,11 @@ impl PluginRuntime {
                 }
             });
         }
-        let transport = Arc::new(StdioTransport::new(stdin, stdout, token.clone()));
+        let broker = sandbox
+            .host_url
+            .as_ref()
+            .map(|url| BrokerProxy::new(url.clone(), token.clone()));
+        let transport = Arc::new(StdioTransport::new(stdin, stdout, token.clone(), broker));
         let runtime = Self {
             manifest: manifest.clone(),
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -389,6 +394,23 @@ impl PluginRuntime {
             None => Err(PluginError::Request(
                 "plugin is not using the stdio transport".to_string(),
             )),
+        }
+    }
+
+    /// One scheduled callback, over HTTP or the stdio pipe.
+    pub fn schedule(&self, payload: &str) -> Result<(), PluginError> {
+        if self.stdio.is_some() {
+            self.stdio_call("schedule", serde_json::json!({ "payload": payload }))?;
+            return Ok(());
+        }
+        let path = format!("/v1/schedule?payload={}", http::encode(payload));
+        match self.request(&path) {
+            Ok(response) if response.status == 200 => Ok(()),
+            Ok(response) => Err(PluginError::Request(format!(
+                "plugin answered HTTP {}",
+                response.status
+            ))),
+            Err(error) => Err(error),
         }
     }
 

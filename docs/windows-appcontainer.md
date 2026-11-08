@@ -37,15 +37,14 @@ isolating the failure to the missing runtime, not the container.
 
 A host `TcpListener` on `127.0.0.1:45678` was not reachable from the container:
 the child timed out instead of connecting. So AppContainer cannot keep using the
-loopback HTTP broker. Isolated stdio plugins need the broker over an inherited
-pipe (the existing stdin/stdout JSON-RPC channel) or a named pipe.
+loopback HTTP broker. The stdio broker (phase 3.8) now covers `net.fetch`,
+`catalog.write`, `schedule.request` and blobs over the inherited pipe, so no
+loopback is needed.
 
 ## Limits / next step
 
-- Loopback to the host broker is **blocked** (timed out against a live
-  `127.0.0.1` listener). A broker over the existing stdio channel or a named pipe
-  is required before isolated plugins can use `net.fetch` / `secret.use`.
-- The plugin install directory (not just one exe) must be copied or ACL-granted,
-  and write paths/profiles cleaned up.
+- Wiring the AppContainer launch into `PluginRuntime` is still missing. The
+  plugin install directory (not just one exe) must be copied or ACL-granted, and
+  write paths/profiles cleaned up.
 - Integration belongs in `platform.rs` behind a config switch, with the probe
   test flipped to assert denial rather than documenting the bypass.

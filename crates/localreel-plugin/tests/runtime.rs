@@ -12,8 +12,18 @@ use serde_json::json;
 use zip::write::SimpleFileOptions;
 
 const DEMO: &str = env!("CARGO_BIN_EXE_plugin-demo");
+const BROKER_DEMO: &str = env!("CARGO_BIN_EXE_plugin-broker-demo");
 
 fn build_package(path: &Path, program: &str, manifest: &serde_json::Value) {
+    build_package_with_binary(path, program, manifest, &std::fs::read(DEMO).unwrap());
+}
+
+fn build_package_with_binary(
+    path: &Path,
+    program: &str,
+    manifest: &serde_json::Value,
+    binary: &[u8],
+) {
     let file = File::create(path).unwrap();
     let mut writer = zip::ZipWriter::new(file);
     writer
@@ -25,7 +35,7 @@ fn build_package(path: &Path, program: &str, manifest: &serde_json::Value) {
     writer
         .start_file(program, SimpleFileOptions::default())
         .unwrap();
-    writer.write_all(&std::fs::read(DEMO).unwrap()).unwrap();
+    writer.write_all(binary).unwrap();
     writer.finish().unwrap();
 }
 
@@ -172,4 +182,82 @@ fn stdio_sidecar_serves_storage_without_a_tcp_port() {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"bcd");
+}
+
+#[test]
+fn stdio_broker_calls_travel_over_pipes() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).unwrap();
+        request.push_str(&String::from_utf8_lossy(&body));
+        let body = r#"{"status":200,"content_type":"text/plain","body_b64":"aGk="}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        request
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let program = format!("bin/plugin-broker-demo{}", std::env::consts::EXE_SUFFIX);
+    let package = dir.path().join("broker-demo.lrplug");
+    let mut manifest = manifest(&program, "stdio");
+    manifest["id"] = json!("broker-demo");
+    build_package_with_binary(
+        &package,
+        &program,
+        &manifest,
+        &std::fs::read(BROKER_DEMO).unwrap(),
+    );
+    let install = dir.path().join("installed");
+    let extracted = extract(&package, &install).unwrap();
+    let executable = install.join(&extracted.entry.program);
+    let runtime = PluginRuntime::start(
+        &executable,
+        &extracted,
+        &json!({}),
+        &localreel_plugin::PluginSandbox {
+            working_dir: Some(install.clone()),
+            roots: Vec::new(),
+            host_url: Some(format!("http://{address}")),
+            limits: Default::default(),
+        },
+    )
+    .unwrap();
+
+    runtime.schedule("{}").unwrap();
+    let result = std::fs::read_to_string(install.join("broker-result.txt")).unwrap();
+    assert_eq!(result, "hi");
+
+    let request = server.join().unwrap();
+    assert!(
+        request.contains("POST /api/v1/plugin-broker/fetch"),
+        "{request}"
+    );
+    assert!(request.contains("x-localreel-plugin:"), "{request}");
+    assert!(request.contains("https://example.com/data"), "{request}");
 }

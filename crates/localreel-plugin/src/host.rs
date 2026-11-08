@@ -1197,17 +1197,10 @@ impl PluginHost {
                 Some(runtime) if runtime.manifest().version != schedule.plugin_version => {
                     Err("plugin version changed since the schedule was requested".to_string())
                 }
-                Some(runtime) => {
-                    let query = url::form_urlencoded::Serializer::new(String::new())
-                        .append_pair("payload", &schedule.payload)
-                        .finish();
-                    let path = format!("/v1/schedule?{query}");
-                    match runtime.request(&path) {
-                        Ok(response) if response.status == 200 => Ok(()),
-                        Ok(response) => Err(format!("plugin answered HTTP {}", response.status)),
-                        Err(error) => Err(error.to_string()),
-                    }
-                }
+                Some(runtime) => match runtime.schedule(&schedule.payload) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                },
             };
             let next_run_at = now_secs().saturating_add(schedule.interval_secs as i64);
             let error = outcome.as_ref().err().map(String::as_str);

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker)
 - Date: 2026-11-08
 
 ## Context
@@ -97,7 +97,12 @@ The CMS/collector probe made the gap concrete:
     child and `vcruntime140.dll` into the profile folder. It is not wired into
     `PluginHost` yet; the HTTP broker must move to inherited stdio or a named pipe
     first.
-18. **`fs.read` remains legacy** (source roots handed directly) and is not
+18. **Phase 3.8 moves the broker onto stdio.** `type=broker.request` frames on
+    the plugin's stdout are proxied by the host to its own broker API (only
+    `/api/v1/plugin-broker/` paths, host token added). `BrokerClient` selects it
+    with `LOCALREEL_PLUGIN_BROKER=stdio`; scheduled callbacks use the same pipe.
+    This is what lets an AppContainer plugin use `net.fetch` without loopback.
+19. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation.
 
