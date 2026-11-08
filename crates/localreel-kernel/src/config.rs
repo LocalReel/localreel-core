@@ -497,6 +497,10 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        // Environment values are command-line-like: a relative path means
+        // "relative to where I ran this", so it is resolved here and stays
+        // absolute even if the process changes directory later.
+        let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(value) = env_string("LOCALREEL_HOST") {
             self.host = value;
         }
@@ -505,19 +509,19 @@ impl Config {
                 .map_err(|_| KernelError::Config("LOCALREEL_PORT must be <= 65535".into()))?;
         }
         if let Some(value) = env_string("LOCALREEL_DATA_DIR") {
-            self.set_data_dir(PathBuf::from(value));
+            self.set_data_dir(anchored(&cwd, PathBuf::from(value)));
         }
         if let Some(value) = env_string("LOCALREEL_LOG_DIR") {
-            self.log_dir = PathBuf::from(value);
+            self.log_dir = anchored(&cwd, PathBuf::from(value));
         }
         if let Some(value) = env_string("LOCALREEL_MODE") {
             self.mode = value.parse()?;
         }
         if let Some(value) = env_string("LOCALREEL_DB") {
-            self.db_path = PathBuf::from(value);
+            self.db_path = anchored(&cwd, PathBuf::from(value));
         }
         if let Some(value) = env_string("LOCALREEL_WEB_DIR") {
-            self.web_dir = Some(PathBuf::from(value));
+            self.web_dir = Some(anchored(&cwd, PathBuf::from(value)));
         }
         if let Some(value) = env_bool("LOCALREEL_ALLOW_REMOTE")? {
             self.allow_remote = value;
@@ -538,7 +542,7 @@ impl Config {
             self.jobs.cache_gc_interval = Duration::from_secs(value);
         }
         if let Some(value) = env_string("LOCALREEL_HLS_DIR") {
-            self.media.hls_dir = PathBuf::from(value);
+            self.media.hls_dir = anchored(&cwd, PathBuf::from(value));
         }
         if let Some(value) = env_string("LOCALREEL_FFMPEG") {
             self.media.ffmpeg = PathBuf::from(value);
@@ -564,7 +568,7 @@ impl Config {
             self.media.idle_session_secs = value;
         }
         if let Some(value) = env_string("LOCALREEL_PREVIEW_DIR") {
-            self.media.preview_dir = PathBuf::from(value);
+            self.media.preview_dir = anchored(&cwd, PathBuf::from(value));
         }
         if let Some(value) = env_bool("LOCALREEL_PREVIEW_SPRITES")? {
             self.media.preview_sprites = value;
