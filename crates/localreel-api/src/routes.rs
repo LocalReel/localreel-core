@@ -1001,6 +1001,61 @@ struct PlaybackResponse {
     message: Option<String>,
 }
 
+/// Wait a moment for the probe job a scan queued.
+///
+/// The scan inserts the row first and fills the codecs shortly after. A play
+/// request landing in that window used to choose the "unknown codec" preset - a
+/// full re-encode of a file that only needs a remux - and two requests on either
+/// side of the probe picked two different cache keys, so both jobs ran. Waiting
+/// a few hundred milliseconds is much cheaper than either.
+async fn settled_media(state: &AppState, media: Media) -> Result<Media, ApiError> {
+    // Nothing to wait for when there is no ffprobe: the fields will never fill.
+    if media.duration.is_some()
+        || media.video_codec.is_some()
+        || state.ffmpeg_capability == localreel_kernel::media_ops::FfmpegCapability::Missing
+    {
+        return Ok(media);
+    }
+    let mut latest = media;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match state.media.get_media(latest.id)? {
+            Some(next) => {
+                latest = next;
+                if latest.duration.is_some() || latest.video_codec.is_some() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(latest)
+}
+
+/// Explain a previous failure instead of queueing the same work again.
+///
+/// A finished job releases its dedupe key, so `enqueue` would happily create a
+/// fresh one on every poll; the client polls while the mode is `preparing`, so a
+/// file that cannot be transcoded would spin forever. The failure is only
+/// reported while it is newer than the media row, so a rescan (which bumps
+/// `updated_at` after the file changed) clears it.
+fn failed_attempt(
+    state: &AppState,
+    kind: &str,
+    dedupe_key: &str,
+    media: &Media,
+) -> Result<Option<String>, ApiError> {
+    let Some(job) = state.jobs.latest_for_dedupe(kind, dedupe_key)? else {
+        return Ok(None);
+    };
+    if job.status != "failed" || job.finished_at.unwrap_or(0) < media.updated_at {
+        return Ok(None);
+    }
+    Ok(Some(job.error.unwrap_or_else(|| {
+        "this file could not be prepared".to_string()
+    })))
+}
+
 async fn prepare_playback(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -1013,6 +1068,7 @@ async fn prepare_playback(
     // Any playback request keeps this media's session alive; the reaper cancels
     // work nobody has asked about for `idle_session_secs`.
     state.transcodes.touch(media.id);
+    let media = settled_media(&state, media).await?;
     if media.missing_at.is_some() {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -1102,6 +1158,16 @@ async fn prepare_playback(
         "audio_stream": audio_stream,
     })
     .to_string();
+    let transcode_key = format!("transcode:{}:{variant_key}", media.id);
+    if let Some(reason) = failed_attempt(&state, "transcode", &transcode_key, &media)? {
+        return Ok(Json(PlaybackResponse {
+            mode: "failed",
+            url: None,
+            job_id: None,
+            message: Some(reason),
+        })
+        .into_response());
+    }
     // Starting an encode on a machine that is out of memory only makes it
     // slower: say so instead of piling another ffmpeg onto the box.
     if localreel_media::memory_pressure() {
@@ -1111,12 +1177,9 @@ async fn prepare_playback(
             "not enough free memory to start a transcode right now",
         ));
     }
-    let job_id = state.jobs.enqueue(
-        "transcode",
-        &payload,
-        Some(&format!("transcode:{}:{variant_key}", media.id)),
-        2,
-    )?;
+    let job_id = state
+        .jobs
+        .enqueue("transcode", &payload, Some(&transcode_key), 2)?;
     state.transcodes.attach_job(media.id, "transcode", &job_id);
     Ok((
         StatusCode::ACCEPTED,
@@ -1147,6 +1210,16 @@ fn prepare_hls_playback(
         }
     }
 
+    let hls_key = format!("hls:{}", media.id);
+    if let Some(reason) = failed_attempt(&state, "hls_package", &hls_key, media)? {
+        return Ok(Json(PlaybackResponse {
+            mode: "failed",
+            url: None,
+            job_id: None,
+            message: Some(reason),
+        })
+        .into_response());
+    }
     let payload = serde_json::json!({ "media_id": media.id }).to_string();
     if localreel_media::memory_pressure() {
         return Err(ApiError::new(
@@ -1155,12 +1228,9 @@ fn prepare_hls_playback(
             "not enough free memory to package this stream right now",
         ));
     }
-    let job_id = state.jobs.enqueue(
-        "hls_package",
-        &payload,
-        Some(&format!("hls:{}", media.id)),
-        2,
-    )?;
+    let job_id = state
+        .jobs
+        .enqueue("hls_package", &payload, Some(&hls_key), 2)?;
     state
         .transcodes
         .attach_job(media.id, "hls_package", &job_id);
@@ -1521,7 +1591,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <main>
     <h1>LocalReel</h1>
     <p>Local-first media server. The API is at <code>/api/v1</code>.</p>
-    <p><a href="/api/v1/health">Health</a> · <a href="/api/v1/sources">Sources</a> · <a href="/api/v1/media">Media</a></p>
+    <p><a href="/api/v1/health">Health</a> 路 <a href="/api/v1/sources">Sources</a> 路 <a href="/api/v1/media">Media</a></p>
     <p>The product UI is built separately in <code>localreel-web</code> and mounted here in a later phase.</p>
   </main>
 </body>
@@ -2102,6 +2172,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_failed_transcode_is_reported_instead_of_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let (media_id, _, _) = seed_playable(&state, dir.path());
+        // A file the browser cannot play directly, so the request reaches the
+        // transcode path instead of answering "direct".
+        state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE media SET video_codec = 'hevc' WHERE id = ?1",
+                    [media_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Leave behind the row a worker would: one failed attempt for this variant.
+        let media = state.media.get_media(media_id).unwrap().unwrap();
+        let preset = preferred_preset(&media);
+        let variant = localreel_media::transcode_variant_key(preset, None);
+        let dedupe = format!("transcode:{media_id}:{variant}");
+        let payload = serde_json::json!({
+            "media_id": media_id,
+            "preset": preset,
+            "audio_stream": null,
+        })
+        .to_string();
+        let job_id = state
+            .jobs
+            .enqueue("transcode", &payload, Some(&dedupe), 1)
+            .unwrap();
+        let claimed = state.jobs.claim("worker", 60).unwrap().unwrap();
+        assert_eq!(claimed.id, job_id);
+        state.jobs.fail(&job_id, "ffmpeg exploded").unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                &format!("/api/v1/media/{media_id}/playback"),
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        // The player polls while "preparing"; without this it would spin forever
+        // and queue a fresh job on every poll.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let playback: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback["mode"], "failed");
+        assert!(
+            playback["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ffmpeg exploded"),
+            "the reason must reach the player: {playback:?}"
+        );
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.
