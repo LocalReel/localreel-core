@@ -104,10 +104,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/audit", get(plugin_audit))
-        .route(
-            "/api/v1/plugins/verifications",
-            get(plugin_verifications),
-        )
+        .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
             "/api/v1/plugins/:id/capabilities",
             get(plugin_capabilities).post(grant_plugin_capability),
@@ -125,6 +122,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins/:id/enable", post(plugin_enable))
         .route("/api/v1/plugins/:id/disable", post(plugin_disable))
         .route("/api/v1/plugins/:id/logs", get(plugin_logs))
+        .route("/api/v1/plugin-schedules", get(list_plugin_schedules))
+        .route(
+            "/api/v1/plugin-schedules/:plugin/:version",
+            delete(delete_plugin_schedule),
+        )
         .route("/api/v1/catalog/drafts", get(list_catalog_drafts))
         .route("/api/v1/plugins/:id/blobs", get(list_plugin_blobs))
         .route("/api/v1/metadata", get(metadata_status))
@@ -457,6 +459,57 @@ async fn plugin_broker_catalog(
     }
     let written = state.plugins.catalog_write(token, payload.items)?;
     Ok(Json(serde_json::json!({ "written": written })))
+}
+
+async fn list_plugin_schedules(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.plugins.schedules().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the schedule store is not available",
+        )
+    })?;
+    let schedules = store.list(None)?;
+    Ok(Json(serde_json::json!({ "schedules": schedules })))
+}
+
+async fn delete_plugin_schedule(
+    State(state): State<Arc<AppState>>,
+    Path((plugin, version)): Path<(String, String)>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.plugins.schedules().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the schedule store is not available",
+        )
+    })?;
+    let deleted = store.delete(&plugin, &version)?;
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id: &plugin,
+            capability: Some("schedule.request"),
+            action: "schedule.deleted",
+            result: if deleted { "revoked" } else { "not_found" },
+            detail: Some(&format!("version={version}")),
+            scope_digest: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: Some(current.user.id),
+        });
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "plugin": plugin,
+        "version": version,
+        "deleted": deleted,
+    })))
 }
 
 /// Drafts staged by plugins, for the eventual CMS review screen.
@@ -3136,6 +3189,49 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    #[tokio::test]
+    async fn plugin_schedules_can_be_listed_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        state
+            .plugins
+            .schedules()
+            .unwrap()
+            .request("collector", "0.1.0", 600, &serde_json::json!({"page": 1}))
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/plugin-schedules", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["schedules"][0]["plugin_id"], "collector");
+        assert_eq!(value["schedules"][0]["payload"], r#"{"page":1}"#);
+
+        let response = app
+            .oneshot(request_json(
+                "DELETE",
+                "/api/v1/plugin-schedules/collector/0.1.0",
+                &session,
+                &csrf,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["deleted"], true);
     }
 
     #[tokio::test]
