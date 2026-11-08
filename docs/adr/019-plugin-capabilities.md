@@ -92,9 +92,11 @@ The CMS/collector probe made the gap concrete:
     time. The supervisor appends before extraction; admins read it at
     `/api/v1/plugins/verifications`. It is a local audit trail, not a public log.
 17. **Phase 3.7 validates the Windows network primitive.** An AppContainer child
-    with no capabilities cannot connect out (`WSAEACCES 10013`); the prototype
-    copies the child and `vcruntime140.dll` into the profile folder. It is not
-    wired into `PluginHost` yet, and loopback-to-broker behavior is untested.
+    with no capabilities cannot connect out (`WSAEACCES 10013`) and cannot reach
+    host loopback (timed out against a live listener). The prototype copies the
+    child and `vcruntime140.dll` into the profile folder. It is not wired into
+    `PluginHost` yet; the HTTP broker must move to inherited stdio or a named pipe
+    first.
 18. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
     isolation.

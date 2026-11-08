@@ -33,11 +33,18 @@ blocked: ... (os error 10013)
 creation work. A minimal Rust `hello` runs after the VC runtime is copied,
 isolating the failure to the missing runtime, not the container.
 
+## Loopback result
+
+A host `TcpListener` on `127.0.0.1:45678` was not reachable from the container:
+the child timed out instead of connecting. So AppContainer cannot keep using the
+loopback HTTP broker. Isolated stdio plugins need the broker over an inherited
+pipe (the existing stdin/stdout JSON-RPC channel) or a named pipe.
+
 ## Limits / next step
 
-- Loopback to the host broker is **not** tested yet. AppContainer normally blocks
-  loopback too; a broker over a named pipe (or an explicit capability) would be
-  needed before isolated plugins can use `net.fetch` / `secret.use`.
+- Loopback to the host broker is **blocked** (timed out against a live
+  `127.0.0.1` listener). A broker over the existing stdio channel or a named pipe
+  is required before isolated plugins can use `net.fetch` / `secret.use`.
 - The plugin install directory (not just one exe) must be copied or ACL-granted,
   and write paths/profiles cleaned up.
 - Integration belongs in `platform.rs` behind a config switch, with the probe
