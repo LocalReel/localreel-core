@@ -12,6 +12,8 @@
 //! the host.
 
 pub mod audit;
+pub mod broker;
+pub mod broker_client;
 pub mod capability;
 mod gate;
 pub mod grants;
@@ -26,8 +28,11 @@ pub mod storage;
 mod supervisor;
 
 pub use audit::{AuditEntry, AuditEvent, AuditLog};
+pub use broker::{BrokerError, BrokerRequest, BrokerResponse};
+pub use broker_client::{BrokerClient, BrokerReply};
 pub use capability::{
-    scope_digest, CapabilityDescriptor, CapabilityRequest, RequestedCapability, CAPABILITIES,
+    scope_digest, CapabilityDescriptor, CapabilityRequest, NetFetchScope, RequestedCapability,
+    CAPABILITIES,
 };
 pub use gate::Gate;
 pub use grants::{CapabilityGrant, GrantStore};

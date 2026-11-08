@@ -177,9 +177,9 @@ pub fn validate_request(request: &CapabilityRequest) -> Result<ValidatedCapabili
                 ));
             }
             for method in &scope.methods {
-                if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+                if !matches!(method.as_str(), "GET" | "HEAD") {
                     return Err(PluginError::Manifest(format!(
-                        "net.fetch.scope.methods contains unsupported method {method:?}"
+                        "net.fetch.scope.methods contains unsupported method {method:?}; the broker currently supports GET and HEAD"
                     )));
                 }
             }

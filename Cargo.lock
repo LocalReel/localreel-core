@@ -864,6 +864,7 @@ name = "localreel-api"
 version = "0.5.5"
 dependencies = [
  "axum",
+ "base64",
  "futures-util",
  "httpdate",
  "localreel-kernel",
@@ -932,6 +933,7 @@ dependencies = [
 name = "localreel-plugin"
 version = "0.5.5"
 dependencies = [
+ "base64",
  "libc",
  "localreel-kernel",
  "rusqlite",
@@ -942,6 +944,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "ureq",
+ "url",
  "uuid",
  "walkdir",
  "windows-sys 0.59.0",

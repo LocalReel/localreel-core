@@ -698,6 +698,11 @@ async fn serve(
         config.data_dir.join("plugins"),
         config.plugin_runtime.stop_timeout,
     );
+    let broker_host = match config.host.as_str() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        host => host,
+    };
+    plugin_host.with_host_url(format!("http://{broker_host}:{}", config.port));
     let source_index = localreel_media::MediaService::new(db.clone());
     let mut plugin_failures: Vec<localreel_plugin::PluginFailure> = Vec::new();
     let mut specs = Vec::new();

@@ -217,7 +217,12 @@ fn start_entry(shared: &Arc<Shared>, sink: &Arc<dyn ProviderSink>, id: &str) {
 
     let install_root = shared.install_root.join(&spec.manifest.id);
     let roots = sink.roots(&spec.manifest.id);
-    match spawn(&spec, &install_root, roots) {
+    let host_url = shared
+        .host_url
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match spawn(&spec, &install_root, roots, host_url) {
         Ok(runtime) => {
             let gate = Gate::new();
             sink.register(
@@ -276,6 +281,7 @@ fn spawn(
     spec: &PluginSpec,
     install_root: &Path,
     roots: Vec<String>,
+    host_url: Option<String>,
 ) -> std::result::Result<Arc<PluginRuntime>, (String, bool)> {
     let version_dir = install_root.join(&spec.manifest.version);
     let manifest = extract(&spec.package, &version_dir)
@@ -288,6 +294,7 @@ fn spawn(
         &PluginSandbox {
             working_dir: Some(install_root.to_path_buf()),
             roots,
+            host_url,
         },
     )
     .map_err(|error| (error.to_string(), is_permanent(&error)))?;

@@ -14,6 +14,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Extension, Json, Router,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
@@ -27,7 +28,7 @@ use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, CurrentUser, DeleteSourceReport, FeedItem,
     Media, MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
-use localreel_plugin::AuditEvent;
+use localreel_plugin::{AuditEvent, BrokerRequest};
 
 use crate::auth;
 use crate::error::ApiError;
@@ -54,7 +55,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/logout", post(auth::logout))
         // Plugins have no browser session; this one authenticates with the
         // token the host gave the sidecar when it started it.
-        .route("/api/v1/plugin-proxy", post(plugin_proxy));
+        .route("/api/v1/plugin-proxy", post(plugin_proxy))
+        .route("/api/v1/plugin-broker/fetch", post(plugin_broker_fetch));
 
     // Any signed-in account: the shared library plus that account's own state.
     let user_api = Router::new()
@@ -342,6 +344,34 @@ async fn plugin_proxy(
     builder
         .body(Body::from(proxied.body))
         .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+/// Host-mediated `net.fetch`. A plugin must present its per-run token and an
+/// active `net.fetch` grant; the host checks the scope, SSRF policy and rate
+/// limit, audits the outcome, and only then returns the body.
+async fn plugin_broker_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<BrokerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    let response = state.plugins.broker_fetch(token, payload)?;
+    let body = base64::engine::general_purpose::STANDARD.encode(&response.body);
+    Ok(Json(serde_json::json!({
+        "status": response.status,
+        "content_type": response.content_type,
+        "body_b64": body,
+    })))
 }
 
 /// Installed plugins with the permissions that actually apply to them.
@@ -2304,6 +2334,43 @@ mod tests {
                     .header("x-localreel-plugin", "not-a-token")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"url":"https://example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_broker_requires_a_plugin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let body = r#"{"url":"https://example.com","method":"GET"}"#;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-broker/fetch")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-broker/fetch")
+                    .header("host", "127.0.0.1:3001")
+                    .header("x-localreel-plugin", "not-a-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1)
+- Status: Accepted (phase 1; phase 2.1 adds the `net.fetch` broker)
 - Date: 2026-11-08
 
 ## Context
@@ -44,6 +44,13 @@ The CMS/collector probe made the gap concrete:
    audit are real; the broker that executes the capabilities is phase 2, and OS
    isolation is phase 3. Until then a grant is a disclosed intent, not a
    privilege that has been exercised. The protocol document says so.
+6. **Phase 2.1 enforces `net.fetch`.** The plugin calls
+   `POST /api/v1/plugin-broker/fetch` with its per-run token; the host checks the
+   active grant for the exact version, the scope (hosts/methods/bytes/timeout/
+   redirects/rate), the SSRF policy and the header allowlist, writes the audit row
+   and only then returns the body. The other capabilities remain
+   disclosure-only until their broker exists. The control channel is still
+   loopback HTTP; phase 3 replaces it and adds OS isolation.
 
 ## Consequences
 

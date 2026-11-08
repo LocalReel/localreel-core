@@ -32,7 +32,12 @@ pub const CSRF_HEADER: &str = "x-localreel-csrf";
 ///
 /// The plugin proxy authenticates with the plugin's own token header instead:
 /// a sidecar has no browser session and never should have one.
-const PUBLIC_PATHS: &[&str] = &["/api/v1/health", "/api/v1/auth/", "/api/v1/plugin-proxy"];
+const PUBLIC_PATHS: &[&str] = &[
+    "/api/v1/health",
+    "/api/v1/auth/",
+    "/api/v1/plugin-proxy",
+    "/api/v1/plugin-broker/fetch",
+];
 
 /// The page's bootstrap answer: who is signed in, and whether first-run setup
 /// is still needed.

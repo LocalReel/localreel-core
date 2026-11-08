@@ -72,6 +72,9 @@ pub struct PluginSandbox {
     pub working_dir: Option<std::path::PathBuf>,
     /// Source roots this plugin is responsible for, as URIs.
     pub roots: Vec<String>,
+    /// Base URL of the host, for plugins that need to call the capability
+    /// broker. Loopback in phase 2; phase 3 replaces it with a non-TCP channel.
+    pub host_url: Option<String>,
 }
 
 /// A bounded tail of the plugin's stderr.
@@ -138,6 +141,9 @@ fn sandboxed_command(
             "LOCALREEL_PLUGIN_ROOTS",
             serde_json::to_string(&sandbox.roots).unwrap_or_else(|_| "[]".to_string()),
         );
+    if let Some(url) = &sandbox.host_url {
+        command.env("LOCALREEL_PLUGIN_HOST_URL", url);
+    }
     if let Some(dir) = &sandbox.working_dir {
         command.current_dir(dir);
     }
@@ -397,6 +403,7 @@ mod tests {
         let sandbox = PluginSandbox {
             working_dir: Some(std::path::PathBuf::from("data/plugins/example")),
             roots: vec!["https://nas/dav".to_string()],
+            host_url: Some("http://127.0.0.1:3001".to_string()),
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin.js"),
@@ -426,6 +433,12 @@ mod tests {
         assert!(keys.contains(&"LOCALREEL_PLUGIN_TOKEN".to_string()));
         assert!(keys.contains(&"LOCALREEL_PLUGIN_CONFIG".to_string()));
         assert!(keys.contains(&"LOCALREEL_PLUGIN_ROOTS".to_string()));
+        let host_url = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("LOCALREEL_PLUGIN_HOST_URL"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(host_url.as_deref(), Some("http://127.0.0.1:3001"));
 
         assert_eq!(
             command.get_current_dir(),
@@ -438,6 +451,7 @@ mod tests {
         let sandbox = PluginSandbox {
             working_dir: None,
             roots: vec!["/library".to_string(), "https://nas/dav".to_string()],
+            host_url: None,
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin"),

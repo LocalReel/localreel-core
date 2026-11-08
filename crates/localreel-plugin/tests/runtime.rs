@@ -70,6 +70,7 @@ fn sidecar_serves_stat_list_walk_and_ranges() {
             &localreel_plugin::PluginSandbox {
                 working_dir: Some(install.clone()),
                 roots: vec![library.to_string_lossy().into_owned()],
+                host_url: None,
             },
         )
         .unwrap(),

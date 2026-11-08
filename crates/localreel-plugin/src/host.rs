@@ -16,7 +16,7 @@
 //! is the only sanctioned way out, it requires the `network` permission, and it
 //! records every request.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -25,10 +25,14 @@ use std::time::{Duration, Instant};
 
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
+use localreel_kernel::time::now_secs;
 use serde::Serialize;
 
-use crate::audit::AuditLog;
-use crate::capability::{self, CapabilityDescriptor, RequestedCapability, CAPABILITIES};
+use crate::audit::{AuditEvent, AuditLog};
+use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
+use crate::capability::{
+    self, CapabilityDescriptor, NetFetchScope, RequestedCapability, CAPABILITIES,
+};
 use crate::gate::Gate;
 use crate::grants::{CapabilityGrant, GrantStore};
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
@@ -237,9 +241,40 @@ pub(crate) struct Shared {
     pub(crate) inner: RwLock<Inner>,
     pub(crate) audit: Option<AuditLog>,
     pub(crate) grants: Option<GrantStore>,
+    /// Base URL the plugin uses to call the host broker. `None` keeps the
+    /// phase-1 behaviour (no broker calls).
+    pub(crate) host_url: RwLock<Option<String>>,
+    /// Fixed-window call counts for capabilities that declare a rate.
+    pub(crate) rates: Mutex<HashMap<String, RateWindow>>,
     /// `<data>/plugins`; each generation installs under `<id>/<version>`.
     pub(crate) install_root: PathBuf,
     pub(crate) stop_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RateWindow {
+    minute: i64,
+    count: u32,
+}
+
+impl Shared {
+    pub(crate) fn allow_rate(&self, key: &str, limit: u32) -> bool {
+        let minute = now_secs() / 60;
+        let mut rates = self
+            .rates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = rates.entry(key.to_string()).or_default();
+        if window.minute != minute {
+            window.minute = minute;
+            window.count = 0;
+        }
+        if window.count >= limit {
+            return false;
+        }
+        window.count += 1;
+        true
+    }
 }
 
 impl Shared {
@@ -313,6 +348,8 @@ impl PluginHost {
                 inner: RwLock::new(Inner::default()),
                 audit,
                 grants,
+                host_url: RwLock::new(None),
+                rates: Mutex::new(HashMap::new()),
                 install_root,
                 stop_timeout,
             }),
@@ -326,6 +363,18 @@ impl PluginHost {
 
     pub fn grants(&self) -> Option<&GrantStore> {
         self.shared.grants.as_ref()
+    }
+
+    /// Tell newly started plugins where the host's capability broker lives.
+    ///
+    /// Call this before `start` so the first plugin generation receives the
+    /// variable. It can be changed later; the next generation picks it up.
+    pub fn with_host_url(&self, url: impl Into<String>) {
+        *self
+            .shared
+            .host_url
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url.into());
     }
 
     /// Install the specs and start supervising them.
@@ -640,6 +689,161 @@ impl PluginHost {
         }
         fetch(url)
     }
+
+    /// Host-mediated `net.fetch`: grant, scope, rate limit, SSRF, audit.
+    ///
+    /// The audit sink is a precondition, not a side effect: without it the
+    /// call is refused before any socket is opened.
+    pub fn broker_fetch(&self, token: &str, request: BrokerRequest) -> Result<BrokerResponse> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.broker_fetch_for(&plugin_id, &version, request)
+    }
+
+    fn broker_fetch_for(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        request: BrokerRequest,
+    ) -> Result<BrokerResponse> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let detail = format!(
+            "{} {}",
+            request.method.to_ascii_uppercase(),
+            broker::redact_url(&request.url)
+        );
+        let started = Instant::now();
+
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "net.fetch");
+        let Some(grant) = grant else {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("net.fetch"),
+                action: "capability.fetch",
+                result: "denied",
+                detail: Some("net.fetch is not granted for this plugin version"),
+                scope_digest: None,
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            return Err(KernelError::PermissionDenied(
+                "net.fetch is not granted for this plugin version".to_string(),
+            ));
+        };
+
+        let scope: NetFetchScope =
+            serde_json::from_value(grant.scope.clone()).map_err(|error| {
+                KernelError::InvalidInput(format!("stored net.fetch scope is invalid: {error}"))
+            })?;
+        if !self
+            .shared
+            .allow_rate(&format!("{plugin_id}:net.fetch"), scope.rate_per_min)
+        {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("net.fetch"),
+                action: "capability.fetch",
+                result: "denied",
+                detail: Some("rate limit reached"),
+                scope_digest: Some(&grant.scope_digest),
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            return Err(KernelError::PermissionDenied(
+                "net.fetch rate limit reached".to_string(),
+            ));
+        }
+
+        match broker::fetch(&scope, &request) {
+            Ok(response) => {
+                let bytes = i64::try_from(response.body.len()).unwrap_or(i64::MAX);
+                audit
+                    .record_event(&AuditEvent {
+                        plugin_id,
+                        capability: Some("net.fetch"),
+                        action: "capability.fetch",
+                        result: "allowed",
+                        detail: Some(&detail),
+                        scope_digest: Some(&grant.scope_digest),
+                        bytes_in: None,
+                        bytes_out: Some(bytes),
+                        duration_ms: Some(started.elapsed().as_millis() as i64),
+                        request_id: Some(&request_id),
+                        job_id: None,
+                        user_id: None,
+                    })
+                    .map_err(|error| {
+                        KernelError::Storage(format!(
+                            "the capability audit could not be written: {error}"
+                        ))
+                    })?;
+                Ok(response)
+            }
+            Err(error) => {
+                let result = match error {
+                    BrokerError::Denied(_) | BrokerError::Invalid(_) | BrokerError::Redirect(_) => {
+                        "denied"
+                    }
+                    BrokerError::TooLarge(_) | BrokerError::Timeout | BrokerError::Upstream(_) => {
+                        "error"
+                    }
+                };
+                let _ = audit.record_event(&AuditEvent {
+                    plugin_id,
+                    capability: Some("net.fetch"),
+                    action: "capability.fetch",
+                    result,
+                    detail: Some(&detail),
+                    scope_digest: Some(&grant.scope_digest),
+                    bytes_in: None,
+                    bytes_out: None,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                    request_id: Some(&request_id),
+                    job_id: None,
+                    user_id: None,
+                });
+                Err(map_broker_error(error))
+            }
+        }
+    }
+}
+
+fn map_broker_error(error: BrokerError) -> KernelError {
+    match error {
+        BrokerError::Invalid(message) => KernelError::InvalidInput(message),
+        BrokerError::Denied(message) | BrokerError::Redirect(message) => {
+            KernelError::PermissionDenied(message)
+        }
+        BrokerError::TooLarge(limit) => KernelError::InvalidInput(format!(
+            "upstream response exceeds the {limit} byte scope limit"
+        )),
+        BrokerError::Timeout => {
+            KernelError::StorageUnavailable("upstream request timed out".to_string())
+        }
+        BrokerError::Upstream(message) => KernelError::StorageUnavailable(message),
+    }
 }
 
 impl Drop for PluginHost {
@@ -861,6 +1065,67 @@ mod tests {
             host.set_enabled("nope", false).unwrap_err(),
             KernelError::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn broker_fetch_refuses_without_an_active_grant_and_audits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("broker.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+
+        // No grant yet: the request is refused before DNS or a socket.
+        let error = host
+            .broker_fetch_for(
+                "demo",
+                "0.1.0",
+                BrokerRequest::get("https://evil.example/x"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, KernelError::PermissionDenied(_)));
+
+        // A grant for another host still refuses the out-of-scope request.
+        host.grants()
+            .unwrap()
+            .grant(
+                "demo",
+                "0.1.0",
+                "net.fetch",
+                serde_json::json!({"hosts": ["api.example.com"]}),
+                None,
+                None,
+            )
+            .unwrap();
+        let error = host
+            .broker_fetch_for(
+                "demo",
+                "0.1.0",
+                BrokerRequest::get("https://evil.example/x"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, KernelError::PermissionDenied(_)));
+
+        // Revocation is effective on the next call; the allowed host is not
+        // contacted because the grant is gone.
+        host.grants()
+            .unwrap()
+            .revoke("demo", "0.1.0", "net.fetch")
+            .unwrap();
+        let error = host
+            .broker_fetch_for(
+                "demo",
+                "0.1.0",
+                BrokerRequest::get("https://api.example.com/x"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, KernelError::PermissionDenied(_)));
+
+        let entries = host.audit().unwrap().recent(Some("demo"), 10).unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.capability.as_deref() == Some("net.fetch")
+                && entry.result.as_deref() == Some("denied")
+        }));
+        assert!(entries.len() >= 3);
     }
 
     #[test]

@@ -160,7 +160,10 @@ guarantee is that every sanctioned request is attributable.
 3. The host starts the entry program with:
    - `LOCALREEL_PLUGIN_ID` — manifest id;
    - `LOCALREEL_PLUGIN_TOKEN` — random per-run token;
-   - `LOCALREEL_PLUGIN_CONFIG` — JSON configuration (≤ 32 KiB).
+   - `LOCALREEL_PLUGIN_CONFIG` — JSON configuration (≤ 32 KiB);
+   - `LOCALREEL_PLUGIN_ROOTS` — JSON array of the source roots the plugin owns;
+   - `LOCALREEL_PLUGIN_HOST_URL` — base URL of the host broker
+     (`http://127.0.0.1:<port>` in phase 2; phase 3 replaces the control channel).
 4. The plugin prints one line to stdout:
    `{"ready": true, "port": 12345}` and listens on `127.0.0.1`.
 5. The host calls `GET /v1/health` until it returns 200 (bounded retries).
