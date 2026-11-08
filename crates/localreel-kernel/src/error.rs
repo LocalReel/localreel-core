@@ -19,6 +19,15 @@ pub enum KernelError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A storage provider exists in the configuration but cannot serve right
+    /// now: its sidecar plugin is disabled, still starting, or failed.
+    ///
+    /// Kept separate from [`KernelError::Storage`] so the HTTP layer can answer
+    /// `503` (try again later, the server is fine) instead of `500` (something
+    /// broke), and so the UI can say which plugin is at fault.
+    #[error("storage unavailable: {0}")]
+    StorageUnavailable(String),
+
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 

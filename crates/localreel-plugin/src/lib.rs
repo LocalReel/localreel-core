@@ -5,21 +5,33 @@
 //! program as a child process and talks to it over loopback HTTP. Storage
 //! plugins implement the [`localreel_kernel::storage::Storage`] contract through
 //! [`PluginStorage`].
+//!
+//! [`PluginHost`] owns the configured set and supervises it: failures become
+//! reported states, crashes are retried with backoff, stops drain in-flight
+//! requests before the process is killed, and the child's process tree dies with
+//! the host.
 
 pub mod audit;
+mod gate;
 pub mod host;
 pub mod http;
 pub mod manifest;
 pub mod package;
+mod platform;
 pub mod runtime;
 pub mod server;
 pub mod storage;
+mod supervisor;
 
 pub use audit::{AuditEntry, AuditLog};
-pub use host::{PluginHost, PluginSummary, ProxyResponse};
+pub use gate::Gate;
+pub use host::{
+    PluginDescriptor, PluginFailure, PluginHost, PluginSpec, PluginState, ProxyResponse,
+};
 pub use manifest::{
     Manifest, PluginError, PluginKind, API_VERSION, PERMISSION_NETWORK, PERMISSION_STORAGE_READ,
 };
 pub use package::{extract, inspect};
 pub use runtime::{PluginRuntime, PluginSandbox};
 pub use storage::PluginStorage;
+pub use supervisor::ProviderSink;

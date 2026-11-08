@@ -29,6 +29,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 toml = "0.8"
+toml_edit = "0.22"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2"
@@ -47,8 +48,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

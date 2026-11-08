@@ -11,6 +11,13 @@ pub enum Event {
     ServerStarted {
         version: String,
     },
+    /// A sidecar plugin moved between lifecycle states (started, failed, …).
+    PluginStateChanged {
+        id: String,
+        state: String,
+        running: bool,
+        error: Option<String>,
+    },
     JobQueued {
         job_id: String,
         kind: String,

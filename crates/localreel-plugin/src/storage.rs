@@ -2,6 +2,11 @@
 //!
 //! The host asks the plugin over loopback HTTP; the plugin decides how to reach
 //! the bytes (WebDAV, SMB, S3, …). The core never learns the remote protocol.
+//!
+//! Every call passes through a [`Gate`]: a stop closes the gate first, waits for
+//! the in-flight counter to reach zero, and only then takes the provider away
+//! and kills the process. `open_range` returns a reader that holds its guard for
+//! as long as the stream lives, because that call outlives the function.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -10,6 +15,7 @@ use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::storage::{FileStat, MediaUri, Storage, StorageEntry};
 use serde::Deserialize;
 
+use crate::gate::{Gate, GuardedRead, InflightGuard};
 use crate::http;
 use crate::runtime::PluginRuntime;
 
@@ -41,14 +47,33 @@ struct EntriesBody {
 
 pub struct PluginStorage {
     runtime: Arc<PluginRuntime>,
+    gate: Arc<Gate>,
 }
 
 impl PluginStorage {
+    /// A provider with its own gate.
     pub fn new(runtime: Arc<PluginRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            gate: Gate::new(),
+        }
+    }
+
+    /// A provider whose gate the supervisor already owns, so it can drain it.
+    pub fn with_gate(runtime: Arc<PluginRuntime>, gate: Arc<Gate>) -> Self {
+        Self { runtime, gate }
+    }
+
+    pub fn gate(&self) -> &Arc<Gate> {
+        &self.gate
+    }
+
+    pub fn runtime(&self) -> &Arc<PluginRuntime> {
+        &self.runtime
     }
 
     fn request_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let _guard = self.gate.enter()?;
         let response = self.runtime.request(path).map_err(map_error)?;
         let status = response.status;
         if status != 200 {
@@ -101,11 +126,12 @@ impl Storage for PluginStorage {
             "/v1/read?uri={}&start={start}&len={len}",
             http::encode(&uri.to_uri())
         );
+        let guard: InflightGuard = self.gate.enter()?;
         let response = self.runtime.request(&path).map_err(map_error)?;
         if response.status != 200 {
             return Err(map_status(response.status));
         }
-        Ok(Box::new(response.take(len)))
+        Ok(Box::new(GuardedRead::new(response.take(len), guard)))
     }
 }
 
@@ -127,5 +153,22 @@ fn map_status(status: u16) -> KernelError {
     match status {
         404 => KernelError::NotFound("plugin reported a missing object".into()),
         _ => KernelError::Storage(format!("plugin returned HTTP {status}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_gate_short_circuits_before_the_socket() {
+        // Building a real runtime needs a child process; the gate is the part
+        // that decides whether a call may start at all, so test it in place.
+        let gate = Gate::new();
+        gate.close();
+        assert!(matches!(
+            gate.enter().unwrap_err(),
+            KernelError::StorageUnavailable(_)
+        ));
     }
 }

@@ -118,6 +118,27 @@ guarantee is that every sanctioned request is attributable.
 The plugin must not write to stdout after the ready line (stdout is drained but
 ignored); diagnostics belong on stderr, whose tail the host keeps for errors.
 
+### When a plugin cannot start
+
+A configured plugin that fails at any step above does **not** take the server
+down. The entry stays in `GET /api/v1/plugins` with a state:
+
+| State | Meaning |
+|---|---|
+| `running` | The sidecar is up and its provider is registered. |
+| `failed` | Loading failed; `error` carries the reason (also recorded as a `start.failed` audit row). |
+| `disabled` | `enabled = false` in the configuration; never loaded. |
+| `stopped` | Stopped on purpose at runtime (a supervisor milestone). |
+
+Sources whose `kind` matches a configured but not-running plugin answer `503`
+(`storage_unavailable`) instead of the generic `500`, so a client can tell
+"temporarily down" from "this source is wrong".
+
+Operators who prefer the old behaviour — refuse to start at all — set
+`[plugin_runtime] strict = true`. The stop path waits
+`[plugin_runtime] stop_timeout_secs` (default 5) for in-flight requests before
+killing the process.
+
 ## HTTP contract
 
 Every request carries `X-LocalReel-Token: <token>`. A wrong or missing token

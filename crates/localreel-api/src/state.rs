@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use localreel_kernel::config::Config;
@@ -24,6 +25,10 @@ pub struct AppState {
     pub transcodes: Arc<localreel_media::TranscodeGate>,
     /// The sidecar plugins this process started.
     pub plugins: Arc<localreel_plugin::PluginHost>,
+    /// The configuration file that was loaded, when there was one. `disable`
+    /// and `enable` can write the switch back here instead of leaving a
+    /// runtime-only state behind.
+    pub config_source: Option<PathBuf>,
     /// The metadata provider actually active, or `None` when disabled or
     /// configured without an API key.
     pub metadata_provider: Option<String>,
@@ -51,6 +56,7 @@ pub struct AppStateParts {
     pub accounts: AccountService,
     pub transcodes: Arc<localreel_media::TranscodeGate>,
     pub plugins: Arc<localreel_plugin::PluginHost>,
+    pub config_source: Option<PathBuf>,
     pub metadata_provider: Option<String>,
     pub ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability,
     pub hwaccel: localreel_kernel::media_ops::HwAccel,
@@ -67,6 +73,7 @@ impl AppState {
             accounts,
             transcodes,
             plugins,
+            config_source,
             metadata_provider,
             ffmpeg_capability,
             hwaccel,
@@ -87,6 +94,7 @@ impl AppState {
             watchers,
             transcodes,
             plugins,
+            config_source,
             metadata_provider,
             ffmpeg_capability,
             hwaccel,

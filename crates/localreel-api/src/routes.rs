@@ -85,6 +85,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/audit", get(plugin_audit))
+        .route("/api/v1/plugins/:id/restart", post(plugin_restart))
+        .route("/api/v1/plugins/:id/enable", post(plugin_enable))
+        .route("/api/v1/plugins/:id/disable", post(plugin_disable))
+        .route("/api/v1/plugins/:id/logs", get(plugin_logs))
         .route("/api/v1/metadata", get(metadata_status))
         .route("/api/v1/metadata/match", post(match_metadata))
         .route("/api/v1/backup", get(download_backup).post(upload_backup))
@@ -354,6 +358,95 @@ async fn plugin_audit(
         .transpose()?
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginControlQuery {
+    /// Also rewrite `enabled` in the configuration file. Off by default: a
+    /// click in the UI must not silently edit a file the operator maintains.
+    #[serde(default)]
+    persist: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginLogsQuery {
+    bytes: Option<usize>,
+}
+
+/// Restart one plugin: stop its generation, then start a fresh one.
+async fn plugin_restart(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.plugins.restart(&id)?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+/// Turn a plugin on at runtime, optionally persisting the switch.
+async fn plugin_enable(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<PluginControlQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let persisted = control_plugin(&state, &id, true, query.persist)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "id": id,
+        "state": state.plugins.descriptor(&id).map(|d| d.state.as_str()),
+        "persisted": persisted,
+    })))
+}
+
+/// Turn a plugin off at runtime, optionally persisting the switch.
+async fn plugin_disable(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<PluginControlQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let persisted = control_plugin(&state, &id, false, query.persist)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "id": id,
+        "state": state.plugins.descriptor(&id).map(|d| d.state.as_str()),
+        "persisted": persisted,
+    })))
+}
+
+fn control_plugin(
+    state: &AppState,
+    id: &str,
+    enabled: bool,
+    persist: bool,
+) -> Result<Option<bool>, ApiError> {
+    let package = state.plugins.package_of(id);
+    state.plugins.set_enabled(id, enabled)?;
+    if !persist {
+        return Ok(None);
+    }
+    let (Some(config_path), Some(package)) = (&state.config_source, package) else {
+        // No configuration file to write (environment-only setup) or no
+        // package to match: the runtime switch still applies.
+        return Ok(Some(false));
+    };
+    Ok(Some(localreel_kernel::config::set_plugin_enabled(
+        config_path,
+        &package,
+        enabled,
+    )?))
+}
+
+/// The tail of a plugin's stderr, for the admin diagnostics view.
+async fn plugin_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<PluginLogsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.plugins.descriptor(&id).is_none() {
+        return Err(ApiError::not_found(format!("plugin '{id}'")));
+    }
+    let bytes = query.bytes.unwrap_or(8192).clamp(1, 64 * 1024);
+    let log = state.plugins.logs(&id, bytes).unwrap_or_default();
+    Ok(Json(serde_json::json!({ "id": id, "log": log })))
 }
 
 async fn admin_health(
@@ -1636,6 +1729,7 @@ mod tests {
             accounts,
             transcodes,
             plugins: Arc::new(localreel_plugin::PluginHost::default()),
+            config_source: None,
             metadata_provider: None,
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
             hwaccel: localreel_kernel::media_ops::HwAccel::None,
@@ -2028,6 +2122,61 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value[key], serde_json::json!([]), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_plugin_is_reported_instead_of_vanishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        // The loader records failures instead of returning an error; the API
+        // must surface them with the reason the operator needs.
+        state.plugins.record_failed(
+            &std::path::PathBuf::from("plugins/broken.lrplug"),
+            None,
+            "plugin did not print a ready line in time",
+        );
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as("/api/v1/plugins", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let plugin = &value["plugins"][0];
+        assert_eq!(plugin["id"], "broken");
+        assert_eq!(plugin["state"], "failed");
+        assert_eq!(plugin["running"], false);
+        assert_eq!(plugin["error"], "plugin did not print a ready line in time");
+    }
+
+    #[tokio::test]
+    async fn controlling_an_unknown_plugin_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/nope/restart",
+                &session,
+                &csrf,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/nope/logs", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

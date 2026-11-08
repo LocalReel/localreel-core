@@ -23,3 +23,12 @@ ureq.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 walkdir.workspace = true
+
+# A plugin runs in its own process, but "own process" is not an isolation
+# guarantee: when the host dies the child must die with it. Windows gets a Job
+# Object, Unix a process group; both need a platform binding.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

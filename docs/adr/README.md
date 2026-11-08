@@ -20,6 +20,7 @@ from the module boundaries.
 | 012 | [Persistent state locations](012-state-locations.md) |
 | 013 | [Accounts and per-user state](013-accounts.md) |
 | 014 | [Plugin permissions are enforced](014-plugin-permissions.md) |
+| 016 | [The Windows per-user installer is ours](016-per-user-installer.md) |
 
-Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–014 on
-2026-11-07).
+Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–016 on
+2026-11-07/08).

@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use anyhow::Context;
 use localreel_api::AppState;
 use localreel_kernel::config::{Config, RunMode};
 use localreel_kernel::db::Database;
@@ -187,6 +186,75 @@ fn run_migrations(db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long plugin audit rows are kept. Long enough to answer "what happened
+/// last month", short enough that the table cannot grow forever.
+const PLUGIN_AUDIT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+fn prune_plugin_audit(audit: &localreel_plugin::AuditLog) {
+    match audit.prune(PLUGIN_AUDIT_RETENTION_SECS) {
+        Ok(0) => {}
+        Ok(removed) => info!(removed, "pruned plugin audit entries"),
+        Err(error) => warn!("failed to prune the plugin audit: {error}"),
+    }
+}
+
+/// The supervisor reports every state change here; the SSE stream forwards it
+/// to the admin page.
+struct PluginProviders {
+    storage: Arc<localreel_media::StorageRegistry>,
+    sources: MediaService,
+    events: EventBus,
+}
+
+impl PluginProviders {
+    fn new(
+        storage: Arc<localreel_media::StorageRegistry>,
+        sources: MediaService,
+        events: EventBus,
+    ) -> Self {
+        Self {
+            storage,
+            sources,
+            events,
+        }
+    }
+}
+
+impl localreel_plugin::ProviderSink for PluginProviders {
+    fn register(&self, kind: &str, provider: Arc<dyn localreel_kernel::storage::Storage>) {
+        self.storage.register(kind, provider);
+    }
+
+    fn unregister(&self, kind: &str) {
+        self.storage.unregister(kind);
+    }
+
+    fn roots(&self, kind: &str) -> Vec<String> {
+        match self.sources.list_sources_with_archived(false) {
+            Ok(sources) => sources
+                .into_iter()
+                .filter(|source| source.kind == kind)
+                .map(|source| source.uri)
+                .collect(),
+            Err(error) => {
+                // A plugin with no roots is still usable; it just cannot be
+                // told what it owns.
+                warn!(plugin = %kind, "failed to list sources: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn state_changed(&self, descriptor: &localreel_plugin::PluginDescriptor) {
+        self.events.publish(Event::PluginStateChanged {
+            id: descriptor.id.clone(),
+            state: descriptor.state.as_str().to_string(),
+            running: descriptor.running,
+            error: descriptor.error.clone(),
+        });
+    }
+}
+
 fn migrate() -> anyhow::Result<()> {
     let (config, _) = Config::load_with_source()?;
     config.ensure_dirs()?;
@@ -269,6 +337,35 @@ fn doctor() -> anyhow::Result<()> {
         "missing (API-only placeholder)".to_string()
     };
     println!("  web:       {web}");
+    if config.plugins.is_empty() {
+        println!("  plugins:   none configured");
+    } else {
+        println!(
+            "  plugins:   {} (policy: {})",
+            config.plugins.len(),
+            if config.plugin_runtime.strict {
+                "strict"
+            } else {
+                "degrade on failure"
+            }
+        );
+        for plugin in &config.plugins {
+            println!(
+                "             {} [{}{}]",
+                plugin.package.display(),
+                if plugin.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if plugin.package.is_file() {
+                    ""
+                } else {
+                    ", package missing"
+                }
+            );
+        }
+    }
     println!("  workers:   {}", config.jobs.workers);
     Ok(())
 }
@@ -570,40 +667,76 @@ async fn serve(
     // The plugin audit table has its own migration stream.
     migrations::apply(&db, "plugin", localreel_plugin::audit::migrations())?;
     let storage = Arc::new(localreel_media::StorageRegistry::new());
-    let mut plugin_host = localreel_plugin::PluginHost::new(db.clone());
-    let mut plugin_runtimes = Vec::new();
+    let plugin_host = localreel_plugin::PluginHost::with_options(
+        db.clone(),
+        config.data_dir.join("plugins"),
+        config.plugin_runtime.stop_timeout,
+    );
     let source_index = localreel_media::MediaService::new(db.clone());
-    for plugin in config.plugins.iter().filter(|plugin| plugin.enabled) {
-        let inspected = localreel_plugin::inspect(&plugin.package)
-            .with_context(|| format!("plugin package {}", plugin.package.display()))?;
-        let install_root = config.data_dir.join("plugins").join(&inspected.id);
-        let install = install_root.join(&inspected.version);
-        let manifest = localreel_plugin::extract(&plugin.package, &install)?;
-        let program = install.join(&manifest.entry.program);
-        // Hand the plugin only the roots it is responsible for; everything else
-        // in the library is not its business.
-        let roots: Vec<String> = source_index
-            .list_sources_with_archived(false)?
-            .into_iter()
-            .filter(|source| source.kind == manifest.id)
-            .map(|source| source.uri)
+    let mut plugin_failures: Vec<localreel_plugin::PluginFailure> = Vec::new();
+    let mut specs = Vec::new();
+    for plugin in &config.plugins {
+        let package = &plugin.package;
+        match localreel_plugin::inspect(package) {
+            Ok(manifest) => {
+                // The kind is known from the manifest even if the process never
+                // starts, so a source that points at it can answer
+                // "unavailable" instead of "unknown".
+                storage.declare(manifest.id.clone());
+                specs.push(localreel_plugin::PluginSpec::new(
+                    package.clone(),
+                    manifest,
+                    plugin.config.clone(),
+                    plugin.enabled,
+                ));
+                if !plugin.enabled {
+                    info!(package = %package.display(), "plugin is disabled in the configuration");
+                }
+            }
+            Err(error) if plugin.enabled => {
+                error!(package = %package.display(), "plugin package is unusable: {error}");
+                plugin_host.record_failed(package, None, &error.to_string());
+                plugin_failures.push(localreel_plugin::PluginFailure {
+                    id: package.display().to_string(),
+                    error: error.to_string(),
+                });
+            }
+            Err(_) => {
+                // A disabled package that cannot even be read is still just
+                // disabled: nothing asked the host to load it.
+                plugin_host.record_disabled(package);
+            }
+        }
+    }
+    let sink = Arc::new(PluginProviders::new(
+        storage.clone(),
+        source_index.clone(),
+        events.clone(),
+    ));
+    plugin_failures.extend(plugin_host.start(specs, sink));
+    if config.plugin_runtime.strict && !plugin_failures.is_empty() {
+        let details: Vec<String> = plugin_failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.id, failure.error))
             .collect();
-        let runtime = Arc::new(localreel_plugin::PluginRuntime::start(
-            &program,
-            &manifest,
-            &plugin.config,
-            &localreel_plugin::PluginSandbox {
-                working_dir: Some(install_root),
-                roots,
-            },
-        )?);
-        storage.register(
-            manifest.id.clone(),
-            Arc::new(localreel_plugin::PluginStorage::new(runtime.clone())),
+        anyhow::bail!(
+            "strict plugin loading is enabled and {} plugin(s) failed: {}",
+            plugin_failures.len(),
+            details.join("; ")
         );
-        info!(id = %manifest.id, version = %manifest.version, "plugin started");
-        plugin_host.register(runtime.clone());
-        plugin_runtimes.push(runtime);
+    }
+    // The audit trail answers "what did this plugin do"; it is history, not an
+    // unbounded log.
+    if let Some(audit) = plugin_host.audit().cloned() {
+        prune_plugin_audit(&audit);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                prune_plugin_audit(&audit);
+            }
+        });
     }
     let plugin_host = Arc::new(plugin_host);
     let media = MediaService::with_storage(db.clone(), storage.clone());
@@ -840,7 +973,8 @@ async fn serve(
         media,
         accounts,
         transcodes,
-        plugins: plugin_host,
+        plugins: plugin_host.clone(),
+        config_source: source.clone(),
         metadata_provider: metadata_provider.as_ref().map(|p| p.name().to_string()),
         ffmpeg_capability,
         hwaccel,
@@ -907,6 +1041,10 @@ async fn serve(
         shutdown_signal.store(true, Ordering::SeqCst);
     })
     .await?;
+
+    // Stop the sidecars after the HTTP server stops accepting work, so their
+    // in-flight reads are drained rather than cut off mid-stream.
+    plugin_host.shutdown();
 
     if let Some(mut tray) = tray_handle {
         tray.close();

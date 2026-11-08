@@ -4,11 +4,16 @@
 //! stdout, then talks to the plugin over loopback HTTP. Everything is bounded:
 //! a handshake timeout, a token that the plugin must echo, and a stderr tail kept
 //! for diagnostics. Dropping the runtime kills the child.
+//!
+//! The runtime is also where "the child must not outlive the host" is enforced:
+//! [`crate::platform`] attaches the process tree to the host's lifecycle before
+//! the handshake, so a host crash cannot leave an orphan holding a port.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,11 +22,14 @@ use serde::Deserialize;
 
 use crate::http;
 use crate::manifest::{Manifest, PluginError};
+use crate::platform;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
-const STDERR_TAIL_BYTES: usize = 8 * 1024;
+/// How much of the plugin's stderr the host keeps. Older bytes are dropped from
+/// the front, so the tail an operator needs for a crash is always present.
+const STDERR_RING_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Ready {
@@ -34,7 +42,8 @@ pub struct PluginRuntime {
     address: SocketAddr,
     token: String,
     child: Mutex<Child>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<StderrRing>>,
+    guard: platform::Guard,
 }
 
 /// Variables a plugin may inherit.
@@ -63,6 +72,29 @@ pub struct PluginSandbox {
     pub working_dir: Option<std::path::PathBuf>,
     /// Source roots this plugin is responsible for, as URIs.
     pub roots: Vec<String>,
+}
+
+/// A bounded tail of the plugin's stderr.
+#[derive(Default)]
+struct StderrRing {
+    bytes: VecDeque<u8>,
+}
+
+impl StderrRing {
+    fn push(&mut self, data: &[u8]) {
+        self.bytes.extend(data.iter().copied());
+        while self.bytes.len() > STDERR_RING_BYTES {
+            self.bytes.pop_front();
+        }
+    }
+
+    fn text(&self, max_bytes: usize) -> String {
+        let mut bytes: Vec<u8> = self.bytes.iter().copied().collect();
+        if bytes.len() > max_bytes {
+            bytes.drain(..bytes.len() - max_bytes);
+        }
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    }
 }
 
 /// Build the command that starts a plugin.
@@ -139,6 +171,7 @@ impl PluginRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        platform::configure(&mut command);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -148,11 +181,13 @@ impl PluginRuntime {
         let mut child = command
             .spawn()
             .map_err(|error| PluginError::NotReady(format!("cannot start plugin: {error}")))?;
+        // Attach the tree before the plugin can fork helpers of its own.
+        let guard = platform::attach(&mut child);
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| PluginError::NotReady("plugin stdout is unavailable".into()))?;
-        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(StderrRing::default()));
         if let Some(mut pipe) = child.stderr.take() {
             let sink = Arc::clone(&stderr);
             std::thread::spawn(move || {
@@ -162,11 +197,7 @@ impl PluginRuntime {
                         Ok(0) | Err(_) => break,
                         Ok(read) => {
                             let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
-                            sink.extend_from_slice(&buffer[..read]);
-                            if sink.len() > STDERR_TAIL_BYTES {
-                                let excess = sink.len() - STDERR_TAIL_BYTES;
-                                sink.drain(..excess);
-                            }
+                            sink.push(&buffer[..read]);
                         }
                     }
                 }
@@ -194,25 +225,24 @@ impl PluginRuntime {
         let ready_line = match receiver.recv_timeout(HANDSHAKE_TIMEOUT) {
             Ok(line) => line,
             Err(_) => {
-                kill(&mut child);
+                platform::terminate(&mut child, &guard);
                 return Err(PluginError::NotReady(
                     "plugin did not print a ready line in time".into(),
                 ));
             }
         };
         let ready: Ready = serde_json::from_str(ready_line.trim()).map_err(|error| {
-            kill(&mut child);
+            platform::terminate(&mut child, &guard);
             let tail = stderr
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+                .unwrap_or_else(|p| p.into_inner())
+                .text(8 * 1024);
             PluginError::NotReady(format!(
-                "invalid ready line {ready_line:?}: {error}; stderr: {}",
-                String::from_utf8_lossy(&tail).trim()
+                "invalid ready line {ready_line:?}: {error}; stderr: {tail}"
             ))
         })?;
         if !ready.ready || ready.port == 0 {
-            kill(&mut child);
+            platform::terminate(&mut child, &guard);
             return Err(PluginError::NotReady("plugin reported not ready".into()));
         }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ready.port);
@@ -222,6 +252,7 @@ impl PluginRuntime {
             token,
             child: Mutex::new(child),
             stderr,
+            guard,
         };
         runtime.wait_until_healthy()?;
         Ok(runtime)
@@ -240,6 +271,10 @@ impl PluginRuntime {
         self.address
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.lock().unwrap_or_else(|p| p.into_inner()).id()
+    }
+
     pub fn request(&self, path: &str) -> Result<http::Response, PluginError> {
         http::get(
             self.address,
@@ -250,25 +285,58 @@ impl PluginRuntime {
         )
     }
 
+    /// One health check with its own short budget.
+    pub fn probe(&self, timeout: Duration) -> bool {
+        matches!(
+            http::get(self.address, &self.token, "/v1/health", CONNECT_TIMEOUT, timeout),
+            Ok(response) if response.status == 200
+        )
+    }
+
+    /// Close the child's stdin. Official plugins treat EOF as "shut down now".
+    pub fn close_stdin(&self) {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        drop(child.stdin.take());
+    }
+
+    /// Has the process exited? Non-blocking; used by the supervisor.
+    pub fn poll_exit(&self) -> Option<ExitStatus> {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        child.try_wait().ok().flatten()
+    }
+
+    /// Kill the process tree now, without waiting for a graceful exit.
+    pub fn terminate(&self) {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        platform::terminate(&mut child, &self.guard);
+        let _ = child.wait();
+    }
+
+    /// The tail of the plugin's stderr, at most `max_bytes` bytes.
+    pub fn stderr_text(&self, max_bytes: usize) -> String {
+        self.stderr
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .text(max_bytes)
+    }
+
     fn wait_until_healthy(&self) -> Result<(), PluginError> {
         let mut last_error = String::new();
-        for _ in 0..20 {
-            match self.request("/v1/health") {
-                Ok(response) if response.status == 200 => return Ok(()),
-                Ok(response) => last_error = format!("health returned {}", response.status),
-                Err(error) => last_error = error.to_string(),
+        // Bounded in wall-clock time, not in attempts: a plugin that accepts
+        // the connection but never answers would otherwise burn one full read
+        // timeout per attempt (see ADR-015's follow-up).
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if self.probe(Duration::from_secs(2)) {
+                return Ok(());
             }
+            last_error = "health did not return 200 within 2s".to_string();
             std::thread::sleep(Duration::from_millis(250));
         }
         Err(PluginError::NotReady(format!(
             "{last_error}; stderr: {}",
-            self.stderr_tail()
+            self.stderr_text(8 * 1024)
         )))
-    }
-
-    fn stderr_tail(&self) -> String {
-        let tail = self.stderr.lock().unwrap_or_else(|p| p.into_inner());
-        String::from_utf8_lossy(&tail).trim().to_string()
     }
 }
 
@@ -278,13 +346,9 @@ impl Drop for PluginRuntime {
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        kill(&mut child);
+        platform::terminate(&mut child, &self.guard);
+        let _ = child.wait();
     }
-}
-
-fn kill(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -389,5 +453,16 @@ mod tests {
             .expect("roots are always present");
         let parsed: Vec<String> = serde_json::from_str(&roots).unwrap();
         assert_eq!(parsed, vec!["/library", "https://nas/dav"]);
+    }
+
+    #[test]
+    fn the_stderr_ring_keeps_the_tail() {
+        let mut ring = StderrRing::default();
+        ring.push(b"first line\n");
+        ring.push(&vec![b'x'; STDERR_RING_BYTES]);
+        ring.push(b"\nlast line");
+        let text = ring.text(64);
+        assert!(text.ends_with("last line"), "{text}");
+        assert!(ring.text(usize::MAX).len() <= STDERR_RING_BYTES + 16);
     }
 }

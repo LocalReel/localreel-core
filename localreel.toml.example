@@ -35,3 +35,27 @@ cache_max_bytes = 21474836480
 cache_max_age_hours = 720
 # thumbnails_dir = "data/thumbnails"
 # transcodes_dir = "data/transcodes"
+
+# Sidecar storage plugins. Each package is a `.lrplug` zip with a manifest.json
+# at its root; the plugin id in that manifest becomes the `kind` a source uses.
+#
+# [[plugins]]
+# package = "plugins/webdav.lrplug"
+# enabled = true
+#
+# [plugins.config]
+# base_url = "https://nas.local/dav/library"
+# username = "reader"
+# password = "secret"
+
+# How the host treats a plugin that cannot start.
+#
+# The default keeps the server usable: the failure is reported in Admin and in
+# the plugin audit (`start.failed`), and everything else keeps working. Servers
+# that would rather refuse to boot with a broken provider can opt in.
+#
+# [plugin_runtime]
+# strict = false
+# How long a stop waits for in-flight plugin requests before killing the
+# process (seconds).
+# stop_timeout_secs = 5

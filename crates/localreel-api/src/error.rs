@@ -101,6 +101,7 @@ impl From<KernelError> for ApiError {
             KernelError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             KernelError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             KernelError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            KernelError::StorageUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             KernelError::Database(_)
             | KernelError::Io(_)
             | KernelError::Storage(_)
@@ -114,6 +115,7 @@ impl From<KernelError> for ApiError {
             StatusCode::CONFLICT => "conflict",
             StatusCode::BAD_REQUEST => "bad_request",
             StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::SERVICE_UNAVAILABLE => "unavailable",
             _ => "internal",
         };
         Self {

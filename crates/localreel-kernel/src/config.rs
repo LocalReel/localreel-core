@@ -80,6 +80,8 @@ pub struct Config {
     pub metadata: MetadataConfig,
     /// Sidecar plugins to start with the server (packages on disk).
     pub plugins: Vec<PluginConfig>,
+    /// What happens when one of them cannot start.
+    pub plugin_runtime: PluginRuntimeConfig,
 }
 
 /// Where optional posters and descriptions come from.
@@ -140,6 +142,22 @@ pub struct PluginConfig {
     pub enabled: bool,
     /// JSON handed to the plugin via `LOCALREEL_PLUGIN_CONFIG`.
     pub config: serde_json::Value,
+}
+
+/// How the host treats plugins that fail to start.
+///
+/// The default is the desktop-friendly one: a broken plugin is reported and the
+/// server keeps running, because a media server that refuses to open its own UI
+/// because one optional provider is misconfigured is worse than a degraded
+/// library. Servers that would rather fail loudly can opt in with
+/// `[plugin_runtime] strict = true`.
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeConfig {
+    /// Abort startup when an enabled plugin cannot be loaded.
+    pub strict: bool,
+    /// How long a stop waits for in-flight plugin requests before the process
+    /// is killed. Also used by the shutdown path.
+    pub stop_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +256,10 @@ impl Default for Config {
                 language: "zh-CN".to_string(),
             },
             plugins: Vec::new(),
+            plugin_runtime: PluginRuntimeConfig {
+                strict: false,
+                stop_timeout: Duration::from_secs(5),
+            },
         }
     }
 }
@@ -435,6 +457,12 @@ impl Config {
                 })
                 .collect();
         }
+        if let Some(value) = file.plugin_runtime.strict {
+            self.plugin_runtime.strict = value;
+        }
+        if let Some(value) = file.plugin_runtime.stop_timeout_secs {
+            self.plugin_runtime.stop_timeout = Duration::from_secs(value);
+        }
         Ok(())
     }
 
@@ -583,6 +611,11 @@ impl Config {
                 ));
             }
         }
+        if self.plugin_runtime.stop_timeout.is_zero() {
+            return Err(KernelError::Config(
+                "plugin stop timeout must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -632,6 +665,68 @@ impl Config {
     }
 }
 
+/// Turn one `[[plugins]]` entry on or off in the configuration file.
+///
+/// Rewrites only the `enabled` key of the matching entry and keeps every other
+/// byte the operator wrote (comments, ordering, spacing). Returns `Ok(false)`
+/// when no entry names `package`, so the caller can leave a runtime-only switch
+/// in place instead of inventing an entry.
+///
+/// `package` is matched after normalising path separators: the TOML value uses
+/// `/`, a `PathBuf` printed on Windows uses `\`.
+pub fn set_plugin_enabled(path: &Path, package: &str, enabled: bool) -> Result<bool> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| KernelError::Config(format!("cannot read {}: {error}", path.display())))?;
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
+        KernelError::Config(format!("cannot parse {}: {error}", path.display()))
+    })?;
+    let wanted = normalize_package(package);
+    let mut found = false;
+    if let Some(plugins) = document
+        .get_mut("plugins")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        for entry in plugins.iter_mut() {
+            let Some(value) = entry.get("package").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            if normalize_package(value) != wanted {
+                continue;
+            }
+            entry["enabled"] = toml_edit::value(enabled);
+            found = true;
+        }
+    }
+    if !found {
+        return Ok(false);
+    }
+
+    // Replace the file in one step so a crash cannot leave a half-written
+    // configuration behind.
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "localreel.toml".to_string());
+    let temp = path.with_file_name(format!(".{file_name}.tmp"));
+    std::fs::write(&temp, document.to_string()).map_err(|error| {
+        KernelError::Config(format!("cannot write {}: {error}", temp.display()))
+    })?;
+    #[cfg(windows)]
+    {
+        // `rename` does not replace an existing file on Windows.
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&temp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        KernelError::Config(format!("cannot replace {}: {error}", path.display()))
+    })?;
+    Ok(true)
+}
+
+fn normalize_package(value: &str) -> String {
+    value.replace('\\', "/").trim().to_string()
+}
+
 /// On-disk config schema. Every field is optional so a partial file only
 /// overrides what it mentions.
 #[derive(Debug, Default, Deserialize)]
@@ -650,6 +745,15 @@ struct ConfigFile {
     metadata: MetadataFile,
     #[serde(default)]
     plugins: Vec<PluginFile>,
+    #[serde(default)]
+    plugin_runtime: PluginRuntimeFile,
+}
+
+/// `[plugin_runtime]` in the configuration file.
+#[derive(Debug, Default, Deserialize)]
+struct PluginRuntimeFile {
+    strict: Option<bool>,
+    stop_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -856,6 +960,58 @@ mod tests {
         assert_eq!(config.plugins.len(), 1);
         assert!(!config.plugins[0].enabled);
         assert_eq!(config.plugins[0].config["root"], "D:/library");
+        // Failure isolation is the default; strictness is opt-in.
+        assert!(!config.plugin_runtime.strict);
+    }
+
+    #[test]
+    fn disabling_a_plugin_rewrites_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(
+            &path,
+            r#"# operator notes
+[[plugins]]
+package = "plugins/demo.lrplug"
+
+[[plugins]]
+package = "plugins/other.lrplug"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        // The caller passes a `PathBuf` printed on Windows; the file uses `/`.
+        assert!(set_plugin_enabled(&path, "plugins\\demo.lrplug", false).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# operator notes"), "comments must survive");
+        let parsed: ConfigFile = toml::from_str(&text).unwrap();
+        assert!(!parsed.plugins[0].enabled);
+        assert!(!parsed.plugins[1].enabled);
+
+        // An entry that is not in the file is not invented.
+        assert!(!set_plugin_enabled(&path, "plugins/missing.lrplug", true).unwrap());
+        let parsed: ConfigFile = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.plugins.len(), 2);
+    }
+
+    #[test]
+    fn parses_plugin_runtime_policy() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+            [[plugins]]
+            package = "plugins/demo.lrplug"
+
+            [plugin_runtime]
+            strict = true
+            stop_timeout_secs = 2
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        assert!(config.plugin_runtime.strict);
+        assert_eq!(config.plugin_runtime.stop_timeout, Duration::from_secs(2));
     }
 
     #[test]
