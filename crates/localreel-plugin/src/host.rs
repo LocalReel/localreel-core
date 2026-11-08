@@ -60,7 +60,12 @@ pub struct CapabilityReport {
     pub name: String,
     pub version: String,
     pub requested: Vec<RequestedCapability>,
+    /// Grants for the plugin's current version only. A grant for an older
+    /// version never applies after an upgrade.
     pub granted: Vec<CapabilityGrant>,
+    /// Requested capabilities with no active grant for the current version.
+    pub pending: Vec<String>,
+    pub requires_grant: bool,
     pub catalog: Vec<CapabilityDescriptor>,
     pub forbidden: Vec<String>,
 }
@@ -667,13 +672,29 @@ impl PluginHost {
             .grants
             .as_ref()
             .and_then(|grants| grants.list(Some(id)).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|grant| grant.plugin_version == version)
+            .collect::<Vec<_>>();
+        let now = now_secs();
+        let pending = requested
+            .iter()
+            .filter(|request| request.source == "manifest")
+            .filter(|request| {
+                !granted
+                    .iter()
+                    .any(|grant| grant.capability == request.name && grant.is_active_at(now))
+            })
+            .map(|request| request.name.clone())
+            .collect::<Vec<_>>();
         Some(CapabilityReport {
             plugin_id: id.to_string(),
             name,
             version,
             requested,
             granted,
+            requires_grant: !pending.is_empty(),
+            pending,
             catalog: CAPABILITIES.to_vec(),
             forbidden: capability::forbidden(),
         })
@@ -2052,15 +2073,9 @@ mod tests {
         host.record_failed(&package(), Some(&manifest), "handshake timed out");
 
         let report = host.capability_report("demo").unwrap();
-        assert!(report
-            .requested
-            .iter()
-            .any(|request| request.name == "net.fetch" && request.source == "manifest"));
-        assert!(report
-            .requested
-            .iter()
-            .any(|request| request.name == "fs.read" && request.source == "legacy"));
         assert!(report.granted.is_empty());
+        assert_eq!(report.pending, vec!["net.fetch".to_string()]);
+        assert!(report.requires_grant);
         assert_eq!(report.catalog.len(), crate::capability::CAPABILITIES.len());
         assert!(!report.forbidden.is_empty());
 
@@ -2078,5 +2093,16 @@ mod tests {
         let report = host.capability_report("demo").unwrap();
         assert_eq!(report.granted.len(), 1);
         assert_eq!(report.granted[0].capability, "net.fetch");
+        assert!(report.pending.is_empty());
+        assert!(!report.requires_grant);
+
+        // An upgrade invalidates the old version's grants; the new version must
+        // be granted again even when the requested capabilities did not change.
+        manifest.version = "0.2.0".into();
+        host.record_failed(&package(), Some(&manifest), "upgraded in test");
+        let report = host.capability_report("demo").unwrap();
+        assert!(report.granted.is_empty());
+        assert_eq!(report.pending, vec!["net.fetch".to_string()]);
+        assert!(report.requires_grant);
     }
 }

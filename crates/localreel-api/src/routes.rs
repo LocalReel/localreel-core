@@ -2922,6 +2922,12 @@ mod tests {
             .iter()
             .any(|request| request["name"] == "fs.read" && request["source"] == "legacy"));
         assert!(!value["catalog"].as_array().unwrap().is_empty());
+        assert_eq!(value["requires_grant"], true);
+        assert!(value["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "net.fetch"));
 
         let grant = serde_json::json!({
             "capability": "net.fetch",
