@@ -202,6 +202,10 @@ pub struct PluginSpec {
     /// `false` means "present in the configuration, switched off". The spec is
     /// kept so an admin can enable it later without a restart.
     pub enabled: bool,
+    /// Windows-only AppContainer isolation for stdio plugins.
+    pub app_container: bool,
+    /// Optional override for the `plugin-sandbox` wrapper path.
+    pub sandbox_program: Option<PathBuf>,
 }
 
 impl PluginSpec {
@@ -221,6 +225,8 @@ impl PluginSpec {
             expected_signature: None,
             publisher_public_keys: Vec::new(),
             enabled,
+            app_container: false,
+            sandbox_program: None,
         }
     }
 
@@ -238,6 +244,12 @@ impl PluginSpec {
         self.publisher = publisher;
         self.expected_signature = signature;
         self.publisher_public_keys = public_keys;
+        self
+    }
+
+    pub fn with_app_container(mut self, enabled: bool, sandbox_program: Option<PathBuf>) -> Self {
+        self.app_container = enabled;
+        self.sandbox_program = sandbox_program;
         self
     }
 }

@@ -430,6 +430,7 @@ an operator audit trail, not a public log.
 [plugin_runtime]
 max_memory_mb = 512
 max_processes = 16
+app_container = true
 ```
 
 - Windows: both limits are set on the plugin's Job Object
@@ -439,8 +440,20 @@ max_processes = 16
 - Defaults: 512 MiB and 16 processes; config validation bounds memory to
   16 MiB–16 GiB and processes to 1–256.
 
-These limits do not block network access. A plugin can still open its own
-socket; transport/OS isolation remains the next phase.
+`app_container = true` is the Windows network boundary (phase 3.9):
+
+- only `transport = "stdio"` and native binaries are accepted; scripts are
+  rejected because the interpreter lives outside the container;
+- the host runs `plugin-sandbox`, which copies the install directory into the
+  AppContainer profile folder and starts it with no capabilities;
+- the plugin gets its broker over stdio, so it needs no loopback; a direct
+  `TcpStream` connect fails with `WSAEACCES`;
+- a missing wrapper or profile failure is fail-closed. Profile folders are not
+  deleted automatically yet.
+
+These limits do not apply to HTTP-transport plugins, which still use loopback
+and can open their own socket. `fs.read` source roots are also still handed
+directly; the next phase brokers or retires that path.
 
 ## Transports (phase 3.4)
 

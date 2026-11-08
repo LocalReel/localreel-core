@@ -743,7 +743,8 @@ async fn serve(
                         plugin.publisher.clone(),
                         plugin.signature.clone(),
                         publisher_keys,
-                    ),
+                    )
+                    .with_app_container(config.plugin_runtime.app_container, None),
                 );
                 if !plugin.enabled {
                     info!(package = %package.display(), "plugin is disabled in the configuration");

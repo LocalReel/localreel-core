@@ -13,6 +13,7 @@ use zip::write::SimpleFileOptions;
 
 const DEMO: &str = env!("CARGO_BIN_EXE_plugin-demo");
 const BROKER_DEMO: &str = env!("CARGO_BIN_EXE_plugin-broker-demo");
+const NET_DEMO: &str = env!("CARGO_BIN_EXE_plugin-net-demo");
 
 fn build_package(path: &Path, program: &str, manifest: &serde_json::Value) {
     build_package_with_binary(path, program, manifest, &std::fs::read(DEMO).unwrap());
@@ -82,6 +83,8 @@ fn sidecar_serves_stat_list_walk_and_ranges() {
                 roots: vec![library.to_string_lossy().into_owned()],
                 host_url: None,
                 limits: Default::default(),
+                app_container: false,
+                sandbox_program: None,
             },
         )
         .unwrap(),
@@ -161,6 +164,8 @@ fn stdio_sidecar_serves_storage_without_a_tcp_port() {
                 roots: vec![library.to_string_lossy().into_owned()],
                 host_url: None,
                 limits: Default::default(),
+                app_container: false,
+                sandbox_program: None,
             },
         )
         .unwrap(),
@@ -245,6 +250,8 @@ fn stdio_broker_calls_travel_over_pipes() {
             roots: Vec::new(),
             host_url: Some(format!("http://{address}")),
             limits: Default::default(),
+            app_container: false,
+            sandbox_program: None,
         },
     )
     .unwrap();
@@ -260,4 +267,121 @@ fn stdio_broker_calls_travel_over_pipes() {
     );
     assert!(request.contains("x-localreel-plugin:"), "{request}");
     assert!(request.contains("https://example.com/data"), "{request}");
+}
+
+#[test]
+fn appcontainer_plugin_uses_the_stdio_broker() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).unwrap();
+        request.push_str(&String::from_utf8_lossy(&body));
+        let body = r#"{"status":200,"content_type":"text/plain","body_b64":"aGk="}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        request
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let program = format!("bin/plugin-broker-demo{}", std::env::consts::EXE_SUFFIX);
+    let package = dir.path().join("broker-demo-appcontainer.lrplug");
+    let mut manifest = manifest(&program, "stdio");
+    manifest["id"] = json!("broker-demo-ac");
+    build_package_with_binary(
+        &package,
+        &program,
+        &manifest,
+        &std::fs::read(BROKER_DEMO).unwrap(),
+    );
+    let install = dir.path().join("installed");
+    let extracted = extract(&package, &install).unwrap();
+    let executable = install.join(&extracted.entry.program);
+    let runtime = PluginRuntime::start(
+        &executable,
+        &extracted,
+        &json!({}),
+        &localreel_plugin::PluginSandbox {
+            working_dir: Some(install.clone()),
+            roots: Vec::new(),
+            host_url: Some(format!("http://{address}")),
+            limits: Default::default(),
+            app_container: true,
+            sandbox_program: Some(std::path::PathBuf::from(env!(
+                "CARGO_BIN_EXE_plugin-sandbox"
+            ))),
+        },
+    )
+    .unwrap();
+
+    runtime.schedule("{}").unwrap();
+    let request = server.join().unwrap();
+    assert!(
+        request.contains("POST /api/v1/plugin-broker/fetch"),
+        "{request}"
+    );
+    assert!(request.contains("x-localreel-plugin:"), "{request}");
+    assert!(request.contains("https://example.com/data"), "{request}");
+}
+
+#[test]
+fn appcontainer_denies_the_plugins_own_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = format!("bin/plugin-net-demo{}", std::env::consts::EXE_SUFFIX);
+    let package = dir.path().join("net-demo.lrplug");
+    let mut manifest = manifest(&program, "stdio");
+    manifest["id"] = json!("net-demo");
+    build_package_with_binary(
+        &package,
+        &program,
+        &manifest,
+        &std::fs::read(NET_DEMO).unwrap(),
+    );
+    let install = dir.path().join("installed");
+    let extracted = extract(&package, &install).unwrap();
+    let executable = install.join(&extracted.entry.program);
+    let runtime = PluginRuntime::start(
+        &executable,
+        &extracted,
+        &json!({}),
+        &localreel_plugin::PluginSandbox {
+            working_dir: Some(install.clone()),
+            roots: Vec::new(),
+            host_url: None,
+            limits: Default::default(),
+            app_container: true,
+            sandbox_program: Some(std::path::PathBuf::from(env!(
+                "CARGO_BIN_EXE_plugin-sandbox"
+            ))),
+        },
+    )
+    .unwrap();
+
+    runtime.schedule("{}").unwrap();
+    let stderr = runtime.stderr_text(4096);
+    assert!(stderr.contains("net: blocked"), "{stderr}");
 }

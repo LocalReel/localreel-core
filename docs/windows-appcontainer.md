@@ -1,6 +1,7 @@
 # Windows AppContainer network probe
 
-Status: validated inside an example; **not yet wired into `PluginHost`**.
+Status: validated and wired into `PluginRuntime` for `app_container = true`
+(phase 3.9).
 
 ## Why
 
@@ -43,8 +44,10 @@ loopback is needed.
 
 ## Limits / next step
 
-- Wiring the AppContainer launch into `PluginRuntime` is still missing. The
-  plugin install directory (not just one exe) must be copied or ACL-granted, and
-  write paths/profiles cleaned up.
-- Integration belongs in `platform.rs` behind a config switch, with the probe
-  test flipped to assert denial rather than documenting the bypass.
+- `PluginRuntime` now launches `plugin-sandbox` when `[plugin_runtime]
+  app_container = true`; the wrapper copies the install directory and the loader
+  runtime into the profile. Tests prove the stdio broker works and a raw
+  `1.1.1.1:80` connect is denied.
+- Interpreter plugins are rejected (the interpreter is outside the package).
+- Profile folders and their copies are not deleted automatically yet.
+- Unix/macOS network isolation is still absent.

@@ -215,6 +215,9 @@ pub struct PluginRuntimeConfig {
     pub max_memory_bytes: u64,
     /// Process-count ceiling (Windows Job Object; Unix enforced elsewhere).
     pub max_processes: u32,
+    /// Windows-only: launch plugins inside an AppContainer with no network
+    /// capabilities. Requires the `plugin-sandbox` wrapper beside the server.
+    pub app_container: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +322,7 @@ impl Default for Config {
                 stop_timeout: Duration::from_secs(5),
                 max_memory_bytes: 512 * 1024 * 1024,
                 max_processes: 16,
+                app_container: false,
             },
             update: UpdateConfig::default(),
         }
@@ -574,6 +578,9 @@ impl Config {
         if let Some(value) = file.plugin_runtime.max_processes {
             self.plugin_runtime.max_processes = value;
         }
+        if let Some(value) = file.plugin_runtime.app_container {
+            self.plugin_runtime.app_container = value;
+        }
         if let Some(value) = file.update.check {
             self.update.check = value;
         }
@@ -805,6 +812,11 @@ impl Config {
                 "plugin stop timeout must be greater than 0".into(),
             ));
         }
+        if self.plugin_runtime.app_container && !cfg!(windows) {
+            return Err(KernelError::Config(
+                "plugin_runtime.app_container is Windows-only".into(),
+            ));
+        }
         let memory = self.plugin_runtime.max_memory_bytes;
         if !(16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&memory) {
             return Err(KernelError::Config(
@@ -968,6 +980,7 @@ struct PluginRuntimeFile {
     stop_timeout_secs: Option<u64>,
     max_memory_mb: Option<u64>,
     max_processes: Option<u32>,
+    app_container: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1325,6 +1338,7 @@ enabled = false
             stop_timeout_secs = 2
             max_memory_mb = 256
             max_processes = 8
+            app_container = true
             "#,
         )
         .unwrap();
@@ -1334,6 +1348,7 @@ enabled = false
         assert_eq!(config.plugin_runtime.stop_timeout, Duration::from_secs(2));
         assert_eq!(config.plugin_runtime.max_memory_bytes, 256 * 1024 * 1024);
         assert_eq!(config.plugin_runtime.max_processes, 8);
+        assert!(config.plugin_runtime.app_container);
     }
 
     #[test]

@@ -354,6 +354,8 @@ fn spawn(
             roots,
             host_url,
             limits,
+            app_container: spec.app_container,
+            sandbox_program: spec.sandbox_program.clone(),
         },
     )
     .map_err(|error| (error.to_string(), is_permanent(&error)))?;

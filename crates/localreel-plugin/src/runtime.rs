@@ -67,6 +67,16 @@ const INHERITED_ENV: &[&str] = &[
     // Windows needs these to load some runtimes at all.
     "SYSTEMROOT",
     "WINDIR",
+    "USERNAME",
+    "USERDOMAIN",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "ALLUSERSPROFILE",
+    "PROGRAMDATA",
+    "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
 ];
 
 /// What the host gives a plugin besides its own program.
@@ -81,6 +91,11 @@ pub struct PluginSandbox {
     pub host_url: Option<String>,
     /// Resource ceilings applied to the plugin process tree.
     pub limits: crate::limits::PluginLimits,
+    /// Windows-only: run the plugin inside an AppContainer with no network
+    /// capabilities. Requires `sandbox_program` (the `plugin-sandbox` wrapper).
+    pub app_container: bool,
+    /// Path to the `plugin-sandbox` wrapper; defaults to a sibling executable.
+    pub sandbox_program: Option<std::path::PathBuf>,
 }
 
 /// A bounded tail of the plugin's stderr.
@@ -133,7 +148,21 @@ fn sandboxed_command(
     sandbox: &PluginSandbox,
 ) -> Command {
     let mut command = launch_command(program, manifest);
-    command.args(&manifest.entry.args).env_clear();
+    command.args(&manifest.entry.args);
+    if let Some(dir) = &sandbox.working_dir {
+        command.current_dir(dir);
+    }
+    apply_plugin_env(command, manifest, token, config, sandbox)
+}
+
+fn apply_plugin_env(
+    mut command: Command,
+    manifest: &Manifest,
+    token: &str,
+    config: &str,
+    sandbox: &PluginSandbox,
+) -> Command {
+    command.env_clear();
     for key in INHERITED_ENV {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
@@ -152,10 +181,55 @@ fn sandboxed_command(
     if let Some(url) = &sandbox.host_url {
         command.env("LOCALREEL_PLUGIN_HOST_URL", url);
     }
-    if let Some(dir) = &sandbox.working_dir {
-        command.current_dir(dir);
-    }
     command
+}
+
+fn appcontainer_command(
+    program: &Path,
+    manifest: &Manifest,
+    token: &str,
+    config: &str,
+    sandbox: &PluginSandbox,
+) -> Result<Command, PluginError> {
+    if manifest.entry.runtime.is_some() {
+        return Err(PluginError::NotReady(
+            "AppContainer plugins must be native binaries, not interpreter scripts".into(),
+        ));
+    }
+    let wrapper = sandbox.sandbox_program.clone().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("plugin-sandbox.exe")))
+    });
+    let wrapper = wrapper
+        .ok_or_else(|| PluginError::NotReady("the plugin-sandbox wrapper is unavailable".into()))?;
+    if !wrapper.is_file() {
+        return Err(PluginError::NotReady(format!(
+            "the plugin-sandbox wrapper {} is missing",
+            wrapper.display()
+        )));
+    }
+    let source = sandbox
+        .working_dir
+        .clone()
+        .or_else(|| program.parent().map(Path::to_path_buf))
+        .ok_or_else(|| PluginError::NotReady("plugin source directory is unknown".into()))?;
+    let profile: String = manifest
+        .id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let mut command = Command::new(wrapper);
+    command
+        .arg("--profile")
+        .arg(format!("localreel-{profile}"))
+        .arg("--source")
+        .arg(&source)
+        .arg("--program")
+        .arg(program)
+        .arg("--")
+        .args(&manifest.entry.args);
+    Ok(apply_plugin_env(command, manifest, token, config, sandbox))
 }
 
 impl PluginRuntime {
@@ -177,6 +251,11 @@ impl PluginRuntime {
             .map_err(|error| PluginError::Manifest(format!("invalid plugin config: {error}")))?;
         if config.len() > 32 * 1024 {
             return Err(PluginError::Manifest("plugin config is too large".into()));
+        }
+        if sandbox.app_container && manifest.entry.transport != "stdio" {
+            return Err(PluginError::NotReady(
+                "AppContainer isolation requires the stdio transport".into(),
+            ));
         }
         let token = uuid::Uuid::new_v4().to_string();
         if manifest.entry.transport == "stdio" {
@@ -283,7 +362,11 @@ impl PluginRuntime {
         sandbox: &PluginSandbox,
         token: String,
     ) -> Result<Self, PluginError> {
-        let mut command = sandboxed_command(program, manifest, &token, config, sandbox);
+        let mut command = if sandbox.app_container {
+            appcontainer_command(program, manifest, &token, config, sandbox)?
+        } else {
+            sandboxed_command(program, manifest, &token, config, sandbox)
+        };
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -532,6 +615,8 @@ mod tests {
             roots: vec!["https://nas/dav".to_string()],
             host_url: Some("http://127.0.0.1:3001".to_string()),
             limits: Default::default(),
+            app_container: false,
+            sandbox_program: None,
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin.js"),
@@ -581,6 +666,8 @@ mod tests {
             roots: vec!["/library".to_string(), "https://nas/dav".to_string()],
             host_url: None,
             limits: Default::default(),
+            app_container: false,
+            sandbox_program: None,
         };
         let command = sandboxed_command(
             Path::new("pkg/plugin"),

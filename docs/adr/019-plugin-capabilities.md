@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime)
 - Date: 2026-11-08
 
 ## Context
@@ -102,9 +102,15 @@ The CMS/collector probe made the gap concrete:
     `/api/v1/plugin-broker/` paths, host token added). `BrokerClient` selects it
     with `LOCALREEL_PLUGIN_BROKER=stdio`; scheduled callbacks use the same pipe.
     This is what lets an AppContainer plugin use `net.fetch` without loopback.
-19. **`fs.read` remains legacy** (source roots handed directly) and is not
+19. **Phase 3.9 wires AppContainer into the runtime.** `[plugin_runtime]
+    app_container = true` launches stdio/native plugins through
+    `plugin-sandbox`, which copies the install directory into the AppContainer
+    profile and starts the child with no capabilities. Tests prove the broker
+    works over stdio and a raw `1.1.1.1:80` connect is denied. Interpreter
+    scripts are rejected; profile cleanup is still manual.
+20. **`fs.read` remains legacy** (source roots handed directly) and is not
     brokered. The HTTP transport remains the default; phase 3 continues with OS
-    isolation.
+    isolation on other platforms and profile lifecycle.
 
 ## Consequences
 
