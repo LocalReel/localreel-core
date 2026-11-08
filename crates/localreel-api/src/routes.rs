@@ -59,6 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // token the host gave the sidecar when it started it.
         .route("/api/v1/plugin-proxy", post(plugin_proxy))
         .route("/api/v1/plugin-broker/fetch", post(plugin_broker_fetch))
+        .route("/api/v1/plugin-broker/fs", post(plugin_broker_fs))
         .route("/api/v1/plugin-broker/catalog", post(plugin_broker_catalog))
         .route(
             "/api/v1/plugin-broker/schedule",
@@ -433,6 +434,27 @@ async fn plugin_broker_fetch(
         "content_type": response.content_type,
         "body_b64": body,
     })))
+}
+
+/// Host-mediated `fs.read`: the plugin names a file URI, the host resolves it
+/// against the granted roots and returns stat/list/read data.
+async fn plugin_broker_fs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<localreel_plugin::FsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    Ok(Json(state.plugins.fs_read(token, payload)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2816,6 +2838,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_fs_broker_requires_a_plugin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let body = r#"{"op":"stat","uri":"file:///tmp/a"}"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-broker/fs")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

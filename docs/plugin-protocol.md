@@ -115,9 +115,11 @@ owned by the host; the plugin chooses only from the published vocabulary:
   `catalog.write(draft)`, `schedule.request` and `blob.read`/`blob.write` are
   enforced by the host broker: the plugin's per-run token, the active grant for
   its exact version, the declared scope and the SSRF/redirect policy are checked
-  before any side effect, and every allow/deny is audited. `fs.read` remains the
-  legacy storage-root path; it is disclosed but not brokered. None of this is an
-  OS sandbox: a plugin can still open its own socket, which is why phase 3
+  before any side effect, and every allow/deny is audited. `fs.read` now has a
+  broker endpoint (`POST /api/v1/plugin-broker/fs`) that resolves `file://` URIs
+  against the granted roots; existing storage plugins may still use the legacy
+  direct roots until they migrate. None of this is an OS sandbox by itself:
+  HTTP-transport plugins can still open their own socket, which is why phase 3
   replaces the transport and adds OS isolation (ADR-019).
 
 ## Broker: `net.fetch` (phase 2.1)
@@ -454,8 +456,8 @@ app_container = true
   points at a dead process; live wrappers are kept.
 
 These limits do not apply to HTTP-transport plugins, which still use loopback
-and can open their own socket. `fs.read` source roots are also still handed
-directly; the next phase brokers or retires that path.
+and can open their own socket. `fs.read` now has a broker endpoint, but storage
+plugins have not all migrated off the legacy direct-root path yet.
 
 ## Transports (phase 3.4)
 
@@ -498,6 +500,20 @@ The host proxies only `/api/v1/plugin-broker/` paths and adds the per-run token;
 the plugin never learns the token or opens a socket. `BrokerClient::from_env()`
 selects this mode when `LOCALREEL_PLUGIN_BROKER=stdio`. Scheduled callbacks use
 the `schedule` JSON-RPC method over the same pipe.
+
+### fs.read broker
+
+`POST /api/v1/plugin-broker/fs` (plugin token in `x-localreel-plugin`):
+
+```json
+{"op":"read","uri":"file:///library/a.mp4","start":0,"len":65536}
+```
+
+`op` is `stat`, `list` or `read`; `read` returns `{"body_b64":"..."}` capped at
+8 MiB per call. The host canonicalises the URI and each granted root, refuses a
+target outside all roots, and audits both allow and deny. The check and the
+`open` are separate syscalls; a same-user process racing a symlink is the
+remaining TOCTOU gap. `BrokerClient::fs_stat/fs_list/fs_read` use this endpoint.
 
 ## Permissions
 

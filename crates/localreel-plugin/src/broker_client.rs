@@ -201,6 +201,49 @@ impl BrokerClient {
         self.fetch(url, headers)?.json()
     }
 
+    /// `fs.read` over the host broker. The plugin only sends a `file://` URI;
+    /// the host resolves it against the granted roots.
+    pub fn fs_stat(&self, uri: &str) -> Result<Value, String> {
+        self.fs_call("stat", uri, 0, 0)
+    }
+
+    pub fn fs_list(&self, uri: &str) -> Result<Value, String> {
+        self.fs_call("list", uri, 0, 0)
+    }
+
+    pub fn fs_read(&self, uri: &str, start: u64, len: u64) -> Result<Vec<u8>, String> {
+        let value = self.fs_call("read", uri, start, len)?;
+        let encoded = value
+            .get("body_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "fs.read response has no body_b64".to_string())?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("fs.read body is not base64: {error}"))
+    }
+
+    fn fs_call(&self, op: &str, uri: &str, start: u64, len: u64) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "op": op,
+            "uri": uri,
+            "start": start,
+            "len": len,
+        });
+        let (status, response) = self.request(
+            "POST",
+            "/api/v1/plugin-broker/fs",
+            body.to_string().as_bytes(),
+        )?;
+        if status != 200 {
+            return Err(format!(
+                "fs.{op} refused the call ({status}): {}",
+                broker_error_message(&String::from_utf8_lossy(&response))
+            ));
+        }
+        serde_json::from_slice(&response)
+            .map_err(|error| format!("fs.{op} response is not JSON: {error}"))
+    }
+
     /// Stage normalized titles through `catalog.write(draft)`.
     pub fn write_catalog<T: Serialize>(&self, items: &[T]) -> Result<usize, String> {
         let payload = serde_json::json!({ "items": items });
@@ -440,6 +483,21 @@ mod tests {
             Transport::Http { base_url, .. } => assert_eq!(base_url, "http://127.0.0.1:3001"),
             Transport::Stdio => panic!("expected HTTP"),
         }
+    }
+
+    #[test]
+    fn fs_calls_use_the_broker_endpoint() {
+        let reply = r#"{"size":6,"modified":null,"is_dir":false}"#;
+        let (base_url, server) = spawn_broker(reply.to_string());
+        let client = BrokerClient::new(base_url, "run-token");
+        let stat = client.fs_stat("file:///library/a.mp4").unwrap();
+        assert_eq!(stat["size"], 6);
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("POST /api/v1/plugin-broker/fs"),
+            "{request}"
+        );
+        assert!(request.contains("file:///library/a.mp4"), "{request}");
     }
 
     #[test]

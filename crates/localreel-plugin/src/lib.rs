@@ -17,6 +17,7 @@ pub mod broker;
 pub mod broker_client;
 pub mod capability;
 pub mod catalog;
+pub mod fs_broker;
 mod gate;
 pub mod grants;
 pub mod host;
@@ -43,6 +44,7 @@ pub use capability::{
     CAPABILITIES,
 };
 pub use catalog::{CatalogDraft, CatalogDraftStore};
+pub use fs_broker::{FsEntry, FsRequest};
 pub use gate::Gate;
 pub use grants::{CapabilityGrant, GrantStore};
 pub use host::{

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker)
 - Date: 2026-11-08
 
 ## Context
@@ -110,9 +110,14 @@ The CMS/collector probe made the gap concrete:
     wrapper and the runtime both delete the profile on normal exit/kill; a
     startup sweep removes profiles whose marker PID is no longer alive.
     Interpreter scripts are rejected.
-20. **`fs.read` remains legacy** (source roots handed directly) and is not
-    brokered. The HTTP transport remains the default; phase 3 continues with OS
-    isolation on other platforms and profile lifecycle.
+20. **Phase 3.10 brokers `fs.read`.** A plugin sends `file://` URIs to
+    `POST /api/v1/plugin-broker/fs`; the host checks the active `fs.read` grant,
+    canonicalises each root and the target, refuses targets outside all roots,
+    caps reads at 8 MiB and audits allow/deny. Existing storage plugins still
+    use the legacy direct roots until migrated; the check/open TOCTOU gap is
+    documented.
+21. **Storage roots remain legacy** where not migrated. The HTTP transport
+    remains the default; phase 3 continues with Unix isolation and migration.
 
 ## Consequences
 

@@ -35,10 +35,11 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::blob::{BlobMeta, BlobStore};
 use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
 use crate::capability::{
-    self, BlobScope, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, NetFetchScope,
-    RequestedCapability, ScheduleScope, SecretUseScope, CAPABILITIES,
+    self, BlobScope, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, FsReadScope,
+    NetFetchScope, RequestedCapability, ScheduleScope, SecretUseScope, CAPABILITIES,
 };
 use crate::catalog::CatalogDraftStore;
+use crate::fs_broker::{self, FsRequest};
 use crate::gate::Gate;
 use crate::grants::{CapabilityGrant, GrantStore};
 use crate::limits::PluginLimits;
@@ -987,6 +988,96 @@ impl PluginHost {
     }
     /// Host-mediated `catalog.write(draft)`.
     ///
+    pub fn fs_read(&self, token: &str, request: FsRequest) -> Result<Value> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.fs_read_for(&plugin_id, &version, request)
+    }
+
+    fn fs_read_for(&self, plugin_id: &str, version: &str, request: FsRequest) -> Result<Value> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let action = format!("fs.read.{}", request.op);
+        let detail = format!("{} {}", request.op, request.uri);
+        let started = Instant::now();
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "fs.read");
+        let Some(grant) = grant else {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("fs.read"),
+                action: &action,
+                result: "denied",
+                detail: Some("no active fs.read grant"),
+                scope_digest: None,
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: Some(started.elapsed().as_millis() as i64),
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            return Err(KernelError::PermissionDenied(
+                "fs.read is not granted".to_string(),
+            ));
+        };
+        let scope: FsReadScope = serde_json::from_value(grant.scope.clone()).map_err(|error| {
+            KernelError::InvalidInput(format!("stored fs.read scope is invalid: {error}"))
+        })?;
+        match fs_broker::execute(&scope.roots, &request) {
+            Ok(value) => {
+                let bytes_out = value
+                    .get("body_b64")
+                    .and_then(Value::as_str)
+                    .map(|body| (body.len() as u64 * 3 / 4) as i64);
+                let _ = audit.record_event(&AuditEvent {
+                    plugin_id,
+                    capability: Some("fs.read"),
+                    action: &action,
+                    result: "allowed",
+                    detail: Some(&detail),
+                    scope_digest: Some(&grant.scope_digest),
+                    bytes_in: None,
+                    bytes_out,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                    request_id: Some(&request_id),
+                    job_id: None,
+                    user_id: None,
+                });
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = audit.record_event(&AuditEvent {
+                    plugin_id,
+                    capability: Some("fs.read"),
+                    action: &action,
+                    result: "denied",
+                    detail: Some(&error.to_string()),
+                    scope_digest: Some(&grant.scope_digest),
+                    bytes_in: None,
+                    bytes_out: None,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                    request_id: Some(&request_id),
+                    job_id: None,
+                    user_id: None,
+                });
+                Err(error)
+            }
+        }
+    }
+
     /// The plugin submits normalized titles; the host validates them against
     /// the grant scope and stores them in the draft staging table. `publish` is
     /// deliberately rejected: promotion into the browsable CMS is a reviewed
@@ -1933,6 +2024,88 @@ mod tests {
             Err(KernelError::PermissionDenied(_))
         ));
         assert!(request.headers.is_empty());
+    }
+
+    #[test]
+    fn fs_read_is_scoped_to_granted_roots() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("a.txt"), b"abcdef").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"no").unwrap();
+
+        let db = Database::open(dir.path().join("fs.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+        host.grants()
+            .unwrap()
+            .grant(
+                "reader",
+                "0.1.0",
+                "fs.read",
+                serde_json::json!({
+                    "roots": [root.to_string_lossy()],
+                    "read_only": true
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let inside_uri = url::Url::from_file_path(root.join("a.txt"))
+            .unwrap()
+            .to_string();
+        let value = host
+            .fs_read_for(
+                "reader",
+                "0.1.0",
+                FsRequest {
+                    op: "read".into(),
+                    uri: inside_uri,
+                    start: 1,
+                    len: 3,
+                },
+            )
+            .unwrap();
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(value["body_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(body, b"bcd");
+
+        let outside_uri = url::Url::from_file_path(outside.join("secret.txt"))
+            .unwrap()
+            .to_string();
+        assert!(host
+            .fs_read_for(
+                "reader",
+                "0.1.0",
+                FsRequest {
+                    op: "stat".into(),
+                    uri: outside_uri,
+                    start: 0,
+                    len: 0,
+                },
+            )
+            .is_err());
+
+        assert!(host
+            .fs_read_for(
+                "other",
+                "0.1.0",
+                FsRequest {
+                    op: "stat".into(),
+                    uri: url::Url::from_file_path(root.join("a.txt"))
+                        .unwrap()
+                        .to_string(),
+                    start: 0,
+                    len: 0,
+                },
+            )
+            .is_err());
     }
 
     #[test]
