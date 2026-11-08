@@ -23,6 +23,7 @@ from the module boundaries.
 | 015 | [A failed plugin degrades, it does not stop the server](015-plugin-failure-isolation.md) |
 | 016 | [The Windows per-user installer is ours](016-per-user-installer.md) |
 | 017 | [Plugins are supervised, not merely started](017-plugin-supervision.md) |
+| 018 | [Relative paths belong to the config file](018-relative-paths.md) |
 
-Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–017 on
+Status: all **Accepted** on 2026-11-01 unless noted otherwise (011–018 on
 2026-11-07/08).
