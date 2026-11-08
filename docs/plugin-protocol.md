@@ -111,14 +111,14 @@ owned by the host; the plugin chooses only from the published vocabulary:
 
   The response mixes `source: "manifest"` (declared) with `source: "legacy"`
   (the old `storage:read`/`network` permissions, shown for compatibility).
-- **Enforcement status (phase 2.3):** `net.fetch`, `secret.use` and
-  `catalog.write(draft)` are enforced by the host broker: the plugin's per-run
-  token, the active grant for its exact version, the declared scope and the
-  SSRF/redirect policy are checked before any side effect, and every allow/deny
-  is audited. The other capabilities (`fs.read`, `schedule.request`, `blob.*`)
-  are still disclosure + grants; they do not have a runtime broker yet. None of
-  this is an OS sandbox: a plugin can still open its own socket, which is why
-  phase 3 replaces the transport and adds OS isolation (ADR-019).
+- **Enforcement status (phase 2.4):** `net.fetch`, `secret.use`,
+  `catalog.write(draft)` and `schedule.request` are enforced by the host broker:
+  the plugin's per-run token, the active grant for its exact version, the
+  declared scope and the SSRF/redirect policy are checked before any side effect,
+  and every allow/deny is audited. The remaining capabilities (`fs.read`,
+  `blob.*`) are still disclosure + grants; they do not have a runtime broker yet.
+  None of this is an OS sandbox: a plugin can still open its own socket, which is
+  why phase 3 replaces the transport and adds OS isolation (ADR-019).
 
 ## Broker: `net.fetch` (phase 2.1)
 
@@ -238,6 +238,34 @@ Play URLs in drafts are **untrusted plugin data**. They are not fetched by the
 draft endpoint; the eventual playback/proxy path must apply its own URL policy
 before opening a socket.
 
+## Broker: `schedule.request` (phase 2.4)
+
+A plugin asks the host for a periodic callback instead of starting its own
+timer:
+
+```http
+POST /api/v1/plugin-broker/schedule
+x-localreel-plugin: <LOCALREEL_PLUGIN_TOKEN>
+content-type: application/json
+
+{"interval_secs": 3600, "payload": {"page": 1}}
+```
+
+The manifest scope bounds the interval:
+
+```json
+{"name": "schedule.request",
+ "scope": {"min_interval_secs": 3600, "max_interval_secs": 86400}}
+```
+
+The host checks the active grant for the exact version, stores one schedule per
+plugin version, and every 15 seconds wakes due rows with
+`GET /v1/schedule?payload=<url-encoded JSON>` against the plugin's loopback
+port. The plugin's SDK `Handler::schedule` default returns 404; a collector can
+implement it to run one collection. A failing callback still advances the next
+run, so a broken plugin cannot create a hot retry loop. Run outcomes are audited
+as `schedule.run` with the schedule id; the callback carries no browser session.
+
 ### Reference collector (phase 2.1)
 
 `plugin-collector-demo` is the first consumer that uses only the broker. Its
@@ -266,24 +294,29 @@ manifest asks for one allowlisted host:
     {
       "name": "catalog.write",
       "scope": { "mode": "draft", "max_items_per_run": 2000 }
+    },
+    {
+      "name": "schedule.request",
+      "scope": { "min_interval_secs": 3600, "max_interval_secs": 86400 }
     }
   ]
 }
 ```
 
-Its config names the request URL and output file:
+Its config names the request URL, output file and optional interval:
 
 ```json
 { "url": "https://api.example.com/api.php/provide/vod/?ac=detail&pg=1",
-  "out": "collected.json", "catalog": true }
+  "out": "collected.json", "catalog": true, "schedule_interval_secs": 3600 }
 ```
 
-After the host grants `net.fetch` and `catalog.write`, the plugin calls the
-broker, parses the MacCMS `list` into
-`{remote_id,name,lines:[{source_tag,episodes}]}`, writes `collected.json` and
-stages the same titles as catalog drafts. It does not open an outbound socket
-itself. There is no CMS catalog yet; this slice exists to keep the broker
-contract honest before the catalog schema is committed.
+After the host grants `net.fetch`, `catalog.write` and `schedule.request`, the
+plugin calls the broker, parses the MacCMS `list` into
+`{remote_id,name,lines:[{source_tag,episodes}]}`, writes `collected.json`,
+stages the same titles as catalog drafts and asks for a periodic callback. It
+does not open an outbound socket itself. There is no CMS catalog yet; this slice
+exists to keep the broker contract honest before the catalog schema is
+committed.
 
 The demo reuses `kind: "storage"` only because protocol v1 has no collector kind;
 it serves health and nothing else, so it must not be pointed at a source. A

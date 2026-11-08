@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod package;
 mod platform;
 pub mod runtime;
+pub mod schedule;
 pub mod secrets;
 pub mod server;
 pub mod storage;
@@ -48,6 +49,7 @@ pub use manifest::{
 };
 pub use package::{extract, inspect};
 pub use runtime::{PluginRuntime, PluginSandbox};
+pub use schedule::{PluginSchedule, ScheduleStore};
 pub use secrets::{SecretHandle, SecretStore};
 pub use storage::PluginStorage;
 pub use supervisor::ProviderSink;

@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`)
+- Status: Accepted (phase 1; phase 2.1 `net.fetch`, 2.2 `secret.use`, 2.3 `catalog.write(draft)`, 2.4 `schedule.request`)
 - Date: 2026-11-08
 
 ## Context
@@ -59,9 +59,14 @@ The CMS/collector probe made the gap concrete:
    upserts `plugin_catalog_drafts`. `publish` is rejected: promotion into the
    browsable `cms_*` tables is a reviewed admin action. Play URLs are untrusted
    draft data and must be validated again before playback.
-9. **Other capabilities remain disclosure-only** until their broker exists. The
-   control channel is still loopback HTTP; phase 3 replaces it and adds OS
-   isolation.
+9. **Phase 2.4 adds `schedule.request`.** The host stores one schedule per plugin
+   version, bounds the interval by the grant, wakes due rows with
+   `GET /v1/schedule?payload=...`, advances the next run even on failure, and
+   audits `schedule.run`. The plugin cannot run its own timer through this
+   capability.
+10. **Other capabilities remain disclosure-only** until their broker exists. The
+    control channel is still loopback HTTP; phase 3 replaces it and adds OS
+    isolation.
 
 ## Consequences
 

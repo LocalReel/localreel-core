@@ -58,7 +58,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // token the host gave the sidecar when it started it.
         .route("/api/v1/plugin-proxy", post(plugin_proxy))
         .route("/api/v1/plugin-broker/fetch", post(plugin_broker_fetch))
-        .route("/api/v1/plugin-broker/catalog", post(plugin_broker_catalog));
+        .route("/api/v1/plugin-broker/catalog", post(plugin_broker_catalog))
+        .route(
+            "/api/v1/plugin-broker/schedule",
+            post(plugin_broker_schedule),
+        );
 
     // Any signed-in account: the shared library plus that account's own state.
     let user_api = Router::new()
@@ -425,6 +429,42 @@ async fn list_catalog_drafts(
         "drafts": drafts,
         "count": count,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleRequestPayload {
+    interval_secs: u64,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+async fn plugin_broker_schedule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ScheduleRequestPayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get("x-localreel-plugin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "the x-localreel-plugin token header is required",
+        ));
+    }
+    let payload_value = if payload.payload.is_null() {
+        serde_json::json!({})
+    } else {
+        payload.payload
+    };
+    let schedule = state
+        .plugins
+        .schedule_request(token, payload.interval_secs, payload_value)?;
+    Ok(Json(serde_json::to_value(schedule).map_err(|error| {
+        ApiError::internal(format!("failed to encode schedule: {error}"))
+    })?))
 }
 
 /// Installed plugins with the permissions that actually apply to them.
@@ -2547,6 +2587,43 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/plugin-broker/fetch")
+                    .header("host", "127.0.0.1:3001")
+                    .header("x-localreel-plugin", "not-a-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_schedule_broker_requires_a_plugin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+        let body = r#"{"interval_secs":3600}"#;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-broker/schedule")
+                    .header("host", "127.0.0.1:3001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/plugin-broker/schedule")
                     .header("host", "127.0.0.1:3001")
                     .header("x-localreel-plugin", "not-a-token")
                     .header("content-type", "application/json")

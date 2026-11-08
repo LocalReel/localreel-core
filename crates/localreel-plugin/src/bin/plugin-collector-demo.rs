@@ -201,6 +201,24 @@ fn main() {
     // Fetch after the handshake so a slow upstream never blocks startup.
     std::thread::spawn(collect);
 
+    // Ask the host for a periodic callback once, at startup. The callback
+    // re-runs collect() through /v1/schedule; it does not re-request itself.
+    if let Some(client) = BrokerClient::from_env() {
+        let config: Value = std::env::var("LOCALREEL_PLUGIN_CONFIG")
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| json!({}));
+        if let Some(interval) = config.get("schedule_interval_secs").and_then(Value::as_u64) {
+            match client.request_schedule(interval, &json!({})) {
+                Ok(schedule) => eprintln!(
+                    "collector: schedule={} interval={}s",
+                    schedule["id"], interval
+                ),
+                Err(error) => eprintln!("collector: schedule.request failed: {error}"),
+            }
+        }
+    }
+
     for stream in listener.incoming().flatten() {
         let _ = handle(stream, &token);
     }
@@ -240,6 +258,10 @@ fn handle(mut stream: TcpStream, token: &str) -> std::io::Result<()> {
     let (path, _query) = target.split_once('?').unwrap_or((&target, ""));
     match path {
         "/v1/health" => respond(&mut stream, 200, b"{\"ok\":true}"),
+        "/v1/schedule" => {
+            std::thread::spawn(collect);
+            respond(&mut stream, 200, b"{\"ok\":true}")
+        }
         _ => respond(&mut stream, 404, b"not found"),
     }
 }

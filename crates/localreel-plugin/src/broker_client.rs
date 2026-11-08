@@ -118,6 +118,44 @@ impl BrokerClient {
         parse_reply(&text)
     }
 
+    /// Ask the host for a periodic callback (`GET /v1/schedule`).
+    pub fn request_schedule(&self, interval_secs: u64, payload: &Value) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "interval_secs": interval_secs,
+            "payload": payload,
+        });
+        let endpoint = format!("{}/api/v1/plugin-broker/schedule", self.base_url);
+        let response = match self
+            .agent
+            .post(&endpoint)
+            .set("x-localreel-plugin", &self.token)
+            .set("content-type", "application/json")
+            .send_string(&body.to_string())
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                let mut text = String::new();
+                let _ = response
+                    .into_reader()
+                    .take(8 * 1024)
+                    .read_to_string(&mut text);
+                return Err(format!(
+                    "schedule.request refused the call ({status}): {}",
+                    broker_error_message(&text)
+                ));
+            }
+            Err(error) => return Err(format!("schedule.request failed: {error}")),
+        };
+        let mut text = String::new();
+        response
+            .into_reader()
+            .take(1024 * 1024)
+            .read_to_string(&mut text)
+            .map_err(|error| format!("schedule.response could not be read: {error}"))?;
+        serde_json::from_str(&text)
+            .map_err(|error| format!("schedule.response is not JSON: {error}"))
+    }
+
     pub fn fetch_json<T: DeserializeOwned>(
         &self,
         url: &str,

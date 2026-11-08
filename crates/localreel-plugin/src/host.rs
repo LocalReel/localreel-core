@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
 use crate::capability::{
     self, CapabilityDescriptor, CatalogWriteMode, CatalogWriteScope, NetFetchScope,
-    RequestedCapability, SecretUseScope, CAPABILITIES,
+    RequestedCapability, ScheduleScope, SecretUseScope, CAPABILITIES,
 };
 use crate::catalog::CatalogDraftStore;
 use crate::gate::Gate;
@@ -42,6 +43,7 @@ use crate::grants::{CapabilityGrant, GrantStore};
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
 use crate::package::inspect;
 use crate::runtime::PluginRuntime;
+use crate::schedule::{PluginSchedule, ScheduleStore};
 use crate::secrets::SecretStore;
 use crate::supervisor::{self, Intent, ProviderSink};
 
@@ -248,6 +250,7 @@ pub(crate) struct Shared {
     pub(crate) grants: Option<GrantStore>,
     pub(crate) secrets: Option<SecretStore>,
     pub(crate) catalog: Option<CatalogDraftStore>,
+    pub(crate) schedules: Option<ScheduleStore>,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
     pub(crate) host_url: RwLock<Option<String>>,
@@ -262,6 +265,14 @@ pub(crate) struct Shared {
 pub(crate) struct RateWindow {
     minute: i64,
     count: u32,
+}
+
+struct SchedulerGuard<'a>(&'a AtomicBool);
+
+impl Drop for SchedulerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Shared {
@@ -315,11 +326,15 @@ struct Supervisor {
 pub struct PluginHost {
     shared: Arc<Shared>,
     supervisor: Mutex<Option<Supervisor>>,
+    /// One scheduler pass at a time; a slow plugin callback must not stack up
+    /// another blocking task every tick.
+    scheduler_busy: AtomicBool,
 }
 
 impl Default for PluginHost {
     fn default() -> Self {
         Self::build(
+            None,
             None,
             None,
             None,
@@ -336,7 +351,8 @@ impl PluginHost {
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
             Some(SecretStore::new(db.clone())),
-            Some(CatalogDraftStore::new(db)),
+            Some(CatalogDraftStore::new(db.clone())),
+            Some(ScheduleStore::new(db)),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -349,7 +365,8 @@ impl PluginHost {
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
             Some(SecretStore::new(db.clone())),
-            Some(CatalogDraftStore::new(db)),
+            Some(CatalogDraftStore::new(db.clone())),
+            Some(ScheduleStore::new(db)),
             install_root,
             stop_timeout,
         )
@@ -360,6 +377,7 @@ impl PluginHost {
         grants: Option<GrantStore>,
         secrets: Option<SecretStore>,
         catalog: Option<CatalogDraftStore>,
+        schedules: Option<ScheduleStore>,
         install_root: PathBuf,
         stop_timeout: Duration,
     ) -> Self {
@@ -370,12 +388,14 @@ impl PluginHost {
                 grants,
                 secrets,
                 catalog,
+                schedules,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
                 install_root,
                 stop_timeout,
             }),
             supervisor: Mutex::new(None),
+            scheduler_busy: AtomicBool::new(false),
         }
     }
 
@@ -393,6 +413,10 @@ impl PluginHost {
 
     pub fn catalog(&self) -> Option<&CatalogDraftStore> {
         self.shared.catalog.as_ref()
+    }
+
+    pub fn schedules(&self) -> Option<&ScheduleStore> {
+        self.shared.schedules.as_ref()
     }
 
     /// Tell newly started plugins where the host's capability broker lives.
@@ -961,6 +985,170 @@ impl PluginHost {
                 ))
             })?;
         Ok(written)
+    }
+
+    pub fn schedule_request(
+        &self,
+        token: &str,
+        interval_secs: u64,
+        payload: Value,
+    ) -> Result<PluginSchedule> {
+        let runtime = self
+            .authenticate(token)
+            .ok_or_else(|| KernelError::PermissionDenied("unknown plugin token".to_string()))?;
+        let (plugin_id, version) = {
+            let manifest = runtime.manifest();
+            (manifest.id.clone(), manifest.version.clone())
+        };
+        self.schedule_request_for(&plugin_id, &version, interval_secs, payload)
+    }
+
+    fn schedule_request_for(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        interval_secs: u64,
+        payload: Value,
+    ) -> Result<PluginSchedule> {
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "schedule.request");
+        let Some(grant) = grant else {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("schedule.request"),
+                action: "capability.schedule",
+                result: "denied",
+                detail: Some("schedule.request is not granted for this plugin version"),
+                scope_digest: None,
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            return Err(KernelError::PermissionDenied(
+                "schedule.request is not granted for this plugin version".to_string(),
+            ));
+        };
+        let scope: ScheduleScope =
+            serde_json::from_value(grant.scope.clone()).map_err(|error| {
+                KernelError::InvalidInput(format!(
+                    "stored schedule.request scope is invalid: {error}"
+                ))
+            })?;
+        if interval_secs < scope.min_interval_secs || interval_secs > scope.max_interval_secs {
+            return Err(KernelError::InvalidInput(format!(
+                "schedule interval must be {}..={} seconds",
+                scope.min_interval_secs, scope.max_interval_secs
+            )));
+        }
+        let store = self.shared.schedules.as_ref().ok_or_else(|| {
+            KernelError::StorageUnavailable("the schedule store is unavailable".to_string())
+        })?;
+        let schedule = store.request(plugin_id, version, interval_secs, &payload)?;
+        let job_id = schedule.id.to_string();
+        audit
+            .record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("schedule.request"),
+                action: "capability.schedule",
+                result: "allowed",
+                detail: Some(&format!(
+                    "interval={interval_secs}s schedule={}",
+                    schedule.id
+                )),
+                scope_digest: Some(&grant.scope_digest),
+                bytes_in: Some(payload.to_string().len() as i64),
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: Some(&job_id),
+                user_id: None,
+            })
+            .map_err(|error| {
+                KernelError::Storage(format!(
+                    "the capability audit could not be written: {error}"
+                ))
+            })?;
+        Ok(schedule)
+    }
+
+    /// Run every due callback, one by one. A failing plugin still advances its
+    /// interval, so a broken collector cannot create a hot retry loop.
+    pub fn run_due_schedules(&self) -> Result<usize> {
+        if self.scheduler_busy.swap(true, Ordering::AcqRel) {
+            return Ok(0);
+        }
+        let _guard = SchedulerGuard(&self.scheduler_busy);
+        let Some(store) = self.shared.schedules.as_ref() else {
+            return Ok(0);
+        };
+        let due = store.due(now_secs(), 32)?;
+        let mut ran = 0usize;
+        for schedule in due {
+            let started = Instant::now();
+            let runtime = self
+                .shared
+                .read()
+                .entries
+                .get(&schedule.plugin_id)
+                .and_then(|entry| entry.runtime.clone());
+            let outcome = match runtime {
+                None => Err("plugin is not running".to_string()),
+                Some(runtime) if runtime.manifest().version != schedule.plugin_version => {
+                    Err("plugin version changed since the schedule was requested".to_string())
+                }
+                Some(runtime) => {
+                    let query = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("payload", &schedule.payload)
+                        .finish();
+                    let path = format!("/v1/schedule?{query}");
+                    match runtime.request(&path) {
+                        Ok(response) if response.status == 200 => Ok(()),
+                        Ok(response) => Err(format!("plugin answered HTTP {}", response.status)),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            };
+            let next_run_at = now_secs().saturating_add(schedule.interval_secs as i64);
+            let error = outcome.as_ref().err().map(String::as_str);
+            store.mark(schedule.id, next_run_at, error)?;
+            let job_id = schedule.id.to_string();
+            if let Some(audit) = &self.shared.audit {
+                let _ = audit.record_event(&AuditEvent {
+                    plugin_id: &schedule.plugin_id,
+                    capability: Some("schedule.request"),
+                    action: "schedule.run",
+                    result: if outcome.is_ok() { "allowed" } else { "error" },
+                    detail: Some(&format!(
+                        "schedule={} {}",
+                        schedule.id,
+                        error.unwrap_or("ok")
+                    )),
+                    scope_digest: None,
+                    bytes_in: None,
+                    bytes_out: None,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                    request_id: None,
+                    job_id: Some(&job_id),
+                    user_id: None,
+                });
+            }
+            if outcome.is_ok() {
+                ran += 1;
+            }
+        }
+        Ok(ran)
     }
 
     fn apply_secret(
@@ -1558,6 +1746,56 @@ mod tests {
             .iter()
             .any(|entry| entry.capability.as_deref() == Some("catalog.write")
                 && entry.result.as_deref() == Some("allowed")));
+    }
+
+    #[test]
+    fn schedule_request_is_granted_and_interval_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("schedule.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+
+        assert!(matches!(
+            host.schedule_request_for("collector", "0.1.0", 600, serde_json::json!({})),
+            Err(KernelError::PermissionDenied(_))
+        ));
+
+        host.grants()
+            .unwrap()
+            .grant(
+                "collector",
+                "0.1.0",
+                "schedule.request",
+                serde_json::json!({"min_interval_secs": 60, "max_interval_secs": 3600}),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(host
+            .schedule_request_for("collector", "0.1.0", 30, serde_json::json!({}))
+            .is_err());
+        let schedule = host
+            .schedule_request_for("collector", "0.1.0", 600, serde_json::json!({"page": 2}))
+            .unwrap();
+        assert_eq!(schedule.interval_secs, 600);
+        assert_eq!(
+            host.schedules()
+                .unwrap()
+                .list(Some("collector"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(host
+            .audit()
+            .unwrap()
+            .recent(Some("collector"), 10)
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry.capability.as_deref() == Some("schedule.request")
+                    && entry.result.as_deref() == Some("allowed")
+            ));
     }
 
     #[test]

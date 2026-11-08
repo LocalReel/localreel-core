@@ -770,6 +770,20 @@ async fn serve(
         });
     }
     let plugin_host = Arc::new(plugin_host);
+    // Host-owned schedules: plugins ask for a callback, the host runs due rows.
+    // A blocking thread keeps plugin HTTP/DB work off the async runtime.
+    {
+        let scheduler_host = plugin_host.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                let host = scheduler_host.clone();
+                let _ = tokio::task::spawn_blocking(move || host.run_due_schedules()).await;
+            }
+        });
+    }
     let media = MediaService::with_storage(db.clone(), storage.clone());
     let accounts = localreel_media::AccountService::new(db.clone());
     if let Ok(removed) = accounts.purge_expired_sessions() {

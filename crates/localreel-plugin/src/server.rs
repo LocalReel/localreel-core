@@ -44,6 +44,11 @@ pub trait Handler: Send + Sync {
     fn stat(&self, uri: &str) -> Result<Stat, HandlerError>;
     fn list(&self, uri: &str, recursive: bool) -> Result<Vec<Entry>, HandlerError>;
     fn read(&self, uri: &str, start: u64, len: u64) -> Result<Vec<u8>, HandlerError>;
+    /// One host-scheduled callback. The default refuses, so existing storage
+    /// plugins keep their old behaviour.
+    fn schedule(&self, _payload: &str) -> Result<(), HandlerError> {
+        Err(HandlerError::NotFound)
+    }
 }
 
 /// Serve the plugin protocol on loopback until the process is terminated.
@@ -109,6 +114,7 @@ fn handle(mut stream: TcpStream, handler: &dyn Handler, token: &str) -> std::io:
         "/v1/list" => entries(&mut stream, handler, query, false),
         "/v1/walk" => entries(&mut stream, handler, query, true),
         "/v1/read" => read(&mut stream, handler, query),
+        "/v1/schedule" => schedule(&mut stream, handler, query),
         _ => respond(&mut stream, 404, "text/plain", b"unknown route"),
     }
 }
@@ -172,6 +178,14 @@ fn read(stream: &mut TcpStream, handler: &dyn Handler, query: &str) -> std::io::
         .unwrap_or(0);
     match handler.read(&uri, start, len) {
         Ok(bytes) => respond(stream, 200, "application/octet-stream", &bytes),
+        Err(error) => error_response(stream, error),
+    }
+}
+
+fn schedule(stream: &mut TcpStream, handler: &dyn Handler, query: &str) -> std::io::Result<()> {
+    let payload = param(query, "payload").unwrap_or_default();
+    match handler.schedule(&payload) {
+        Ok(()) => respond(stream, 200, "application/json", b"{\"ok\":true}"),
         Err(error) => error_response(stream, error),
     }
 }

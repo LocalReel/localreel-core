@@ -77,6 +77,11 @@ pub fn migrations() -> &'static [Migration] {
             name: "plugin_catalog_drafts",
             sql: include_str!("../migrations/0004_plugin_catalog_drafts.sql"),
         },
+        Migration {
+            version: 5,
+            name: "plugin_schedules",
+            sql: include_str!("../migrations/0005_plugin_schedules.sql"),
+        },
     ]
 }
 
