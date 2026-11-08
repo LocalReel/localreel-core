@@ -1,6 +1,7 @@
 //! Full chain: a real `PluginHost`, real API router, a real `fs.read` grant and
 //! a stdio storage plugin whose stat/list/read go through the broker.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,8 +43,25 @@ impl ProviderSink for Sink {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn storage_plugin_uses_real_grant_and_api() {
+fn sandbox_program() -> PathBuf {
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("debug")
+        .join(format!("plugin-sandbox{}", std::env::consts::EXE_SUFFIX));
+    if !target.is_file() {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "localreel-plugin", "--bin", "plugin-sandbox"])
+            .status()
+            .expect("cargo build plugin-sandbox");
+        assert!(status.success());
+    }
+    assert!(target.is_file(), "{} is missing", target.display());
+    target
+}
+
+async fn full_chain(app_container: bool) {
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("library");
     std::fs::create_dir_all(&library).unwrap();
@@ -131,10 +149,11 @@ async fn storage_plugin_uses_real_grant_and_api() {
     host.with_host_url(format!("http://{address}"));
 
     let sink = Arc::new(Sink::default());
-    let failures = host.start(
-        vec![PluginSpec::new(package, manifest, json!({}), true)],
-        sink.clone(),
-    );
+    let mut spec = PluginSpec::new(package, manifest, json!({}), true);
+    if app_container {
+        spec = spec.with_app_container(true, Some(sandbox_program()));
+    }
+    let failures = host.start(vec![spec], sink.clone());
     assert!(failures.is_empty(), "{failures:?}");
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -161,4 +180,14 @@ async fn storage_plugin_uses_real_grant_and_api() {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"bcd");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_plugin_uses_real_grant_and_api() {
+    full_chain(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appcontainer_storage_uses_real_grant_and_api() {
+    full_chain(true).await;
 }
