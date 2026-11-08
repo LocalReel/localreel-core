@@ -23,6 +23,7 @@ pub mod manifest;
 pub mod package;
 mod platform;
 pub mod runtime;
+pub mod secrets;
 pub mod server;
 pub mod storage;
 mod supervisor;
@@ -45,5 +46,6 @@ pub use manifest::{
 };
 pub use package::{extract, inspect};
 pub use runtime::{PluginRuntime, PluginSandbox};
+pub use secrets::{SecretHandle, SecretStore};
 pub use storage::PluginStorage;
 pub use supervisor::ProviderSink;

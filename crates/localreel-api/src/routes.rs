@@ -11,7 +11,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Extension, Json, Router,
 };
 use base64::Engine as _;
@@ -28,6 +28,7 @@ use localreel_media::{
     BackupImportReport, CacheGcReport, CacheStats, CurrentUser, DeleteSourceReport, FeedItem,
     Media, MediaFilter, MediaState, RemapReport, ScanIssue, ScanRun, Source,
 };
+use localreel_plugin::capability::SecretUseScope;
 use localreel_plugin::{AuditEvent, BrokerRequest};
 
 use crate::auth;
@@ -96,6 +97,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/plugins/:id/capabilities/:capability",
             delete(revoke_plugin_capability),
+        )
+        .route("/api/v1/plugins/:id/secrets", get(list_plugin_secrets))
+        .route(
+            "/api/v1/plugins/:id/secrets/:handle",
+            put(store_plugin_secret).delete(delete_plugin_secret),
         )
         .route("/api/v1/plugins/:id/restart", post(plugin_restart))
         .route("/api/v1/plugins/:id/enable", post(plugin_enable))
@@ -528,6 +534,133 @@ async fn revoke_plugin_capability(
         "capability": capability,
         "revoked": revoked,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretPayload {
+    value: String,
+}
+
+/// Handles only; the value never leaves the host through this API.
+async fn list_plugin_secrets(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.plugins.descriptor(&id).is_none() {
+        return Err(ApiError::not_found(format!("plugin '{id}'")));
+    }
+    let secrets = state.plugins.secrets().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the secret store is not available",
+        )
+    })?;
+    let handles = secrets.handles(&id)?;
+    Ok(Json(serde_json::json!({ "handles": handles })))
+}
+
+/// Store a credential for a handle the manifest requested. There is no GET for
+/// the value: the broker is the only reader.
+async fn store_plugin_secret(
+    State(state): State<Arc<AppState>>,
+    Path((id, handle)): Path<(String, String)>,
+    Extension(current): Extension<CurrentUser>,
+    Json(body): Json<SecretPayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.plugins.descriptor(&id).is_none() {
+        return Err(ApiError::not_found(format!("plugin '{id}'")));
+    }
+    let scope = declared_secret_scope(&state, &id)?;
+    if !scope.handles.iter().any(|candidate| candidate == &handle) {
+        return Err(ApiError::bad_request(
+            "the plugin manifest does not request this secret handle",
+        ));
+    }
+    let secrets = state.plugins.secrets().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the secret store is not available",
+        )
+    })?;
+    let stored = secrets.put(&id, &handle, &body.value)?;
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id: &id,
+            capability: Some("secret.use"),
+            action: "secret.stored",
+            result: "granted",
+            detail: Some(&format!("handle={handle}")),
+            scope_digest: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: Some(current.user.id),
+        });
+    }
+    Ok(Json(serde_json::json!({
+        "plugin": id,
+        "handle": stored.handle,
+        "updated_at": stored.updated_at,
+    })))
+}
+
+async fn delete_plugin_secret(
+    State(state): State<Arc<AppState>>,
+    Path((id, handle)): Path<(String, String)>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.plugins.descriptor(&id).is_none() {
+        return Err(ApiError::not_found(format!("plugin '{id}'")));
+    }
+    let secrets = state.plugins.secrets().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the secret store is not available",
+        )
+    })?;
+    let removed = secrets.delete(&id, &handle)?;
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id: &id,
+            capability: Some("secret.use"),
+            action: "secret.deleted",
+            result: if removed { "revoked" } else { "not_found" },
+            detail: Some(&format!("handle={handle}")),
+            scope_digest: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: Some(current.user.id),
+        });
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "plugin": id,
+        "handle": handle,
+        "deleted": removed,
+    })))
+}
+
+fn declared_secret_scope(state: &AppState, plugin_id: &str) -> Result<SecretUseScope, ApiError> {
+    let manifest = state
+        .plugins
+        .manifest(plugin_id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin '{plugin_id}'")))?;
+    let request = manifest
+        .declared_capabilities()
+        .iter()
+        .find(|capability| capability.name == "secret.use")
+        .ok_or_else(|| ApiError::bad_request("the plugin manifest does not request secret.use"))?;
+    serde_json::from_value(request.scope.clone()).map_err(|error| {
+        ApiError::bad_request(format!("the declared secret.use scope is invalid: {error}"))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2538,6 +2671,97 @@ mod tests {
             .unwrap()
             .iter()
             .any(|grant| grant["capability"] == "net.fetch" && grant["revoked_at"].is_number()));
+    }
+
+    #[tokio::test]
+    async fn plugin_secrets_are_stored_without_ever_returning_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let (session, csrf) = sign_in(&state);
+        let manifest = localreel_plugin::Manifest::parse(
+            br#"{
+                "id": "collector",
+                "name": "Collector",
+                "version": "0.1.0",
+                "api_version": "localreel.plugin/v1",
+                "kind": "storage",
+                "entry": { "program": "plugin-collector-demo" },
+                "capabilities": [
+                    {
+                        "name": "secret.use",
+                        "scope": {
+                            "handles": ["api-key"],
+                            "hosts": ["api.example.com"],
+                            "inject": "header",
+                            "name": "X-Api-Key",
+                            "prefix": ""
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        state.plugins.record_failed(
+            &std::path::PathBuf::from("plugins/collector.lrplug"),
+            Some(&manifest),
+            "not started in this test",
+        );
+        let app = router(state);
+
+        let secret = "super-secret-value";
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "PUT",
+                "/api/v1/plugins/collector/secrets/api-key",
+                &session,
+                &csrf,
+                serde_json::json!({ "value": secret }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/plugins/collector/secrets", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("api-key"));
+        assert!(
+            !text.contains(secret),
+            "the API must never return the value"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "PUT",
+                "/api/v1/plugins/collector/secrets/not-requested",
+                &session,
+                &csrf,
+                serde_json::json!({ "value": "x" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(request_json(
+                "DELETE",
+                "/api/v1/plugins/collector/secrets/api-key",
+                &session,
+                &csrf,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -27,17 +27,19 @@ use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::time::now_secs;
 use serde::Serialize;
+use url::Url;
 
 use crate::audit::{AuditEvent, AuditLog};
 use crate::broker::{self, BrokerError, BrokerRequest, BrokerResponse};
 use crate::capability::{
-    self, CapabilityDescriptor, NetFetchScope, RequestedCapability, CAPABILITIES,
+    self, CapabilityDescriptor, NetFetchScope, RequestedCapability, SecretUseScope, CAPABILITIES,
 };
 use crate::gate::Gate;
 use crate::grants::{CapabilityGrant, GrantStore};
 use crate::manifest::{Manifest, PERMISSION_NETWORK};
 use crate::package::inspect;
 use crate::runtime::PluginRuntime;
+use crate::secrets::SecretStore;
 use crate::supervisor::{self, Intent, ProviderSink};
 
 /// Upper bound on a proxied response, so one plugin cannot fill the disk.
@@ -241,6 +243,7 @@ pub(crate) struct Shared {
     pub(crate) inner: RwLock<Inner>,
     pub(crate) audit: Option<AuditLog>,
     pub(crate) grants: Option<GrantStore>,
+    pub(crate) secrets: Option<SecretStore>,
     /// Base URL the plugin uses to call the host broker. `None` keeps the
     /// phase-1 behaviour (no broker calls).
     pub(crate) host_url: RwLock<Option<String>>,
@@ -312,7 +315,13 @@ pub struct PluginHost {
 
 impl Default for PluginHost {
     fn default() -> Self {
-        Self::build(None, None, PathBuf::from("plugins"), Duration::from_secs(5))
+        Self::build(
+            None,
+            None,
+            None,
+            PathBuf::from("plugins"),
+            Duration::from_secs(5),
+        )
     }
 }
 
@@ -320,7 +329,8 @@ impl PluginHost {
     pub fn new(db: Database) -> Self {
         Self::build(
             Some(AuditLog::new(db.clone())),
-            Some(GrantStore::new(db)),
+            Some(GrantStore::new(db.clone())),
+            Some(SecretStore::new(db)),
             PathBuf::from("plugins"),
             Duration::from_secs(5),
         )
@@ -331,7 +341,8 @@ impl PluginHost {
     pub fn with_options(db: Database, install_root: PathBuf, stop_timeout: Duration) -> Self {
         Self::build(
             Some(AuditLog::new(db.clone())),
-            Some(GrantStore::new(db)),
+            Some(GrantStore::new(db.clone())),
+            Some(SecretStore::new(db)),
             install_root,
             stop_timeout,
         )
@@ -340,6 +351,7 @@ impl PluginHost {
     fn build(
         audit: Option<AuditLog>,
         grants: Option<GrantStore>,
+        secrets: Option<SecretStore>,
         install_root: PathBuf,
         stop_timeout: Duration,
     ) -> Self {
@@ -348,6 +360,7 @@ impl PluginHost {
                 inner: RwLock::new(Inner::default()),
                 audit,
                 grants,
+                secrets,
                 host_url: RwLock::new(None),
                 rates: Mutex::new(HashMap::new()),
                 install_root,
@@ -363,6 +376,10 @@ impl PluginHost {
 
     pub fn grants(&self) -> Option<&GrantStore> {
         self.shared.grants.as_ref()
+    }
+
+    pub fn secrets(&self) -> Option<&SecretStore> {
+        self.shared.secrets.as_ref()
     }
 
     /// Tell newly started plugins where the host's capability broker lives.
@@ -709,7 +726,7 @@ impl PluginHost {
         &self,
         plugin_id: &str,
         version: &str,
-        request: BrokerRequest,
+        mut request: BrokerRequest,
     ) -> Result<BrokerResponse> {
         let audit = self.shared.audit.as_ref().ok_or_else(|| {
             KernelError::PermissionDenied("capability audit is unavailable".to_string())
@@ -776,6 +793,8 @@ impl PluginHost {
             ));
         }
 
+        self.apply_secret(plugin_id, version, &scope, &mut request)?;
+
         match broker::fetch(&scope, &request) {
             Ok(response) => {
                 let bytes = i64::try_from(response.body.len()).unwrap_or(i64::MAX);
@@ -827,6 +846,127 @@ impl PluginHost {
                 Err(map_broker_error(error))
             }
         }
+    }
+    fn apply_secret(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        fetch_scope: &NetFetchScope,
+        request: &mut BrokerRequest,
+    ) -> Result<()> {
+        let Some(handle) = request.secret.clone() else {
+            return Ok(());
+        };
+        let audit = self.shared.audit.as_ref().ok_or_else(|| {
+            KernelError::PermissionDenied("capability audit is unavailable".to_string())
+        })?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let deny = |reason: &str| -> Result<()> {
+            let _ = audit.record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("secret.use"),
+                action: "capability.secret",
+                result: "denied",
+                detail: Some(reason),
+                scope_digest: None,
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            });
+            Err(KernelError::PermissionDenied(reason.to_string()))
+        };
+
+        let grant = self
+            .grants()
+            .map(|grants| grants.active(plugin_id, version))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|grant| grant.capability == "secret.use");
+        let Some(grant) = grant else {
+            return deny("secret.use is not granted for this plugin version");
+        };
+        let scope: SecretUseScope =
+            serde_json::from_value(grant.scope.clone()).map_err(|error| {
+                KernelError::InvalidInput(format!("stored secret.use scope is invalid: {error}"))
+            })?;
+        if !scope.handles.iter().any(|candidate| candidate == &handle) {
+            return deny("the requested secret handle is outside the granted scope");
+        }
+        let url = Url::parse(&request.url)
+            .map_err(|error| KernelError::InvalidInput(format!("invalid URL: {error}")))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| KernelError::InvalidInput("URL has no host".to_string()))?;
+        if !broker::host_matches(host, &scope.hosts) {
+            return deny("the destination host is outside the granted secret.use scope");
+        }
+        if fetch_scope.redirects > 0 {
+            return deny("secret.use requests cannot follow redirects");
+        }
+        if scope.inject == "query" && !request.method.eq_ignore_ascii_case("GET") {
+            return deny("query secret injection is only supported for GET");
+        }
+        let store =
+            self.shared.secrets.as_ref().ok_or_else(|| {
+                KernelError::PermissionDenied("secret store is unavailable".into())
+            })?;
+        let secret = store.get(plugin_id, &handle)?.ok_or_else(|| {
+            KernelError::PermissionDenied("the secret handle is not configured".into())
+        })?;
+        let value = format!("{}{}", scope.prefix, secret);
+
+        match scope.inject.as_str() {
+            "header" => {
+                if value.len() > 4096 || !value.chars().all(|ch| (' '..='~').contains(&ch)) {
+                    return deny("the secret cannot be represented as an HTTP header value");
+                }
+                if request
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(&scope.name))
+                {
+                    return deny("the plugin already set the injected header");
+                }
+                request.headers.insert(scope.name.clone(), value);
+            }
+            "query" => {
+                let mut parsed = Url::parse(&request.url)
+                    .map_err(|error| KernelError::InvalidInput(format!("invalid URL: {error}")))?;
+                if parsed.query_pairs().any(|(name, _)| name == scope.name) {
+                    return deny("the URL already contains the injected query parameter");
+                }
+                parsed.query_pairs_mut().append_pair(&scope.name, &value);
+                request.url = parsed.to_string();
+            }
+            _ => return deny("secret.use.scope.inject must be 'header' or 'query'"),
+        }
+
+        audit
+            .record_event(&AuditEvent {
+                plugin_id,
+                capability: Some("secret.use"),
+                action: "capability.secret",
+                result: "allowed",
+                detail: Some(&format!("handle={handle} host={host}")),
+                scope_digest: Some(&grant.scope_digest),
+                bytes_in: None,
+                bytes_out: None,
+                duration_ms: None,
+                request_id: Some(&request_id),
+                job_id: None,
+                user_id: None,
+            })
+            .map_err(|error| {
+                KernelError::Storage(format!(
+                    "the capability audit could not be written: {error}"
+                ))
+            })?;
+        request.secret = None;
+        Ok(())
     }
 }
 
@@ -1126,6 +1266,114 @@ mod tests {
                 && entry.result.as_deref() == Some("denied")
         }));
         assert!(entries.len() >= 3);
+    }
+
+    #[test]
+    fn secret_use_injects_a_header_and_never_audits_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("secret.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+        host.grants()
+            .unwrap()
+            .grant(
+                "demo",
+                "0.1.0",
+                "secret.use",
+                serde_json::json!({
+                    "handles": ["api-key"],
+                    "hosts": ["api.example.com"],
+                    "inject": "header",
+                    "name": "X-Api-Key",
+                    "prefix": ""
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        let secret = "super-secret-token";
+        host.secrets()
+            .unwrap()
+            .put("demo", "api-key", secret)
+            .unwrap();
+
+        let fetch_scope = NetFetchScope {
+            hosts: vec!["api.example.com".into()],
+            methods: vec!["GET".into()],
+            max_bytes: 1024,
+            timeout_secs: 5,
+            redirects: 0,
+            rate_per_min: 60,
+        };
+        let mut request = BrokerRequest::get("https://api.example.com/vod").with_secret("api-key");
+        host.apply_secret("demo", "0.1.0", &fetch_scope, &mut request)
+            .unwrap();
+        assert_eq!(
+            request.headers.get("X-Api-Key").map(String::as_str),
+            Some(secret)
+        );
+        assert!(request.secret.is_none());
+
+        let entries = host.audit().unwrap().recent(Some("demo"), 10).unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.capability.as_deref() == Some("secret.use")
+                && entry.result.as_deref() == Some("allowed")
+        }));
+        assert!(
+            !entries
+                .iter()
+                .filter_map(|entry| entry.detail.as_deref())
+                .any(|detail| detail.contains(secret)),
+            "the secret value must never reach the audit log"
+        );
+    }
+
+    #[test]
+    fn secret_use_rejects_redirects_and_out_of_scope_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("secret.db").to_str().unwrap(), 1).unwrap();
+        localreel_kernel::migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let host = PluginHost::new(db);
+        host.grants()
+            .unwrap()
+            .grant(
+                "demo",
+                "0.1.0",
+                "secret.use",
+                serde_json::json!({
+                    "handles": ["api-key"],
+                    "hosts": ["api.example.com"],
+                    "inject": "header",
+                    "name": "X-Api-Key",
+                    "prefix": ""
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        host.secrets().unwrap().put("demo", "api-key", "v").unwrap();
+
+        let mut fetch_scope = NetFetchScope {
+            hosts: vec!["api.example.com".into()],
+            methods: vec!["GET".into()],
+            max_bytes: 1024,
+            timeout_secs: 5,
+            redirects: 1,
+            rate_per_min: 60,
+        };
+        let mut request = BrokerRequest::get("https://api.example.com/vod").with_secret("api-key");
+        assert!(matches!(
+            host.apply_secret("demo", "0.1.0", &fetch_scope, &mut request),
+            Err(KernelError::PermissionDenied(_))
+        ));
+
+        fetch_scope.redirects = 0;
+        let mut request = BrokerRequest::get("https://evil.example/vod").with_secret("api-key");
+        assert!(matches!(
+            host.apply_secret("demo", "0.1.0", &fetch_scope, &mut request),
+            Err(KernelError::PermissionDenied(_))
+        ));
+        assert!(request.headers.is_empty());
     }
 
     #[test]

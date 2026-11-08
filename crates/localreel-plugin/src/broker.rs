@@ -25,6 +25,10 @@ pub struct BrokerRequest {
     /// Only a small allowlist is forwarded; see [`ALLOWED_HEADERS`].
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Handle of a host-held secret to inject. The value never reaches the
+    /// plugin; the host resolves it only after checking the `secret.use` grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 fn default_method() -> String {
@@ -37,7 +41,13 @@ impl BrokerRequest {
             url: url.into(),
             method: "GET".into(),
             headers: BTreeMap::new(),
+            secret: None,
         }
+    }
+
+    pub fn with_secret(mut self, handle: impl Into<String>) -> Self {
+        self.secret = Some(handle.into());
+        self
     }
 }
 
@@ -263,20 +273,25 @@ fn ensure_host_allowed(url: &Url, patterns: &[String]) -> Result<(), BrokerError
         .host_str()
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| BrokerError::Invalid("URL has no host".to_string()))?;
-    let allowed = patterns.iter().any(|pattern| {
-        let pattern = pattern.to_ascii_lowercase();
-        match pattern.strip_prefix("*.") {
-            Some(suffix) => host.ends_with(&format!(".{suffix}")) && host != suffix,
-            None => host == pattern,
-        }
-    });
-    if allowed {
+    if host_matches(&host, patterns) {
         Ok(())
     } else {
         Err(BrokerError::Denied(format!(
             "host {host:?} is outside the granted net.fetch allowlist"
         )))
     }
+}
+
+/// Exact match, or `*.suffix` for a subdomain (but not the apex).
+pub(crate) fn host_matches(host: &str, patterns: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        match pattern.strip_prefix("*.") {
+            Some(suffix) => host.ends_with(&format!(".{suffix}")) && host != suffix,
+            None => host == pattern,
+        }
+    })
 }
 
 fn ensure_public_destination(url: &Url) -> Result<(), BrokerError> {

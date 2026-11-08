@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1 adds the `net.fetch` broker)
+- Status: Accepted (phase 1; phase 2.1 adds `net.fetch`, phase 2.2 adds `secret.use`)
 - Date: 2026-11-08
 
 ## Context
@@ -48,9 +48,14 @@ The CMS/collector probe made the gap concrete:
    `POST /api/v1/plugin-broker/fetch` with its per-run token; the host checks the
    active grant for the exact version, the scope (hosts/methods/bytes/timeout/
    redirects/rate), the SSRF policy and the header allowlist, writes the audit row
-   and only then returns the body. The other capabilities remain
-   disclosure-only until their broker exists. The control channel is still
-   loopback HTTP; phase 3 replaces it and adds OS isolation.
+   and only then returns the body.
+7. **Phase 2.2 adds `secret.use`.** The plugin names a handle; the host checks the
+   active `secret.use` grant, the handle/host scope and the injection rule, reads
+   the value from the host store, injects it, audits handle+host (never the
+   value) and forbids redirects so the credential cannot leave the scope. The
+   value is never returned by any API. Other capabilities remain disclosure-only
+   until their broker exists. The control channel is still loopback HTTP; phase 3
+   replaces it and adds OS isolation.
 
 ## Consequences
 

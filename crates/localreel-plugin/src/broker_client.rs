@@ -62,15 +62,30 @@ impl BrokerClient {
 
     /// Fetch a URL through the host broker.
     pub fn fetch(&self, url: &str, headers: &[(&str, &str)]) -> Result<BrokerReply, String> {
+        self.fetch_with_secret(url, None, headers)
+    }
+
+    /// Fetch with a host-held credential. The plugin names a handle; it never
+    /// sees the value, and the host injects it only after checking its own
+    /// `secret.use` grant.
+    pub fn fetch_with_secret(
+        &self,
+        url: &str,
+        secret: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<BrokerReply, String> {
         let mut map = BTreeMap::new();
         for (name, value) in headers {
             map.insert((*name).to_string(), (*value).to_string());
         }
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "url": url,
             "method": "GET",
             "headers": map,
         });
+        if let Some(handle) = secret {
+            payload["secret"] = serde_json::Value::String(handle.to_string());
+        }
         let endpoint = format!("{}/api/v1/plugin-broker/fetch", self.base_url);
         let response = match self
             .agent

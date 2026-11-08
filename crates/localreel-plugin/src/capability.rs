@@ -236,6 +236,22 @@ pub fn validate_request(request: &CapabilityRequest) -> Result<ValidatedCapabili
                     "secret.use.scope.inject must be 'header' or 'query'".into(),
                 ));
             }
+            require_text(&scope.name, "secret.use.scope.name", 64)?;
+            if !scope
+                .name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            {
+                return Err(PluginError::Manifest(
+                    "secret.use.scope.name must be alphanumeric, '-' or '_'".into(),
+                ));
+            }
+            if scope.prefix.len() > 64 || scope.prefix.contains(['\r', '\n', '\0']) {
+                return Err(PluginError::Manifest(
+                    "secret.use.scope.prefix must be at most 64 bytes and contain no controls"
+                        .into(),
+                ));
+            }
             (descriptor.tier, to_value(scope)?)
         }
         "schedule.request" => {
@@ -401,6 +417,10 @@ pub struct SecretUseScope {
     pub handles: Vec<String>,
     pub hosts: Vec<String>,
     pub inject: String,
+    /// Header name or query parameter name.
+    pub name: String,
+    /// Prepended to the value (for example `Bearer `).
+    pub prefix: String,
 }
 
 impl Default for SecretUseScope {
@@ -409,6 +429,8 @@ impl Default for SecretUseScope {
             handles: Vec::new(),
             hosts: Vec::new(),
             inject: "header".into(),
+            name: "Authorization".into(),
+            prefix: "Bearer ".into(),
         }
     }
 }
@@ -518,6 +540,45 @@ mod tests {
             "net.fetch",
             json!({"hosts": ["api.example.com"], "unknown": true})
         ))
+        .is_err());
+    }
+
+    #[test]
+    fn secret_use_requires_a_safe_injection_name_and_prefix() {
+        let valid = json!({
+            "handles": ["api-key"],
+            "hosts": ["api.example.com"],
+            "inject": "header",
+            "name": "X-Api-Key",
+            "prefix": "Bearer "
+        });
+        assert!(validate_request(&CapabilityRequest {
+            name: "secret.use".into(),
+            scope: valid,
+        })
+        .is_ok());
+
+        let bad_name = json!({
+            "handles": ["api-key"],
+            "hosts": ["api.example.com"],
+            "name": "Bad Header"
+        });
+        assert!(validate_request(&CapabilityRequest {
+            name: "secret.use".into(),
+            scope: bad_name,
+        })
+        .is_err());
+
+        let bad_prefix = json!({
+            "handles": ["api-key"],
+            "hosts": ["api.example.com"],
+            "name": "X-Api-Key",
+            "prefix": "line\r\nbreak"
+        });
+        assert!(validate_request(&CapabilityRequest {
+            name: "secret.use".into(),
+            scope: bad_prefix,
+        })
         .is_err());
     }
 

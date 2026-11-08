@@ -111,14 +111,14 @@ owned by the host; the plugin chooses only from the published vocabulary:
 
   The response mixes `source: "manifest"` (declared) with `source: "legacy"`
   (the old `storage:read`/`network` permissions, shown for compatibility).
-- **Enforcement status (phase 2.1):** `net.fetch` is enforced by the host broker:
-  the plugin's per-run token, the active grant for its exact version, the declared
-  host/method/byte/timeout/redirect/rate scope and the SSRF policy are checked
-  before a socket is opened, and every allow/deny is audited. The other
-  capabilities (`fs.read`, `secret.use`, `schedule.request`, `catalog.write`,
-  `blob.*`) are still disclosure + grants; they do not have a runtime broker yet.
-  None of this is an OS sandbox: a plugin can still open its own socket, which is
-  why phase 3 replaces the transport and adds OS isolation (ADR-019).
+- **Enforcement status (phase 2.2):** `net.fetch` and `secret.use` are enforced by
+  the host broker: the plugin's per-run token, the active grant for its exact
+  version, the declared scope and the SSRF/redirect policy are checked before a
+  socket is opened, and every allow/deny is audited. The other capabilities
+  (`fs.read`, `schedule.request`, `catalog.write`, `blob.*`) are still disclosure
+  + grants; they do not have a runtime broker yet. None of this is an OS
+  sandbox: a plugin can still open its own socket, which is why phase 3 replaces
+  the transport and adds OS isolation (ADR-019).
 
 ## Broker: `net.fetch` (phase 2.1)
 
@@ -153,11 +153,59 @@ survive:
 {"status": 200, "content_type": "application/json", "body_b64": "eyJ..."}
 ```
 
-The plugin SDK offers `BrokerClient::from_env()` and `fetch_json()`. A missing
-grant, an out-of-scope host/method, a forbidden header or a non-public
-destination is a `403`; invalid input is `400`; upstream/timeout conditions are
-`503`. The legacy `/api/v1/plugin-proxy` endpoint remains for old storage plugins;
-new code should use the broker.
+The plugin SDK offers `BrokerClient::from_env()`, `fetch_json()` and
+`fetch_with_secret()`. A missing grant, an out-of-scope host/method, a forbidden
+header or a non-public destination is a `403`; invalid input is `400`;
+upstream/timeout conditions are `503`. The legacy `/api/v1/plugin-proxy` endpoint
+remains for old storage plugins; new code should use the broker.
+
+## Broker: `secret.use` (phase 2.2)
+
+A plugin never receives a credential. It names a handle in the broker request:
+
+```json
+{"url": "https://api.example.com/vod", "method": "GET",
+ "headers": {"accept": "application/json"}, "secret": "api-key"}
+```
+
+The manifest declares where the host may inject it:
+
+```json
+{
+  "name": "secret.use",
+  "scope": {
+    "handles": ["api-key"],
+    "hosts": ["api.example.com"],
+    "inject": "header",
+    "name": "X-Api-Key",
+    "prefix": ""
+  }
+}
+```
+
+Admins store the value (never returned by any API) with:
+
+```text
+PUT    /api/v1/plugins/:id/secrets/:handle    {"value":"..."}
+GET    /api/v1/plugins/:id/secrets            # handles and timestamps only
+DELETE /api/v1/plugins/:id/secrets/:handle
+```
+
+Rules the host enforces:
+
+- the `secret.use` grant must be active for the plugin's exact version;
+- the handle and destination host must be in the granted scope;
+- `inject` is `header` (default name `Authorization`, default prefix `Bearer `)
+  or `query` (GET only); the plugin may not already set the same header/param;
+- a request using a secret may not follow redirects, so the credential cannot be
+  forwarded to a host outside the scope;
+- the value is injected after the `net.fetch` scope check and before the socket;
+  the audit row records the handle and host, never the value.
+
+Storage caveat: values live in the local SQLite database protected by the OS
+account boundary. Encryption at rest is a follow-up; the guarantee this phase
+makes is that the **plugin never reads the value**, not that an attacker with
+the host's data directory cannot.
 
 ### Reference collector (phase 2.1)
 
