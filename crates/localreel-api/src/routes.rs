@@ -4505,6 +4505,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_rejects_a_non_ascii_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "upload-demo", "0.1.0");
+        let bytes = std::fs::read(&package).unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/plugins/packages/upload")
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .header("x-localreel-csrf", csrf)
+            .header(
+                "x-localreel-publisher",
+                HeaderValue::from_bytes(b"acme\x80").unwrap(),
+            )
+            .body(Body::from(bytes))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_header");
+    }
+
+    #[tokio::test]
     async fn package_stage_rejects_a_digest_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let package = test_package(dir.path(), "stage-demo", "0.1.0");
