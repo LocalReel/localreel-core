@@ -4533,6 +4533,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_rejects_an_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/plugins/packages/upload")
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .header("x-localreel-csrf", csrf)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "empty_package");
+    }
+
+    #[tokio::test]
     async fn package_stage_rejects_a_digest_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let package = test_package(dir.path(), "stage-demo", "0.1.0");
