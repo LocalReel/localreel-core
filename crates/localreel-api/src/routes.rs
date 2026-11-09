@@ -2577,6 +2577,171 @@ mod tests {
             .unwrap()
     }
 
+    /// Two episodes of one show plus a movie that must not become a show.
+    fn seed_series(state: &AppState, dir: &std::path::Path) -> (i64, i64) {
+        let library = dir.join("series");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = state.media.add_source(library.to_str().unwrap()).unwrap();
+        let now = localreel_kernel::time::now_secs();
+        state
+            .db
+            .with_write(|connection| {
+                let mut ids = Vec::new();
+                for (uid, episode, thumbnail) in
+                    [("ep1", Some(1), None), ("ep2", Some(2), Some("ep2.jpg"))]
+                {
+                    connection.execute(
+                        "INSERT INTO media (uid, source_id, uri, canonical_path, filename,
+                             duration, thumbnail_path, series_key, series_title, episode,
+                             file_size, modified_at, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?3, ?4, 100.0, ?5, 'd:/library/show', 'Show', ?6,
+                             0, 0, ?7, ?7)",
+                        (
+                            uid,
+                            source.id,
+                            format!("file:///{uid}.mp4"),
+                            format!("{uid}.mp4"),
+                            thumbnail,
+                            episode,
+                            now,
+                        ),
+                    )?;
+                    ids.push(connection.last_insert_rowid());
+                }
+                // A movie is a row without a series_key.
+                connection.execute(
+                    "INSERT INTO media (uid, source_id, uri, canonical_path, filename,
+                         duration, file_size, modified_at, created_at, updated_at)
+                     VALUES ('movie', ?1, 'file:///movie.mp4', 'file:///movie.mp4', 'movie.mp4',
+                         120.0, 0, 0, ?2, ?2)",
+                    (source.id, now),
+                )?;
+                Ok((ids[0], ids[1]))
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn series_endpoints_group_the_flat_media_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let (first, second) = seed_series(&state, dir.path());
+        // The owner watched the first episode; the second has the thumbnail.
+        state
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media_state (
+                         media_id, user_id, liked, favorite, position, duration, updated_at
+                     ) VALUES (?1, 1, 0, 0, 96.0, 100.0, 10)",
+                    [first],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/series", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["total"], 1, "the movie is not a show");
+        let show = &page["items"][0];
+        let id = localreel_media::series::series_id("d:/library/show");
+        assert_eq!(show["id"], id);
+        assert_eq!(show["key"], "d:/library/show");
+        assert_eq!(show["title"], "Show");
+        assert_eq!(show["episode_count"], 2);
+        assert_eq!(show["watched_count"], 1);
+        assert_eq!(show["last_media_id"], first);
+        assert_eq!(show["poster_media_id"], second);
+        assert_eq!(show["thumbnail_path"], "ep2.jpg");
+        assert_eq!(show["last_position"], 96.0);
+
+        let response = app
+            .oneshot(request_as(&format!("/api/v1/series/{id}"), &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["series"]["episode_count"], 2);
+        let episodes = detail["episodes"].as_array().unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0]["episode"], 1);
+        assert_eq!(episodes[0]["series_id"], id);
+        assert_eq!(episodes[1]["episode"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_series_is_a_json_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_as("/api/v1/series/0000000000000000", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "not_found");
+        assert_eq!(
+            error["error"]["message"],
+            "series 0000000000000000 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_serves_html_routes_and_json_404s_for_api_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state(dir.path()));
+
+        let mut html_request = request("/library/42");
+        html_request
+            .headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        let response = app.clone().oneshot(html_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html"));
+
+        let response = app.clone().oneshot(request("/api/v1/nope")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "not_found");
+        assert_eq!(error["error"]["message"], "no such endpoint");
+
+        let response = app.oneshot(request("/library/42")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"not found");
+    }
+
     #[tokio::test]
     async fn tracks_list_the_audio_menu() {
         let dir = tempfile::tempdir().unwrap();

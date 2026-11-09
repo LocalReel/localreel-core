@@ -12,8 +12,9 @@ use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBeha
 
 use crate::model::{
     CacheGcReport, CacheStats, FeedItem, Media, MediaFilter, MediaMetadata, MediaState, ScanIssue,
-    ScanRun, Source, Track,
+    ScanRun, SeriesSummary, Source, Track,
 };
+use crate::series::series_id;
 use crate::storage::StorageRegistry;
 use crate::tracks::normalize_language;
 
@@ -435,7 +436,7 @@ impl MediaService {
                 "SELECT id, uid, source_id, uri, canonical_path, filename, title,
                         duration, width, height, file_size, modified_at, video_codec,
                         audio_codec, bitrate, thumbnail_path, missing_at, created_at,
-                        updated_at
+                        updated_at, series_key, series_title, episode
                  FROM media
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?1 OFFSET ?2",
@@ -515,7 +516,8 @@ impl MediaService {
                 "SELECT m.id, m.uid, m.source_id, m.uri, m.canonical_path, m.filename,
                         m.title, m.duration, m.width, m.height, m.file_size, m.modified_at,
                         m.video_codec, m.audio_codec, m.bitrate, m.thumbnail_path,
-                        m.missing_at, m.created_at, m.updated_at
+                        m.missing_at, m.created_at, m.updated_at, m.series_key,
+                        m.series_title, m.episode
                  {from} {where_clause}
                  ORDER BY {order}
                  LIMIT ? OFFSET ?"
@@ -530,6 +532,75 @@ impl MediaService {
             }
             Ok((media, total))
         })
+    }
+
+    /// Shows for one account, newest activity first.
+    ///
+    /// A show is a normalized parent directory (`media.series_key`); rows
+    /// without one are movies and stay out. The id is derived from the key, so
+    /// it survives rescans and a rebuilt database.
+    pub fn list_series(&self, user_id: i64) -> Result<Vec<SeriesSummary>> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.series_key, m.series_title, m.episode, m.id, m.duration,
+                        m.thumbnail_path, m.updated_at, s.position, s.duration, s.updated_at
+                 FROM media m
+                 LEFT JOIN media_state s ON s.media_id = m.id AND s.user_id = ?1
+                 WHERE m.series_key IS NOT NULL",
+            )?;
+            let rows = statement.query_map([user_id], |row| {
+                Ok(SeriesEpisode {
+                    key: row.get(0)?,
+                    series_title: row.get(1)?,
+                    episode: row.get(2)?,
+                    media_id: row.get(3)?,
+                    media_duration: row.get(4)?,
+                    thumbnail_path: row.get(5)?,
+                    media_updated_at: row.get(6)?,
+                    position: row.get(7)?,
+                    state_duration: row.get(8)?,
+                    state_updated_at: row.get(9)?,
+                })
+            })?;
+            let mut episodes = Vec::new();
+            for row in rows {
+                episodes.push(row?);
+            }
+            Ok(group_series(episodes))
+        })
+    }
+
+    /// One show plus its episodes in episode order (specials/movies last).
+    pub fn series_detail(
+        &self,
+        user_id: i64,
+        series_id: &str,
+    ) -> Result<Option<(SeriesSummary, Vec<Media>)>> {
+        let summaries = self.list_series(user_id)?;
+        let Some(summary) = summaries
+            .into_iter()
+            .find(|summary| summary.id == series_id)
+        else {
+            return Ok(None);
+        };
+        let episodes = self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, uid, source_id, uri, canonical_path, filename, title,
+                        duration, width, height, file_size, modified_at, video_codec,
+                        audio_codec, bitrate, thumbnail_path, missing_at, created_at,
+                        updated_at, series_key, series_title, episode
+                 FROM media
+                 WHERE series_key = ?1
+                 ORDER BY episode IS NULL, episode, id",
+            )?;
+            let rows = statement.query_map([&summary.key], row_to_media)?;
+            let mut media = Vec::new();
+            for row in rows {
+                media.push(row?);
+            }
+            Ok(media)
+        })?;
+        Ok(Some((summary, episodes)))
     }
 
     /// Ranked feed: continue-watching first, then unwatched episodes in series
@@ -944,7 +1015,7 @@ impl MediaService {
                     "SELECT id, uid, source_id, uri, canonical_path, filename, title,
                             duration, width, height, file_size, modified_at, video_codec,
                             audio_codec, bitrate, thumbnail_path, missing_at, created_at,
-                            updated_at
+                            updated_at, series_key, series_title, episode
                      FROM media WHERE id = ?1",
                     [id],
                     row_to_media,
@@ -964,7 +1035,7 @@ impl MediaService {
                     "SELECT id, uid, source_id, uri, canonical_path, filename, title,
                             duration, width, height, file_size, modified_at, video_codec,
                             audio_codec, bitrate, thumbnail_path, missing_at, created_at,
-                            updated_at
+                            updated_at, series_key, series_title, episode
                      FROM media WHERE uid = ?1",
                     [uid],
                     row_to_media,
@@ -1418,6 +1489,8 @@ fn row_to_track(row: &Row<'_>) -> rusqlite::Result<Track> {
 }
 
 fn row_to_media(row: &Row<'_>) -> rusqlite::Result<Media> {
+    let series_key: Option<String> = row.get(19)?;
+    let series_id = series_key.as_deref().map(series_id);
     Ok(Media {
         id: row.get(0)?,
         uid: row.get(1)?,
@@ -1438,7 +1511,147 @@ fn row_to_media(row: &Row<'_>) -> rusqlite::Result<Media> {
         missing_at: row.get(16)?,
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
+        series_key,
+        series_title: row.get(20)?,
+        episode: row.get(21)?,
+        series_id,
     })
+}
+
+/// One episode row as seen by the series grouping.
+struct SeriesEpisode {
+    key: String,
+    series_title: Option<String>,
+    episode: Option<i64>,
+    media_id: i64,
+    media_duration: Option<f64>,
+    thumbnail_path: Option<String>,
+    media_updated_at: i64,
+    position: Option<f64>,
+    state_duration: Option<f64>,
+    state_updated_at: Option<i64>,
+}
+
+/// Group one account's episode rows into show summaries.
+fn group_series(episodes: Vec<SeriesEpisode>) -> Vec<SeriesSummary> {
+    let mut groups: HashMap<String, Vec<SeriesEpisode>> = HashMap::new();
+    for episode in episodes {
+        groups.entry(episode.key.clone()).or_default().push(episode);
+    }
+    let mut summaries: Vec<SeriesSummary> = groups
+        .into_iter()
+        .map(|(key, mut episodes)| build_series_summary(&key, &mut episodes))
+        .collect();
+    // Newest activity first, then title; the key only breaks exact ties so the
+    // order stays stable across calls.
+    summaries.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    summaries
+}
+
+fn build_series_summary(key: &str, episodes: &mut [SeriesEpisode]) -> SeriesSummary {
+    debug_assert!(!episodes.is_empty(), "a series group is never empty");
+    // `episode IS NULL` sorts first in SQLite, which would put specials before
+    // the show, so order explicitly: numbered episodes ascending, then
+    // specials/movies by id.
+    episodes.sort_by_key(|episode| {
+        (
+            episode.episode.is_none(),
+            episode.episode.unwrap_or(0),
+            episode.media_id,
+        )
+    });
+    let title = episodes
+        .iter()
+        .find_map(|episode| {
+            episode
+                .series_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| series_title_from_key(key));
+    let watched_count = episodes
+        .iter()
+        .filter(|episode| {
+            let Some(position) = episode.position else {
+                return false;
+            };
+            let duration = episode.state_duration.unwrap_or(0.0);
+            position > 0.0 && (duration <= 0.0 || position / duration >= 0.95)
+        })
+        .count() as i64;
+    // The most recently touched episode; the episode number only breaks a tie
+    // between two states written in the same second.
+    let latest_state = episodes
+        .iter()
+        .filter_map(|episode| {
+            episode
+                .state_updated_at
+                .map(|updated_at| (updated_at, episode))
+        })
+        .min_by_key(|(updated_at, episode)| {
+            (
+                std::cmp::Reverse(*updated_at),
+                episode.episode.is_none(),
+                episode.episode.unwrap_or(0),
+                episode.media_id,
+            )
+        });
+    let (last_media_id, last_position, last_duration) = match latest_state {
+        Some((_, episode)) => (
+            episode.media_id,
+            episode.position.unwrap_or(0.0),
+            episode.state_duration.unwrap_or(0.0),
+        ),
+        None => {
+            // Nothing watched yet: point at the first episode with the media
+            // row's duration so the client can render a progress bar.
+            let first = &episodes[0];
+            (first.media_id, 0.0, first.media_duration.unwrap_or(0.0))
+        }
+    };
+    let poster = episodes
+        .iter()
+        .find(|episode| {
+            episode
+                .thumbnail_path
+                .as_deref()
+                .is_some_and(|path| !path.is_empty())
+        })
+        .unwrap_or(&episodes[0]);
+    SeriesSummary {
+        id: series_id(key),
+        key: key.to_string(),
+        title,
+        episode_count: episodes.len() as i64,
+        watched_count,
+        last_media_id,
+        last_position,
+        last_duration,
+        poster_media_id: poster.media_id,
+        thumbnail_path: poster.thumbnail_path.clone(),
+        updated_at: episodes
+            .iter()
+            .map(|episode| episode.media_updated_at)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+/// Fallback title: the last segment of the normalized directory key.
+fn series_title_from_key(key: &str) -> String {
+    key.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(key)
+        .trim()
+        .to_string()
 }
 
 fn is_safe_variant_name(name: &str) -> bool {
@@ -2249,5 +2462,267 @@ mod tests {
         assert!(service
             .patch_state(1, id, None, None, Some(f64::NAN), None)
             .is_err());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_episode(
+        service: &MediaService,
+        source_id: i64,
+        uid: &str,
+        series_key: Option<&str>,
+        series_title: Option<&str>,
+        episode: Option<i64>,
+        duration: Option<f64>,
+        thumbnail_path: Option<&str>,
+        updated_at: i64,
+    ) -> i64 {
+        service
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "INSERT INTO media (
+                         uid, source_id, uri, canonical_path, filename, duration,
+                         thumbnail_path, series_key, series_title, episode, file_size,
+                         modified_at, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?10)",
+                    params![
+                        uid,
+                        source_id,
+                        format!("file:///series/{uid}.mp4"),
+                        format!("{uid}.mp4"),
+                        duration,
+                        thumbnail_path,
+                        series_key,
+                        series_title,
+                        episode,
+                        updated_at,
+                    ],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap()
+    }
+
+    fn save_watch(
+        service: &MediaService,
+        user_id: i64,
+        media_id: i64,
+        position: f64,
+        duration: f64,
+        updated_at: i64,
+    ) {
+        service
+            .db
+            .with_write(|connection| {
+                // `save_state` stamps `now`, and these tests need two different
+                // timestamps within the same second.
+                connection.execute(
+                    "INSERT INTO media_state (
+                         media_id, user_id, liked, favorite, position, duration, updated_at
+                     ) VALUES (?1, ?2, 0, 0, ?3, ?4, ?5)",
+                    params![media_id, user_id, position, duration, updated_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn groups_episodes_into_series_with_per_account_progress() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+
+        let alpha1 = insert_episode(
+            &service,
+            source.id,
+            "alpha-1",
+            Some("d:/library/alpha"),
+            Some("Alpha"),
+            Some(1),
+            Some(100.0),
+            None,
+            300,
+        );
+        let alpha2 = insert_episode(
+            &service,
+            source.id,
+            "alpha-2",
+            Some("d:/library/alpha"),
+            Some("Alpha"),
+            Some(2),
+            Some(100.0),
+            Some("alpha-2.jpg"),
+            300,
+        );
+        insert_episode(
+            &service,
+            source.id,
+            "alpha-3",
+            Some("d:/library/alpha"),
+            Some("Alpha"),
+            Some(3),
+            Some(100.0),
+            None,
+            300,
+        );
+        let beta1 = insert_episode(
+            &service,
+            source.id,
+            "beta-1",
+            Some("d:/library/beta"),
+            None,
+            Some(1),
+            Some(50.0),
+            None,
+            200,
+        );
+        // A movie has no series_key and must never appear as a show.
+        insert_episode(
+            &service,
+            source.id,
+            "movie",
+            None,
+            None,
+            None,
+            Some(120.0),
+            None,
+            999,
+        );
+
+        // Account 1 finished episode 1 (95% is the bar) and is 40% into
+        // episode 2, which it opened last.
+        save_watch(&service, 1, alpha1, 95.0, 100.0, 10);
+        save_watch(&service, 1, alpha2, 40.0, 100.0, 20);
+
+        let series = service.list_series(1).unwrap();
+        assert_eq!(series.len(), 2, "movies are not shows");
+        // Newest activity first: alpha's media rows are newer than beta's.
+        let alpha = &series[0];
+        assert_eq!(alpha.key, "d:/library/alpha");
+        assert_eq!(alpha.id, crate::series::series_id("d:/library/alpha"));
+        assert_eq!(alpha.id.len(), 16);
+        assert_eq!(alpha.title, "Alpha");
+        assert_eq!(alpha.episode_count, 3);
+        assert_eq!(alpha.watched_count, 1);
+        assert_eq!(alpha.last_media_id, alpha2, "most recently touched wins");
+        assert_eq!(alpha.last_position, 40.0);
+        assert_eq!(alpha.last_duration, 100.0);
+        assert_eq!(alpha.poster_media_id, alpha2);
+        assert_eq!(alpha.thumbnail_path.as_deref(), Some("alpha-2.jpg"));
+        assert_eq!(alpha.updated_at, 300);
+
+        let beta = &series[1];
+        // The title falls back to the last segment of the key.
+        assert_eq!(beta.title, "beta");
+        assert_eq!(beta.episode_count, 1);
+        assert_eq!(beta.last_media_id, beta1);
+        assert_eq!(beta.last_position, 0.0);
+        assert_eq!(beta.last_duration, 50.0);
+
+        // Another account has no progress: every show starts at its first
+        // episode, and nothing is watched.
+        let fresh = service.list_series(2).unwrap();
+        let alpha = fresh
+            .iter()
+            .find(|show| show.key.ends_with("/alpha"))
+            .unwrap();
+        assert_eq!(alpha.watched_count, 0);
+        assert_eq!(alpha.last_media_id, alpha1);
+        assert_eq!(alpha.last_position, 0.0);
+        assert_eq!(alpha.last_duration, 100.0);
+        assert_eq!(alpha.thumbnail_path.as_deref(), Some("alpha-2.jpg"));
+    }
+
+    #[test]
+    fn series_detail_orders_episodes_and_rejects_unknown_ids() {
+        let (dir, service) = setup();
+        let source_dir = dir.path().join("videos");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = service.add_source(source_dir.to_str().unwrap()).unwrap();
+
+        let three = insert_episode(
+            &service,
+            source.id,
+            "show-3",
+            Some("d:/library/show"),
+            Some("Show"),
+            Some(3),
+            Some(60.0),
+            None,
+            300,
+        );
+        let one = insert_episode(
+            &service,
+            source.id,
+            "show-1",
+            Some("d:/library/show"),
+            Some("Show"),
+            Some(1),
+            Some(60.0),
+            Some("show-1.jpg"),
+            300,
+        );
+        let two = insert_episode(
+            &service,
+            source.id,
+            "show-2",
+            Some("d:/library/show"),
+            Some("Show"),
+            Some(2),
+            Some(60.0),
+            None,
+            300,
+        );
+        // A special has no episode number and sorts last.
+        let special = insert_episode(
+            &service,
+            source.id,
+            "show-sp",
+            Some("d:/library/show"),
+            Some("Show"),
+            None,
+            Some(30.0),
+            None,
+            300,
+        );
+        insert_episode(
+            &service,
+            source.id,
+            "other-1",
+            Some("d:/library/other"),
+            Some("Other"),
+            Some(1),
+            Some(60.0),
+            None,
+            200,
+        );
+
+        let id = crate::series::series_id("d:/library/show");
+        let (summary, episodes) = service.series_detail(1, &id).unwrap().unwrap();
+        assert_eq!(summary.episode_count, 4);
+        let ids: Vec<i64> = episodes.iter().map(|media| media.id).collect();
+        assert_eq!(ids, vec![one, two, three, special]);
+        // The new fields round-trip through `row_to_media`.
+        assert_eq!(episodes[0].series_key.as_deref(), Some("d:/library/show"));
+        assert_eq!(episodes[0].series_title.as_deref(), Some("Show"));
+        assert_eq!(episodes[0].episode, Some(1));
+        assert_eq!(episodes[0].series_id.as_deref(), Some(id.as_str()));
+
+        let stored = service.get_media(one).unwrap().unwrap();
+        assert_eq!(stored.series_key.as_deref(), Some("d:/library/show"));
+        assert_eq!(stored.episode, Some(1));
+        assert_eq!(stored.series_id.as_deref(), Some(id.as_str()));
+        let listed = service.list_media(10, 0).unwrap();
+        assert_eq!(listed.len(), 5);
+        assert!(listed
+            .iter()
+            .all(|media| media.series_id.is_some() == media.series_key.is_some()));
+
+        assert!(service
+            .series_detail(1, "0000000000000000")
+            .unwrap()
+            .is_none());
     }
 }

@@ -33,6 +33,22 @@ pub struct SeriesInfo {
     pub is_extra: bool,
 }
 
+/// Stable 16-hex-char id for a series key (FNV-1a 64-bit).
+///
+/// A show is addressed by its derived key, not by a database id, so the id has
+/// to survive rescans and a rebuilt database. FNV-1a gives that without a
+/// hashing dependency; the output is an identifier, not a security primitive.
+pub fn series_id(key: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// Derive series metadata from a canonical file path and its file name.
 pub fn derive(canonical_path: &str, filename: &str) -> SeriesInfo {
     let normalized = canonical_path.replace('\\', "/");
@@ -271,6 +287,17 @@ mod tests {
         assert!(is_extra("CM.mkv", "SPs"));
         assert!(is_extra("Menu.mkv", "SPs"));
         assert!(!is_extra("[VCB-Studio] Title [12][1080p].mkv", "Title"));
+    }
+
+    #[test]
+    fn series_ids_are_stable_and_distinct() {
+        let id = series_id("d:/library/flip flapper");
+        assert_eq!(id, series_id("d:/library/flip flapper"));
+        assert_eq!(id.len(), 16);
+        assert!(id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()));
+        assert_ne!(id, series_id("d:/library/another show"));
     }
 
     #[test]

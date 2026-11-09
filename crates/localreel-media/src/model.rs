@@ -100,6 +100,33 @@ pub struct Media {
     pub missing_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Normalized parent directory shared by the episodes of one show.
+    pub series_key: Option<String>,
+    /// Human-readable show title, when the scanner could derive one.
+    pub series_title: Option<String>,
+    /// Episode number parsed from the filename; `None` for movies and specials.
+    pub episode: Option<i64>,
+    /// Stable short identifier for `series_key` (16 lowercase hex chars).
+    pub series_id: Option<String>,
+}
+
+/// One show of the library, grouped by `media.series_key`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesSummary {
+    pub id: String,
+    pub key: String,
+    pub title: String,
+    pub episode_count: i64,
+    /// Episodes of this show the calling account has watched (>=95%).
+    pub watched_count: i64,
+    /// The episode this account touched most recently (else the first one).
+    pub last_media_id: i64,
+    pub last_position: f64,
+    pub last_duration: f64,
+    /// An episode that has a thumbnail, used as the show poster.
+    pub poster_media_id: i64,
+    pub thumbnail_path: Option<String>,
+    pub updated_at: i64,
 }
 
 /// One item of the scrollable feed.

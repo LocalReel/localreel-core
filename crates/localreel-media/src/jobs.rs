@@ -1247,6 +1247,10 @@ exit 0
             missing_at: None,
             created_at: 0,
             updated_at: 0,
+            series_key: None,
+            series_title: None,
+            episode: None,
+            series_id: None,
         }
     }
 }

@@ -237,6 +237,10 @@ mod tests {
             missing_at: None,
             created_at: 1,
             updated_at: 1,
+            series_key: None,
+            series_title: None,
+            episode: None,
+            series_id: None,
         }
     }
 
