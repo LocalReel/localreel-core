@@ -415,6 +415,12 @@ expected `sha256` and copies the verified package to
 record. It still does not edit the config or start the plugin, so a bad stage
 can be deleted without touching a running generation.
 
+`POST /api/v1/plugins/packages/upload` takes the same optional
+`publisher`/`signature`/`sha256` as query parameters and the raw `.lrplug` bytes
+as the body (64 MiB cap). It writes a temporary file under
+`data/plugins/packages/.uploads`, runs the same stage checks, and removes the
+temporary file whether staging succeeds or fails.
+
 `GET /api/v1/plugins/packages` lists staged versions by reading those metadata
 files. `DELETE /api/v1/plugins/packages/<id>/<version>` removes one, but answers
 `409 package_in_use` when a configured plugin's package path resolves to it.

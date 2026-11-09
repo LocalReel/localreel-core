@@ -112,6 +112,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(inspect_plugin_package),
         )
         .route("/api/v1/plugins/packages/stage", post(stage_plugin_package))
+        .route(
+            "/api/v1/plugins/packages/upload",
+            post(upload_plugin_package).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/v1/plugins/packages", get(list_staged_packages))
         .route(
             "/api/v1/plugins/packages/install",
@@ -996,6 +1000,63 @@ async fn stage_plugin_package(
         "sha256": sha256,
         "signature_verified": signature_verified,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadPackageQuery {
+    publisher: Option<String>,
+    signature: Option<String>,
+    sha256: Option<String>,
+}
+
+/// Upload a `.lrplug` body and reuse the path-based stage checks. The temporary
+/// upload is always removed, including when validation fails.
+async fn upload_plugin_package(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+    Query(query): Query<UploadPackageQuery>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "empty_package",
+            "the request body is empty",
+        ));
+    }
+    let uploads = state
+        .plugins
+        .install_root()
+        .join("packages")
+        .join(".uploads");
+    std::fs::create_dir_all(&uploads).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload_failed",
+            format!("cannot create the upload directory: {error}"),
+        )
+    })?;
+    let temporary = uploads.join(format!("{}.lrplug", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, &body).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload_failed",
+            format!("cannot store the upload: {error}"),
+        )
+    })?;
+    let result = stage_plugin_package(
+        State(state),
+        Extension(current),
+        Json(StagePackageRequest {
+            path: temporary.to_string_lossy().into_owned(),
+            publisher: query.publisher,
+            signature: query.signature,
+            sha256: query.sha256,
+        }),
+    )
+    .await;
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 async fn list_staged_packages(
@@ -4371,6 +4432,42 @@ mod tests {
                 && entry.result.as_deref() == Some("rejected")
                 && entry.user_id.is_some()),
             "{entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_stages_the_request_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "upload-demo", "0.1.0");
+        let bytes = std::fs::read(&package).unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/plugins/packages/upload")
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .header("x-localreel-csrf", csrf)
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["manifest"]["id"], "upload-demo");
+        assert!(dir
+            .path()
+            .join("plugins/packages/upload-demo/0.1.0.lrplug")
+            .is_file());
+        let uploads = dir.path().join("plugins/packages/.uploads");
+        assert_eq!(
+            std::fs::read_dir(&uploads)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0
         );
     }
 
