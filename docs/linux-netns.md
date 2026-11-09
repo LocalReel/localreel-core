@@ -22,12 +22,15 @@ Validated in WSL (Alpine, Rust 1.88, util-linux `unshare`):
 - The Rust runtime test
   `appcontainer_denies_the_plugins_own_socket` passes on Linux: the plugin sees
   `net: blocked` for `1.1.1.1:80`.
+- `linux_isolation_uses_a_network_namespace` asserts the exact
+  `unshare -Urn -- <program> <args>` command.
 - `cargo clippy -p localreel-plugin --all-targets -- -D warnings` is clean.
 
 Other loopback-fixture runtime tests in this WSL image fail with connection
-refused / HTTP health timeouts; that is an environment issue (Docker Desktop WSL
-networking), not the netns path. The Windows AppContainer path has the full
-runtime/full-chain coverage.
+refused / HTTP health timeouts. Diagnosis: `netstat` shows the plugin
+`LISTEN 127.0.0.1:<port>`, while `wget` in the same shell gets connection
+refused; this is Docker Desktop WSL networking, not the netns path. The Windows
+AppContainer path has the full runtime/full-chain coverage.
 
 ## Limits
 

@@ -737,6 +737,33 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_isolation_uses_a_network_namespace() {
+        let sandbox = PluginSandbox {
+            working_dir: Some(std::path::PathBuf::from("data/plugins/example")),
+            roots: Vec::new(),
+            host_url: None,
+            limits: Default::default(),
+            app_container: true,
+            sandbox_program: None,
+        };
+        let command = linux_netns_command(
+            Path::new("pkg/plugin"),
+            &manifest(None),
+            "token",
+            "{}",
+            &sandbox,
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), "unshare");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["-Urn", "--", "pkg/plugin", "--flag"]);
+    }
+
     #[test]
     fn roots_are_passed_as_json() {
         let sandbox = PluginSandbox {
