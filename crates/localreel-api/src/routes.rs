@@ -565,7 +565,8 @@ async fn patch_admin_config(
         Some(&current.user.username),
         "config.allow_remote",
         Some(if allow_remote { "on" } else { "off" }),
-        Some(&path.to_string_lossy()),
+        // The file path is noise in a list; the settings panel already names it.
+        None,
     );
     Ok(Json(serde_json::json!({
         "allow_remote": allow_remote,
