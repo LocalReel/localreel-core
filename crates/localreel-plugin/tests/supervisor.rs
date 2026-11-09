@@ -49,11 +49,15 @@ impl ProviderSink for TestSink {
 }
 
 fn build_package(path: &Path) {
+    build_package_version(path, "0.1.0");
+}
+
+fn build_package_version(path: &Path, version: &str) {
     let program = format!("bin/plugin-demo{}", std::env::consts::EXE_SUFFIX);
     let manifest = json!({
         "id": "demo",
         "name": "Reference storage plugin",
-        "version": "0.1.0",
+        "version": version,
         "api_version": localreel_plugin::API_VERSION,
         "kind": "storage",
         "entry": { "program": program, "args": [] },
@@ -247,6 +251,37 @@ fn an_unreadable_package_is_a_reported_failure_not_a_crash() {
     // a fatal error.
     let failures: Vec<PluginFailure> = host.start(Vec::new(), sink);
     assert!(failures.is_empty());
+}
+
+#[test]
+fn replacing_a_running_plugin_starts_the_new_version() {
+    let fixture = fixture();
+    wait_for(
+        &fixture.host,
+        "demo",
+        "the 0.1.0 generation",
+        Duration::from_secs(10),
+        |descriptor| descriptor.version == "0.1.0" && descriptor.state.is_running(),
+    );
+
+    let package = fixture._dir.path().join("demo-0.2.0.lrplug");
+    build_package_version(&package, "0.2.0");
+    let manifest = inspect(&package).unwrap();
+    let spec = PluginSpec::new(
+        package,
+        manifest,
+        json!({ "root": fixture._dir.path().join("library") }),
+        true,
+    );
+    fixture.host.replace(spec).unwrap();
+    let descriptor = wait_for(
+        &fixture.host,
+        "demo",
+        "the 0.2.0 generation",
+        Duration::from_secs(10),
+        |descriptor| descriptor.version == "0.2.0" && descriptor.state.is_running(),
+    );
+    assert!(descriptor.generation >= 2, "{descriptor:?}");
 }
 
 #[test]

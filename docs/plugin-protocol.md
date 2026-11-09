@@ -417,8 +417,7 @@ can be deleted without touching a running generation.
 
 `POST /api/v1/plugins/packages/upload` takes the optional
 `x-localreel-publisher`, `x-localreel-signature` and `x-localreel-sha256`
-headers (the same names as query parameters are still accepted for older
-clients) and the raw `.lrplug` bytes as the body (64 MiB cap). It writes a
+headers and the raw `.lrplug` bytes as the body (64 MiB cap). It writes a
 temporary file under `data/plugins/packages/.uploads`, runs the same stage
 checks, and removes the temporary file whether staging succeeds or fails.
 
@@ -429,10 +428,11 @@ files. `DELETE /api/v1/plugins/packages/<id>/<version>` removes one, but answers
 `POST /api/v1/plugins/packages/install` with `{id, version}` points the matching
 `[[plugins]]` entry at the staged file and updates its `sha256`/`publisher`/
 `signature`; a new id appends an enabled entry. It requires
-`signature_verified: true` in the stage metadata and re-checks the digest, but it
-does **not** start the plugin. The response says `restart_required: true`; after
-a server restart the new generation loads and the version is recorded. Installing
-an older staged version for the same id is the rollback path. Stage, install and
+`signature_verified: true` in the stage metadata and re-checks the digest. When
+the plugin already has a running supervisor entry, the host replaces that entry
+in place and the response reports `restarted: true`; otherwise it reports
+`restart_required: true` and the config change loads on the next server restart.
+Installing an older staged version for the same id is the rollback path. Stage, install and
 unstage append `package.*` rows to the plugin audit trail (`package.stage`,
 `package.install`, `package.unstage`); rejected unsigned, digest, signature,
 config or in-use failures are recorded with `result = "rejected"` and a reason.

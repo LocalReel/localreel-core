@@ -59,6 +59,8 @@ fn notify(sink: &dyn ProviderSink, shared: &Shared, id: &str) {
 pub(crate) enum Intent {
     Restart(String),
     SetEnabled(String, bool),
+    /// Re-run convergence after the host replaced an entry in place.
+    Wake,
     Shutdown,
 }
 
@@ -109,6 +111,7 @@ pub(crate) fn run(
             Ok(Intent::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Intent::Restart(id)) => restart(&shared, &id),
             Ok(Intent::SetEnabled(id, enabled)) => set_enabled(&shared, &id, enabled),
+            Ok(Intent::Wake) => {}
             Err(RecvTimeoutError::Timeout) => {}
         }
         converge(&shared, &sink, Instant::now());

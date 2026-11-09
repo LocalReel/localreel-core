@@ -1002,19 +1002,11 @@ async fn stage_plugin_package(
     })))
 }
 
-#[derive(Debug, Deserialize)]
-struct UploadPackageQuery {
-    publisher: Option<String>,
-    signature: Option<String>,
-    sha256: Option<String>,
-}
-
 /// Upload a `.lrplug` body and reuse the path-based stage checks. The temporary
 /// upload is always removed, including when validation fails.
 async fn upload_plugin_package(
     State(state): State<Arc<AppState>>,
     Extension(current): Extension<CurrentUser>,
-    Query(query): Query<UploadPackageQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1029,9 +1021,9 @@ async fn upload_plugin_package(
             None => Ok(None),
         }
     };
-    let publisher = header("x-localreel-publisher")?.or(query.publisher);
-    let signature = header("x-localreel-signature")?.or(query.signature);
-    let sha256 = header("x-localreel-sha256")?.or(query.sha256);
+    let publisher = header("x-localreel-publisher")?;
+    let signature = header("x-localreel-signature")?;
+    let sha256 = header("x-localreel-sha256")?;
     if body.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1285,13 +1277,40 @@ async fn install_staged_package(
             "the running host has no plugin with that id",
         ));
     }
+    let manifest = localreel_plugin::package::inspect(&package).map_err(|error| {
+        ApiError::new(StatusCode::CONFLICT, "invalid_package", error.to_string())
+    })?;
+    let publisher_keys: Vec<String> = publisher
+        .map(|publisher| {
+            state
+                .config
+                .publishers
+                .iter()
+                .filter(|entry| entry.id == publisher && entry.is_active_at(now_secs()))
+                .map(|entry| entry.public_key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let restarted = match state.plugins.spec(&request.id) {
+        Some(mut spec) => {
+            spec.package = package.clone();
+            spec.manifest = manifest;
+            spec.expected_sha256 = Some(sha256.to_string());
+            spec.publisher = publisher.map(str::to_string);
+            spec.expected_signature = signature.map(str::to_string);
+            spec.publisher_public_keys = publisher_keys;
+            spec.enabled = true;
+            state.plugins.replace(spec).is_ok()
+        }
+        None => false,
+    };
     audit_package_event(
         &state,
         &request.id,
         "package.install",
         "installed",
         &format!(
-            "version={} signature_verified=true restart_required=true",
+            "version={} signature_verified=true hot_restarted={restarted}",
             request.version
         ),
         Some(current.user.id),
@@ -1302,7 +1321,8 @@ async fn install_staged_package(
         "version": request.version,
         "package": package,
         "config": config_path,
-        "restart_required": true,
+        "restarted": restarted,
+        "restart_required": !restarted,
     })))
 }
 
@@ -4378,6 +4398,7 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["restart_required"], true);
+        assert_eq!(value["restarted"], false);
 
         let text = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(text.matches("[[plugins]]").count(), 1, "{text}");

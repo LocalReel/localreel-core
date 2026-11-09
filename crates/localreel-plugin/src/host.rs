@@ -834,6 +834,58 @@ impl PluginHost {
             .map(|entry| entry.descriptor.package.clone())
     }
 
+    /// Copy of the spec the supervisor is using for `id`.
+    pub fn spec(&self, id: &str) -> Option<PluginSpec> {
+        self.shared
+            .read()
+            .entries
+            .get(id)
+            .and_then(|entry| entry.spec.clone())
+    }
+
+    /// Replace one entry in place and let the supervisor stop the old runtime
+    /// and start the new spec on its next pass. Requires an active supervisor.
+    pub fn replace(&self, spec: PluginSpec) -> Result<()> {
+        if self
+            .supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return Err(KernelError::Conflict(
+                "plugin supervision is not running".into(),
+            ));
+        }
+        {
+            let mut inner = self.shared.write();
+            let generation = inner
+                .entries
+                .get(&spec.id)
+                .map(|entry| entry.generation + 1)
+                .unwrap_or(1);
+            inner.entries.insert(
+                spec.id.clone(),
+                Entry {
+                    descriptor: descriptor_for_spec(&spec, PluginState::Starting, None),
+                    desired: Desired::Running,
+                    desired_revision: generation,
+                    running_revision: 0,
+                    generation,
+                    attempts: 0,
+                    permanent: false,
+                    next_attempt: None,
+                    health_failures: 0,
+                    unhealthy_restarts: 0,
+                    last_probe: None,
+                    runtime: None,
+                    gate: None,
+                    spec: Some(spec),
+                },
+            );
+        }
+        self.send(Intent::Wake)
+    }
+
     /// The runtime that presents `token`, if any.
     pub fn authenticate(&self, token: &str) -> Option<Arc<PluginRuntime>> {
         self.shared
