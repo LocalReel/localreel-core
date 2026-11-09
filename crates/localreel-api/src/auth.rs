@@ -35,6 +35,9 @@ pub const CSRF_HEADER: &str = "x-localreel-csrf";
 const PUBLIC_PATHS: &[&str] = &[
     "/api/v1/health",
     "/api/v1/auth/",
+    // A share link is a credential of its own: the token in the path is what
+    // authorises the request, and it reaches exactly one item.
+    "/api/v1/share/",
     "/api/v1/plugin-proxy",
     "/api/v1/plugin-broker/fetch",
     "/api/v1/plugin-broker/fs",

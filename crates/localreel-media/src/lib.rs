@@ -18,6 +18,7 @@ pub mod restore;
 pub mod scan;
 pub mod series;
 pub mod service;
+pub mod share;
 pub mod state_migration;
 pub mod storage;
 pub mod tracks;
@@ -45,6 +46,7 @@ pub use preview::{preview_cues, preview_vtt, tile_size, PreviewCue};
 pub use restore::{restore_backup, RestoreReport};
 pub use scan::{discover_source, discover_source_with_cancel, ScanDiscovery};
 pub use service::{MediaPageQuery, MediaService};
+pub use share::{new_token, Share};
 pub use state_migration::{
     episode_key, migrate_legacy_state, StateMigrationDetail, StateMigrationReport,
 };

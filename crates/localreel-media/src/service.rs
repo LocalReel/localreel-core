@@ -1441,6 +1441,12 @@ impl MediaService {
             Ok(connection.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))?)
         })
     }
+
+    /// The share module lives next door and needs the connection, not the
+    /// storage registry.
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
+    }
 }
 
 fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {

@@ -8,6 +8,7 @@ pub mod auth;
 pub mod error;
 pub mod guard;
 pub mod routes;
+pub mod shares;
 pub mod state;
 pub mod update;
 pub mod update_runtime;

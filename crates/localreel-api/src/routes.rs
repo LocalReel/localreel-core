@@ -55,6 +55,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/setup", post(auth::setup))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
+        // A share link is the only resource an unauthenticated request may
+        // name; it grants read access to one item and nothing else.
+        .route("/api/v1/share/:token", get(crate::shares::meta))
+        .route("/api/v1/share/:token/stream", get(crate::shares::stream))
         // Plugins have no browser session; this one authenticates with the
         // token the host gave the sidecar when it started it.
         .route("/api/v1/plugin-proxy", post(plugin_proxy))
@@ -89,6 +93,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/media/:id/stream",
             get(stream_media).head(head_media),
         )
+        // Share links for one item: any signed-in account may make one, because
+        // it can already watch the item itself.
+        .route(
+            "/api/v1/media/:id/share",
+            post(crate::shares::create).get(crate::shares::list),
+        )
+        .route("/api/v1/shares/:token", delete(crate::shares::revoke))
         .route("/api/v1/events", get(events))
         .nest_service("/thumbnails", thumbnails)
         .nest_service("/transcodes", transcodes)
@@ -2975,7 +2986,7 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
     })
 }
 
-async fn serve_media(
+pub(crate) async fn serve_media(
     state: Arc<AppState>,
     id: i64,
     headers: HeaderMap,
