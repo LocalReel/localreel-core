@@ -1912,6 +1912,7 @@ mod tests {
             permissions: permissions.into_iter().map(str::to_string).collect(),
             capabilities: Vec::new(),
             description: None,
+            icon: None,
         }
     }
 

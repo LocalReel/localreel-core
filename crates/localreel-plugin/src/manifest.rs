@@ -50,6 +50,12 @@ pub struct Manifest {
     pub capabilities: Vec<CapabilityRequest>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional icon, as a path inside the package (`.svg`, `.png` or `.webp`).
+    /// The UI shows it in the plugin list; without one it falls back to a
+    /// monogram. Never an absolute path or a URL: the host reads it from the
+    /// package it already verified.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +152,9 @@ impl Manifest {
             ));
         }
         validate_relative_program(&self.entry.program)?;
+        if let Some(icon) = &self.icon {
+            validate_icon(icon)?;
+        }
         if let Some(runtime) = &self.entry.runtime {
             let valid = !runtime.is_empty()
                 && runtime.len() <= 64
@@ -318,6 +327,25 @@ pub fn validate_relative_program(program: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// An icon is held to the same path rules as the entry program, plus an
+/// extension allowlist: the host reads the file and serves it, so the extension
+/// is what decides the content type the browser will trust.
+pub fn validate_icon(icon: &str) -> Result<(), PluginError> {
+    validate_relative_program(icon).map_err(|_| {
+        PluginError::Manifest("icon must be a relative path inside the package".into())
+    })?;
+    let extension = Path::new(icon)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("svg") | Some("png") | Some("webp") => Ok(()),
+        _ => Err(PluginError::Manifest(
+            "icon must be a .svg, .png or .webp file".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +366,37 @@ mod tests {
             permissions: vec![PERMISSION_NETWORK.into()],
             capabilities: Vec::new(),
             description: None,
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn accepts_an_icon_that_lives_inside_the_package() {
+        let mut item = manifest();
+        item.icon = Some("assets/icon.svg".into());
+        assert!(item.validate().is_ok());
+        item.icon = Some("icon.PNG".into());
+        assert!(
+            item.validate().is_ok(),
+            "the extension check is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn refuses_an_icon_that_escapes_the_package() {
+        for icon in ["../icon.png", "/etc/icon.png", "C:/icon.png", "a\\b.png"] {
+            let mut item = manifest();
+            item.icon = Some(icon.into());
+            assert!(item.validate().is_err(), "{icon} must be refused");
+        }
+    }
+
+    #[test]
+    fn refuses_an_icon_the_browser_would_not_render() {
+        for icon in ["icon.exe", "icon.svg.html", "icon"] {
+            let mut item = manifest();
+            item.icon = Some(icon.into());
+            assert!(item.validate().is_err(), "{icon} must be refused");
         }
     }
 

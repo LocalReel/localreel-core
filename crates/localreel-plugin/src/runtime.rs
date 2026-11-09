@@ -722,6 +722,7 @@ mod tests {
             permissions: vec![],
             capabilities: vec![],
             description: None,
+            icon: None,
         }
     }
 
