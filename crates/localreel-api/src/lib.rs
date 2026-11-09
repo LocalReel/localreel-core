@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod error;
 pub mod guard;
+pub mod rate;
 pub mod routes;
 pub mod shares;
 pub mod state;

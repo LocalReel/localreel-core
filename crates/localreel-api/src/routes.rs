@@ -59,6 +59,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // name; it grants read access to one item and nothing else.
         .route("/api/v1/share/:token", get(crate::shares::meta))
         .route("/api/v1/share/:token/stream", get(crate::shares::stream))
+        .route(
+            "/api/v1/share/:token/download",
+            get(crate::shares::download),
+        )
         // Plugins have no browser session; this one authenticates with the
         // token the host gave the sidecar when it started it.
         .route("/api/v1/plugin-proxy", post(plugin_proxy))

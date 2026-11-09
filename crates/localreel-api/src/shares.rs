@@ -6,18 +6,29 @@
 //!   and nothing else. The token is the only key, so it is random, and the
 //!   handlers here never accept an id in place of one.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::{Extension, Json};
 use localreel_media::CurrentUser;
 use serde::Deserialize;
 
 use crate::error::ApiError;
+use crate::rate::MinuteLimiter;
 use crate::routes::serve_media;
 use crate::state::AppState;
+
+/// Share routes get their own budget: 120 requests per token per minute is far
+/// above a player's needs (one request per range) and far below a scrape.
+const REQUESTS_PER_MINUTE: u32 = 120;
+
+fn limiter() -> &'static MinuteLimiter {
+    static LIMITER: OnceLock<MinuteLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| MinuteLimiter::new(REQUESTS_PER_MINUTE, Duration::from_secs(60)))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateShare {
@@ -42,6 +53,13 @@ fn share_json(share: &localreel_media::Share) -> serde_json::Value {
 fn active_share(state: &AppState, token: &str) -> Result<localreel_media::Share, ApiError> {
     // One answer for "no such link", "expired" and "revoked": an outsider must
     // not learn which of the three applies.
+    if !limiter().check(token) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many requests for this link; try again in a minute",
+        ));
+    }
     let share = state
         .media
         .share_by_token(token)?
@@ -110,6 +128,9 @@ pub async fn meta(
         // Relative on purpose: the page works behind a reverse proxy and a
         // LAN address alike.
         "stream": format!("/api/v1/share/{token}/stream"),
+        "download": share
+            .allow_download
+            .then(|| format!("/api/v1/share/{token}/download")),
     })))
 }
 
@@ -122,4 +143,46 @@ pub async fn stream(
 ) -> Result<Response, ApiError> {
     let share = active_share(&state, &token)?;
     serve_media(state, share.media_id, headers, false).await
+}
+
+/// Saving the file, which a link may forbid.
+///
+/// Playback has to stay a normal inline stream, so the "no download" switch
+/// cannot live on it; a separate endpoint that answers 403 is what makes the
+/// switch real rather than a hidden button.
+pub async fn download(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let share = active_share(&state, &token)?;
+    if !share.allow_download {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "download_forbidden",
+            "this link does not allow downloads",
+        ));
+    }
+    let media = state
+        .media
+        .get_media(share.media_id)?
+        .ok_or_else(|| ApiError::not_found("share link"))?;
+    let name: String = media
+        .filename
+        .chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut response = serve_media(state, share.media_id, headers, false).await?;
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
 }
