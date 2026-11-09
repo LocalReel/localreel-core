@@ -10,6 +10,7 @@ pub mod guard;
 pub mod routes;
 pub mod state;
 pub mod update;
+pub mod update_runtime;
 pub mod web;
 
 pub use routes::router;

@@ -43,6 +43,9 @@ pub struct AppState {
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Last successful remote release check, and when it ran.
     pub update_cache: std::sync::Mutex<Option<crate::update::CachedCheck>>,
+    /// The one-at-a-time self-update: install kind, download progress and the
+    /// verified installer the console can hand to the setup.
+    pub update: crate::update_runtime::Runtime,
 }
 
 /// The pieces the server assembles before it starts serving.
@@ -103,6 +106,7 @@ impl AppState {
             started_at: now_secs(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             update_cache: std::sync::Mutex::new(None),
+            update: crate::update_runtime::Runtime::new(),
         })
     }
 

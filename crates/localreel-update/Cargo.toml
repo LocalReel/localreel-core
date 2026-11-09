@@ -1,0 +1,15 @@
+[package]
+name = "localreel-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Signed update manifests, verified downloads and the installer hand-off"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+ureq = { workspace = true }

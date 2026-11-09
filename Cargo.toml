@@ -7,6 +7,7 @@ members = [
     "crates/localreel-media",
     "crates/localreel-api",
     "crates/localreel-server",
+    "crates/localreel-update",
 ]
 resolver = "2"
 

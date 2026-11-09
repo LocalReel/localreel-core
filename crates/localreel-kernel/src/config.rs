@@ -89,16 +89,19 @@ pub struct Config {
     pub update: UpdateConfig,
 }
 
-/// Remote release checking: a tracker, not an installer.
+/// Remote release checking, and the signed manifest behind the update button.
 ///
 /// `check` is on by default; the request goes to the public GitHub API with a
 /// six second budget at most once per `interval_hours`. `feed` exists for
-/// mirrors and for tests.
+/// mirrors and for tests. `manifest` is the signed `update.json` the download
+/// and install path reads; point it at an internal mirror to keep updates on
+/// the local network.
 #[derive(Debug, Clone)]
 pub struct UpdateConfig {
     pub check: bool,
     pub feed: Option<String>,
     pub interval_hours: u64,
+    pub manifest: Option<String>,
 }
 
 impl Default for UpdateConfig {
@@ -107,6 +110,7 @@ impl Default for UpdateConfig {
             check: true,
             feed: None,
             interval_hours: 24,
+            manifest: None,
         }
     }
 }

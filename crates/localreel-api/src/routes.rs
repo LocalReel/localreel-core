@@ -100,6 +100,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let admin_api = Router::new()
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/update", get(admin_update))
+        .route("/api/v1/admin/update/download", post(update_download))
+        .route("/api/v1/admin/update/apply", post(update_apply))
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
@@ -1766,9 +1768,10 @@ async fn admin_update(
     let current = localreel_kernel::VERSION;
     let config = state.config.update.clone();
     if !config.check {
-        return Ok(Json(
+        return Ok(Json(update_body(
+            &state,
             crate::update::Status::build(false, current, None, None).to_json(),
-        ));
+        )));
     }
 
     let interval = config.interval_hours.saturating_mul(3600) as i64;
@@ -1808,9 +1811,58 @@ async fn admin_update(
         .lock()
         .map(|cache| cache.clone())
         .unwrap_or(None);
-    Ok(Json(
+    Ok(Json(update_body(
+        &state,
         crate::update::Status::build(true, current, cached.as_ref(), error).to_json(),
-    ))
+    )))
+}
+
+/// Add the self-update halves to the release check: what this installation is
+/// and what the download worker is doing.
+fn update_body(state: &AppState, mut body: serde_json::Value) -> serde_json::Value {
+    body["install"] = state.update.install_json();
+    body["download"] = state.update.download_json();
+    body
+}
+
+/// Download and verify the installer for this platform.
+///
+/// Returns as soon as the worker starts; progress is read back from
+/// `GET /api/v1/admin/update`.
+async fn update_download(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let url = state
+        .config
+        .update
+        .manifest
+        .clone()
+        .unwrap_or_else(|| crate::update_runtime::DEFAULT_MANIFEST.to_string());
+    let data_dir = state.config.data_dir.clone();
+    state
+        .update
+        .start(&url, &data_dir)
+        .map_err(|message| ApiError::new(StatusCode::CONFLICT, "update_unavailable", message))?;
+    Ok(Json(state.update.download_json()))
+}
+
+/// Hand the verified installer to the setup, then stop the server.
+///
+/// The setup was spawned with `/wait`, so it blocks until this process is gone;
+/// the shutdown is delayed just long enough for this response to be written.
+async fn update_apply(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .update
+        .apply()
+        .map_err(|message| ApiError::new(StatusCode::CONFLICT, "update_unavailable", message))?;
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        shutdown.notify_one();
+    });
+    Ok(Json(state.update.download_json()))
 }
 
 async fn download_backup(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
