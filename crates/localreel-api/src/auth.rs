@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -26,6 +26,36 @@ pub const SESSION_COOKIE: &str = "localreel_session";
 pub const CSRF_COOKIE: &str = "localreel_csrf";
 pub const CSRF_HEADER: &str = "x-localreel-csrf";
 
+/// The browser that started a session, so the console can tell one apart from
+/// another. It is informational only; nothing authorises on it.
+fn agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Every signed-in browser. Administrators only.
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sessions = state.accounts.list_sessions()?;
+    Ok(Json(serde_json::json!({
+        "items": sessions,
+        "total": sessions.len(),
+    })))
+}
+
+/// End someone else's session (or your own, from another browser).
+pub async fn revoke_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.accounts.revoke_session(&id)? {
+        return Err(ApiError::not_found("session"));
+    }
+    Ok(Json(serde_json::json!({ "revoked": true })))
+}
+
 /// Paths that work without a session: the health probe (launchers use it) and
 /// the auth endpoints themselves (the login page needs them).
 /// Paths reachable without a session.
@@ -34,7 +64,12 @@ pub const CSRF_HEADER: &str = "x-localreel-csrf";
 /// a sidecar has no browser session and never should have one.
 const PUBLIC_PATHS: &[&str] = &[
     "/api/v1/health",
-    "/api/v1/auth/",
+    // The sign-in endpoints, named one by one. `/api/v1/auth/` as a prefix also
+    // covered `/auth/me` and `/auth/logout`, which meant the former answered 500
+    // (no session in the extensions) and the latter skipped the CSRF check.
+    "/api/v1/auth/status",
+    "/api/v1/auth/login",
+    "/api/v1/auth/setup",
     // A share link is a credential of its own: the token in the path is what
     // authorises the request, and it reaches exactly one item.
     "/api/v1/share/",
@@ -103,7 +138,9 @@ pub async fn setup(
         ));
     }
     let user = state.accounts.setup_owner(&body.username, &body.password)?;
-    let session = state.accounts.create_session(user.id)?;
+    let session = state
+        .accounts
+        .create_session_with_agent(user.id, agent(&headers))?;
     Ok(login_response(
         user,
         session.csrf,
@@ -125,7 +162,9 @@ pub async fn login(
     {
         Some(user) => {
             state.login_limiter.clear(peer.ip());
-            let session = state.accounts.create_session(user.id)?;
+            let session = state
+                .accounts
+                .create_session_with_agent(user.id, agent(&headers))?;
             Ok(login_response(
                 user,
                 session.csrf,

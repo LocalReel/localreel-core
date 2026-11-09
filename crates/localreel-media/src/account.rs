@@ -103,6 +103,35 @@ pub struct Session {
     pub expires_at: i64,
 }
 
+/// One signed-in browser, as the console sees it.
+///
+/// The id is a hash of the session token, not the token: it is enough to name a
+/// session and useless as a cookie, so an administrator can revoke a session
+/// without being handed the ability to use it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub user_id: i64,
+    pub username: String,
+    pub role: Role,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub last_seen_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+}
+
+/// The public name of a session: the first 8 bytes of its SHA-256, hex.
+pub fn session_public_id(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Changes an administrator may apply to an account.
 #[derive(Debug, Clone, Default)]
 pub struct UserPatch {
@@ -254,6 +283,96 @@ impl AccountService {
         self.db.with_write(|connection| {
             connection.execute("DELETE FROM sessions WHERE id = ?1", [token])?;
             Ok(())
+        })
+    }
+
+    /// Start a session for a user and remember which browser it belongs to.
+    pub fn create_session_with_agent(
+        &self,
+        user_id: i64,
+        user_agent: Option<&str>,
+    ) -> Result<Session> {
+        let now = now_secs();
+        let session = Session {
+            id: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+            csrf: Uuid::new_v4().simple().to_string(),
+            expires_at: now + SESSION_TTL_SECS,
+        };
+        let id = session.id.clone();
+        let csrf = session.csrf.clone();
+        let expires_at = session.expires_at;
+        let agent = user_agent.map(|agent| agent.chars().take(200).collect::<String>());
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO sessions (id, csrf, user_id, created_at, expires_at, last_seen_at, user_agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6)",
+                params![id, csrf, user_id, now, expires_at, agent],
+            )?;
+            Ok(())
+        })?;
+        Ok(session)
+    }
+
+    /// Every signed-in browser, newest activity first.
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let now = now_secs();
+        let rows = self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT s.id, s.user_id, u.username, u.role, s.created_at, s.expires_at,
+                        s.last_seen_at, s.user_agent
+                 FROM sessions s JOIN users u ON u.id = s.user_id
+                 WHERE s.expires_at > ?1
+                 ORDER BY s.last_seen_at DESC",
+            )?;
+            let rows = statement
+                .query_map([now], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        rows.into_iter()
+            .map(
+                |(token, user_id, username, role, created_at, expires_at, last_seen_at, agent)| {
+                    Ok(SessionInfo {
+                        id: session_public_id(&token),
+                        user_id,
+                        username,
+                        role: Role::parse(&role)?,
+                        created_at,
+                        expires_at,
+                        last_seen_at,
+                        user_agent: agent,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// End one session by its public id. Returns `false` when nothing matched.
+    pub fn revoke_session(&self, public_id: &str) -> Result<bool> {
+        self.db.with_write(|connection| {
+            let mut statement = connection.prepare("SELECT id FROM sessions")?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let Some(token) = ids
+                .into_iter()
+                .find(|token| session_public_id(token) == public_id)
+            else {
+                return Ok(false);
+            };
+            connection.execute("DELETE FROM sessions WHERE id = ?1", [token])?;
+            Ok(true)
         })
     }
 

@@ -24,7 +24,9 @@ pub mod storage;
 pub mod tracks;
 pub mod watch;
 
-pub use account::{AccountService, CurrentUser, Role, Session, User, UserPatch};
+pub use account::{
+    session_public_id, AccountService, CurrentUser, Role, Session, SessionInfo, User, UserPatch,
+};
 pub use backup::{
     export_backup, import_backup, parse_backup, read_backup, read_backup_with_limit, Backup,
     BackupImportReport, BackupState, BackupUser, BACKUP_VERSION, MAX_BACKUP_BYTES,

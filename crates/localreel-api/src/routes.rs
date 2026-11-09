@@ -199,6 +199,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/users/:id",
             patch(auth::update_user).delete(auth::delete_user),
         )
+        .route("/api/v1/admin/sessions", get(auth::list_sessions))
+        .route(
+            "/api/v1/admin/sessions/:id/revoke",
+            post(auth::revoke_session),
+        )
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     let api = public_api
