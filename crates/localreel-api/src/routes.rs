@@ -120,7 +120,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/audit", get(admin_audit))
-        .route("/api/v1/admin/config", get(admin_config))
+        .route(
+            "/api/v1/admin/config",
+            get(admin_config).patch(patch_admin_config),
+        )
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
@@ -477,7 +480,70 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         },
         "scan_watch": config.scan.watch,
         "update_check": config.update.check,
+        // Best effort: the address another device on the same network would
+        // use. None when there is no route out, which is a normal answer for a
+        // machine that is offline.
+        "lan_address": lan_address(config.port),
+        "config_file": config.config_path.as_ref().map(|path| path.to_string_lossy()),
     }))
+}
+
+/// The address a phone on the same network would dial.
+///
+/// Connecting a UDP socket sends nothing; it only asks the routing table which
+/// interface would be used, which is the address that actually works.
+fn lan_address(port: u16) -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.168.0.1:9").ok()?;
+    let address = socket.local_addr().ok()?;
+    let ip = address.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(format!("{ip}:{port}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminConfigPatch {
+    allow_remote: Option<bool>,
+}
+
+/// Turn remote access on or off by editing the configuration file.
+///
+/// The listener is bound at startup, so this cannot take effect now; the answer
+/// says `restart_required` and the console tells the truth rather than pretending.
+async fn patch_admin_config(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+    Json(body): Json<AdminConfigPatch>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(allow_remote) = body.allow_remote else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "nothing to change",
+        ));
+    };
+    let Some(path) = state.config.config_path.clone() else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "no_config_file",
+            "this server was started without a configuration file, so there is nowhere to save this",
+        ));
+    };
+    localreel_kernel::config::set_allow_remote(&path, allow_remote)?;
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "config.allow_remote",
+        Some(if allow_remote { "on" } else { "off" }),
+        Some(&path.to_string_lossy()),
+    );
+    Ok(Json(serde_json::json!({
+        "allow_remote": allow_remote,
+        "restart_required": true,
+        "config_file": path.to_string_lossy(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]

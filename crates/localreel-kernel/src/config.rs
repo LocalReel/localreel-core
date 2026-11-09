@@ -75,6 +75,9 @@ pub struct Config {
     /// Must be explicitly enabled to bind beyond loopback. The default is
     /// local-only, matching the trust model of the previous LocalReel app.
     pub allow_remote: bool,
+    /// Where this configuration was read from, when it came from a file. The
+    /// console writes switches back here so a change survives a restart.
+    pub config_path: Option<PathBuf>,
     /// Origins accepted from a remote browser, on top of the one derived from
     /// its own `Host`. Only meaningful together with `allow_remote`.
     pub allowed_origins: Vec<String>,
@@ -291,6 +294,7 @@ impl Default for Config {
             log_dir,
             web_dir: None,
             allow_remote: false,
+            config_path: None,
             allowed_origins: Vec::new(),
             data_dir: data_dir.clone(),
             jobs: JobsConfig {
@@ -396,6 +400,7 @@ impl Config {
         }
 
         config.resolve_paths(source_path.as_deref());
+        config.config_path = source_path.clone();
         config.validate()?;
         Ok((config, source_path))
     }
@@ -1305,9 +1310,64 @@ fn env_bool(key: &str) -> Result<Option<bool>> {
     }
 }
 
+/// Write `[server] allow_remote` into an existing configuration file.
+///
+/// Edits the document rather than re-serialising the parsed config, so comments
+/// and the order a person chose survive. A missing section or key is added. The
+/// caller is responsible for telling the user a restart is required: nothing
+/// here rebinds a listener.
+pub fn set_allow_remote(path: &Path, value: bool) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| KernelError::Config(format!("cannot read {}: {error}", path.display())))?;
+    let mut document = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        KernelError::Config(format!("{} is not valid TOML: {error}", path.display()))
+    })?;
+    if !document.contains_key("server") {
+        document.insert("server", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    document["server"]["allow_remote"] = toml_edit::value(value);
+    std::fs::write(path, document.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_allow_remote_and_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(
+            &path,
+            "# kept on purpose\n[server]\nport = 3101\n\n[scan]\nwatch = true\n",
+        )
+        .unwrap();
+
+        set_allow_remote(&path, true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# kept on purpose"), "comments must survive");
+        assert!(text.contains("port = 3101"));
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["server"]["allow_remote"].as_bool(), Some(true));
+        assert_eq!(parsed["scan"]["watch"].as_bool(), Some(true));
+
+        // Setting it back to false replaces the value instead of adding a key.
+        set_allow_remote(&path, false).unwrap();
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["server"]["allow_remote"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn creates_the_server_section_when_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(&path, "[scan]\nwatch = true\n").unwrap();
+        set_allow_remote(&path, true).unwrap();
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["server"]["allow_remote"].as_bool(), Some(true));
+        assert_eq!(parsed["scan"]["watch"].as_bool(), Some(true));
+    }
 
     #[test]
     fn parses_plugin_entries() {
