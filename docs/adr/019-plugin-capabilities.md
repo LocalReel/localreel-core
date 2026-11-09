@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix; 3.28 anchor sidecar file; 3.29 anchor history; 3.30 anchor history rotation; 3.31 package preflight; 3.32 package staging; 3.33 staged package management; 3.34 config install/rollback; 3.35 package lifecycle audit; 3.36 package upload)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix; 3.28 anchor sidecar file; 3.29 anchor history; 3.30 anchor history rotation; 3.31 package preflight; 3.32 package staging; 3.33 staged package management; 3.34 config install/rollback; 3.35 package lifecycle audit; 3.36 package upload; 3.37 upload signature headers)
 - Date: 2026-11-08
 
 ## Context
@@ -197,7 +197,9 @@ The CMS/collector probe made the gap concrete:
 35. **Phase 3.36 accepts a package upload.** `POST /plugins/packages/upload`
     takes the raw `.lrplug` body (64 MiB cap), writes a temporary file under
     `.uploads`, runs the same stage checks and removes the temporary file in all
-    outcomes. It is a transport for stage, not a separate install path.
+    outcomes. Publisher/signature/digest travel in `x-localreel-*` headers; the
+    query form is kept for older clients. It is a transport for stage, not a
+    separate install path.
 
 ## Consequences
 

@@ -1015,8 +1015,23 @@ async fn upload_plugin_package(
     State(state): State<Arc<AppState>>,
     Extension(current): Extension<CurrentUser>,
     Query(query): Query<UploadPackageQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let header = |name: &str| -> Result<Option<String>, ApiError> {
+        match headers.get(name).map(|value| value.to_str()) {
+            Some(Ok(value)) => Ok(Some(value.to_string())),
+            Some(Err(_)) => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_header",
+                format!("{name} is not valid ASCII"),
+            )),
+            None => Ok(None),
+        }
+    };
+    let publisher = header("x-localreel-publisher")?.or(query.publisher);
+    let signature = header("x-localreel-signature")?.or(query.signature);
+    let sha256 = header("x-localreel-sha256")?.or(query.sha256);
     if body.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1049,9 +1064,9 @@ async fn upload_plugin_package(
         Extension(current),
         Json(StagePackageRequest {
             path: temporary.to_string_lossy().into_owned(),
-            publisher: query.publisher,
-            signature: query.signature,
-            sha256: query.sha256,
+            publisher,
+            signature,
+            sha256,
         }),
     )
     .await;
