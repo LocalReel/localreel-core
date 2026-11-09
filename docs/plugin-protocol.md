@@ -426,7 +426,10 @@ fingerprint (SHA-256 of the public key text) and whether the signature verified.
 The supervisor writes it before extraction; restarts append another row. Rows
 also form a SHA-256 hash chain over the previous row and their fields, so a
 deleted or edited row breaks the chain; `GET /api/v1/plugins/verifications/verify`
-recomputes it. This is an operator audit trail, not a public log.
+recomputes it. The host also signs each chain head with an Ed25519 audit key
+(`data/plugin-verification.key`, generated on first use) and stores the anchor;
+`verify` reports `anchored` and `anchor_valid`. This detects local tampering, but
+the key and database live on the same machine, so it is not a public log.
 
 ## Resource ceilings (phase 3.3)
 

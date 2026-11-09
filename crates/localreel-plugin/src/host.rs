@@ -433,6 +433,13 @@ impl PluginHost {
         stop_timeout: Duration,
         limits: PluginLimits,
     ) -> Self {
+        let verifications = match install_root.parent() {
+            Some(dir) => {
+                VerificationStore::with_anchor(db.clone(), &dir.join("plugin-verification.key"))
+                    .unwrap_or_else(|_| VerificationStore::new(db.clone()))
+            }
+            None => VerificationStore::new(db.clone()),
+        };
         Self::build(
             Some(AuditLog::new(db.clone())),
             Some(GrantStore::new(db.clone())),
@@ -440,7 +447,7 @@ impl PluginHost {
             Some(CatalogDraftStore::new(db.clone())),
             Some(ScheduleStore::new(db.clone())),
             Some(BlobStore::new(db.clone())),
-            Some(VerificationStore::new(db)),
+            Some(verifications),
             limits,
             install_root,
             stop_timeout,

@@ -97,6 +97,11 @@ pub fn migrations() -> &'static [Migration] {
             name: "plugin_verification_chain",
             sql: include_str!("../migrations/0008_plugin_verification_chain.sql"),
         },
+        Migration {
+            version: 9,
+            name: "plugin_verification_anchors",
+            sql: include_str!("../migrations/0009_plugin_verification_anchors.sql"),
+        },
     ]
 }
 

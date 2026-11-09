@@ -4,6 +4,10 @@
 //! that a signature alone does not: *which* key verified *which* package, and
 //! when. Rows are written by the host before a plugin is extracted.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::time::now_secs;
@@ -28,11 +32,21 @@ pub struct PackageVerification {
 #[derive(Clone)]
 pub struct VerificationStore {
     db: Database,
+    anchor: Option<Arc<SigningKey>>,
 }
 
 impl VerificationStore {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self { db, anchor: None }
+    }
+
+    /// Load (or create) the host audit key and sign every new chain head.
+    pub fn with_anchor(db: Database, key_path: &Path) -> Result<Self> {
+        let key = Arc::new(load_or_create_key(key_path)?);
+        Ok(Self {
+            db,
+            anchor: Some(key),
+        })
     }
 
     pub fn record(
@@ -54,6 +68,7 @@ impl VerificationStore {
         }
         let fingerprint = public_key.map(key_fingerprint);
         let at = now_secs();
+        let anchor = self.anchor.clone();
         let (id, chain_hash) = self.db.with_write(|connection| {
             let previous: Option<String> = connection
                 .query_row(
@@ -92,6 +107,21 @@ impl VerificationStore {
                     chain
                 ],
             )?;
+            if let Some(key) = &anchor {
+                let signature = key.sign(chain.as_bytes());
+                let public_key = key.verifying_key().to_bytes();
+                connection.execute(
+                    "INSERT INTO plugin_verification_anchors
+                         (chain_hash, signature, public_key, at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        chain,
+                        hex(signature.to_bytes().as_slice()),
+                        hex(public_key.as_slice()),
+                        at
+                    ],
+                )?;
+            }
             Ok((connection.last_insert_rowid(), chain))
         })?;
         Ok(PackageVerification {
@@ -166,6 +196,8 @@ pub struct VerificationChain {
     pub checked: u64,
     pub valid: bool,
     pub broken_at: Option<i64>,
+    pub anchored: bool,
+    pub anchor_valid: Option<bool>,
 }
 
 impl VerificationStore {
@@ -201,15 +233,35 @@ impl VerificationStore {
                         checked,
                         valid: false,
                         broken_at: Some(row.id),
+                        anchored: false,
+                        anchor_valid: None,
                     });
                 }
                 previous = Some(expected);
                 checked += 1;
             }
+            let latest: Option<(String, String, String)> = connection
+                .query_row(
+                    "SELECT chain_hash, signature, public_key
+                     FROM plugin_verification_anchors ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let head = previous.as_deref().unwrap_or("genesis");
+            let (anchored, anchor_valid) = match latest {
+                Some((chain, signature, public_key)) => (
+                    true,
+                    Some(chain == head && verify_anchor(&chain, &signature, &public_key)),
+                ),
+                None => (false, None),
+            };
             Ok(VerificationChain {
                 checked,
                 valid: true,
                 broken_at: None,
+                anchored,
+                anchor_valid,
             })
         })
     }
@@ -253,6 +305,80 @@ pub fn key_fingerprint(public_key_hex: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn verify_anchor(chain: &str, signature: &str, public_key: &str) -> bool {
+    let Ok(public_key) = decode_hex(public_key) else {
+        return false;
+    };
+    let Ok(signature) = decode_hex(signature) else {
+        return false;
+    };
+    let Ok(public_key) = <[u8; 32]>::try_from(public_key.as_slice()) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(&signature) else {
+        return false;
+    };
+    VerifyingKey::from_bytes(&public_key)
+        .map(|key| key.verify(chain.as_bytes(), &signature).is_ok())
+        .unwrap_or(false)
+}
+
+fn load_or_create_key(path: &Path) -> Result<SigningKey> {
+    if path.is_file() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| KernelError::Storage(format!("audit key: {error}")))?;
+        let seed = decode_hex(text.trim())
+            .map_err(|_| KernelError::Storage("audit key is not valid hex".into()))?;
+        let seed: [u8; 32] = seed
+            .try_into()
+            .map_err(|_| KernelError::Storage("audit key must be 32 bytes".into()))?;
+        return Ok(SigningKey::from_bytes(&seed));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| KernelError::Storage(format!("audit key dir: {error}")))?;
+        }
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|error| KernelError::Storage(format!("audit key entropy: {error}")))?;
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|error| KernelError::Storage(format!("audit key create: {error}")))?;
+        file.write_all(hex(&seed).as_bytes())
+            .map_err(|error| KernelError::Storage(format!("audit key write: {error}")))?;
+    }
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(text: &str) -> std::result::Result<Vec<u8>, ()> {
+    if !text.len().is_multiple_of(2) {
+        return Err(());
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).ok_or(())?;
+            let low = (pair[1] as char).to_digit(16).ok_or(())?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +389,29 @@ mod tests {
         let db = Database::open(dir.path().join("verify.db").to_str().unwrap(), 1).unwrap();
         migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
         (dir, VerificationStore::new(db))
+    }
+
+    fn anchored_store() -> (tempfile::TempDir, VerificationStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("verify.db").to_str().unwrap(), 1).unwrap();
+        migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
+        let store = VerificationStore::with_anchor(db, &dir.path().join("audit.key")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn anchor_signs_the_chain_head() {
+        let (_dir, store) = anchored_store();
+        store
+            .record("demo", "0.1.0", &"a".repeat(64), Some("acme"), None, true)
+            .unwrap();
+        store
+            .record("demo", "0.2.0", &"b".repeat(64), Some("acme"), None, true)
+            .unwrap();
+        let chain = store.verify_chain().unwrap();
+        assert!(chain.valid);
+        assert!(chain.anchored);
+        assert_eq!(chain.anchor_valid, Some(true));
     }
 
     #[test]

@@ -170,6 +170,11 @@ async fn full_chain(app_container: bool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
+    let chain = host.verifications().unwrap().verify_chain().unwrap();
+    assert!(chain.valid, "{chain:?}");
+    assert!(chain.anchored, "{chain:?}");
+    assert_eq!(chain.anchor_valid, Some(true), "{chain:?}");
+
     let file = MediaUri::Local(library.join("a.txt"));
     assert_eq!(provider.stat(&file).unwrap().size, 6);
     let listed = provider.list(&MediaUri::Local(library.clone())).unwrap();
