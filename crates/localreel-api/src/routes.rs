@@ -773,6 +773,24 @@ fn audit_package_event(
     }
 }
 
+fn audit_package_failure(
+    state: &AppState,
+    plugin_id: &str,
+    action: &str,
+    version: &str,
+    reason: &str,
+    user_id: Option<i64>,
+) {
+    audit_package_event(
+        state,
+        plugin_id,
+        action,
+        "rejected",
+        &format!("version={version} reason={reason}"),
+        user_id,
+    );
+}
+
 fn verify_package_signature(
     state: &AppState,
     package: &std::path::Path,
@@ -864,6 +882,14 @@ async fn stage_plugin_package(
     })?;
     if let Some(expected) = request.sha256.as_deref() {
         if !expected.eq_ignore_ascii_case(&sha256) {
+            audit_package_failure(
+                &state,
+                &manifest.id,
+                "package.stage",
+                &manifest.version,
+                "digest_mismatch",
+                Some(current.user.id),
+            );
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "digest_mismatch",
@@ -871,12 +897,25 @@ async fn stage_plugin_package(
             ));
         }
     }
-    let signature_verified = verify_package_signature(
+    let signature_verified = match verify_package_signature(
         &state,
         &canonical,
         request.publisher.as_deref(),
         request.signature.as_deref(),
-    )?;
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            audit_package_failure(
+                &state,
+                &manifest.id,
+                "package.stage",
+                &manifest.version,
+                "signature",
+                Some(current.user.id),
+            );
+            return Err(error);
+        }
+    };
 
     let directory = state
         .plugins
@@ -1043,23 +1082,31 @@ async fn install_staged_package(
             "that staged package does not exist",
         ));
     }
-    let metadata: serde_json::Value = std::fs::read(&metadata_path)
+    let Some(metadata) = std::fs::read(&metadata_path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "metadata_missing",
-                "the staged package has no metadata",
-            )
-        })?;
-    if metadata["signature_verified"].as_bool() != Some(true) {
-        audit_package_event(
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        audit_package_failure(
             &state,
             &request.id,
             "package.install",
-            "rejected",
-            &format!("version={} reason=unsigned", request.version),
+            &request.version,
+            "metadata_missing",
+            Some(current.user.id),
+        );
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "metadata_missing",
+            "the staged package has no metadata",
+        ));
+    };
+    if metadata["signature_verified"].as_bool() != Some(true) {
+        audit_package_failure(
+            &state,
+            &request.id,
+            "package.install",
+            &request.version,
+            "unsigned",
             Some(current.user.id),
         );
         return Err(ApiError::new(
@@ -1068,17 +1115,33 @@ async fn install_staged_package(
             "only packages with a verified publisher signature can be installed",
         ));
     }
-    let sha256 = metadata["sha256"].as_str().ok_or_else(|| {
-        ApiError::new(
+    let Some(sha256) = metadata["sha256"].as_str() else {
+        audit_package_failure(
+            &state,
+            &request.id,
+            "package.install",
+            &request.version,
+            "metadata_missing_sha256",
+            Some(current.user.id),
+        );
+        return Err(ApiError::new(
             StatusCode::CONFLICT,
             "metadata_missing",
             "the staged metadata has no sha256",
-        )
-    })?;
+        ));
+    };
     let actual = localreel_plugin::package::digest(&package).map_err(|error| {
         ApiError::new(StatusCode::CONFLICT, "invalid_package", error.to_string())
     })?;
     if !actual.eq_ignore_ascii_case(sha256) {
+        audit_package_failure(
+            &state,
+            &request.id,
+            "package.install",
+            &request.version,
+            "digest_mismatch",
+            Some(current.user.id),
+        );
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "digest_mismatch",
@@ -1087,31 +1150,57 @@ async fn install_staged_package(
     }
     let publisher = metadata["publisher"].as_str();
     let signature = metadata["signature"].as_str();
-    let config_path = state.config_source.as_ref().ok_or_else(|| {
-        ApiError::new(
+    let Some(config_path) = state.config_source.as_ref() else {
+        audit_package_failure(
+            &state,
+            &request.id,
+            "package.install",
+            &request.version,
+            "config_unavailable",
+            Some(current.user.id),
+        );
+        return Err(ApiError::new(
             StatusCode::CONFLICT,
             "config_unavailable",
             "there is no configuration file to update",
-        )
-    })?;
+        ));
+    };
     let previous = state.plugins.package_of(&request.id);
     let package_text = package.to_string_lossy();
-    let updated = localreel_kernel::config::set_plugin_package(
+    let updated = match localreel_kernel::config::set_plugin_package(
         config_path,
         previous.as_deref(),
         &package_text,
         sha256,
         publisher,
         signature,
-    )
-    .map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "config_write_failed",
-            error.to_string(),
-        )
-    })?;
+    ) {
+        Ok(updated) => updated,
+        Err(error) => {
+            audit_package_failure(
+                &state,
+                &request.id,
+                "package.install",
+                &request.version,
+                "config_write_failed",
+                Some(current.user.id),
+            );
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_write_failed",
+                error.to_string(),
+            ));
+        }
+    };
     if !updated {
+        audit_package_failure(
+            &state,
+            &request.id,
+            "package.install",
+            &request.version,
+            "plugin_not_found",
+            Some(current.user.id),
+        );
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "plugin_not_found",
@@ -1165,6 +1254,14 @@ async fn delete_staged_package(
     let directory = state.plugins.install_root().join("packages").join(&id);
     let package = directory.join(format!("{version}.lrplug"));
     if !package.is_file() {
+        audit_package_failure(
+            &state,
+            &id,
+            "package.unstage",
+            &version,
+            "not_found",
+            Some(current.user.id),
+        );
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "package_not_staged",
@@ -1172,6 +1269,14 @@ async fn delete_staged_package(
         ));
     }
     if state.plugins.package_in_use(&package) {
+        audit_package_failure(
+            &state,
+            &id,
+            "package.unstage",
+            &version,
+            "package_in_use",
+            Some(current.user.id),
+        );
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "package_in_use",
@@ -4172,6 +4277,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let package = test_package(dir.path(), "stage-demo", "0.1.0");
         let (state, session, csrf) = signed_in(dir.path());
+        let audit = state.clone();
         let app = router(state);
         let response = app
             .clone()
@@ -4202,6 +4308,18 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "unsigned_package");
+        let entries = audit
+            .plugins
+            .audit()
+            .unwrap()
+            .recent(Some("stage-demo"), 10)
+            .unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.action == "package.install"
+                && entry.result.as_deref() == Some("rejected")
+                && entry.user_id.is_some()),
+            "{entries:?}"
+        );
     }
 
     #[tokio::test]
