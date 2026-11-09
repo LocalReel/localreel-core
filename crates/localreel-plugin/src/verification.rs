@@ -7,7 +7,7 @@
 use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::time::now_secs;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -21,6 +21,8 @@ pub struct PackageVerification {
     pub public_key_fingerprint: Option<String>,
     pub signature_verified: bool,
     pub at: i64,
+    /// Hash chain over this row and the previous one; `None` for legacy rows.
+    pub chain_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -52,12 +54,33 @@ impl VerificationStore {
         }
         let fingerprint = public_key.map(key_fingerprint);
         let at = now_secs();
-        let id = self.db.with_write(|connection| {
+        let (id, chain_hash) = self.db.with_write(|connection| {
+            let previous: Option<String> = connection
+                .query_row(
+                    "SELECT chain_hash FROM plugin_package_verifications
+                     WHERE chain_hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let chain = chain_hash(
+                previous.as_deref(),
+                &ChainInput {
+                    plugin_id,
+                    plugin_version,
+                    package_sha256,
+                    publisher,
+                    public_key_fingerprint: fingerprint.as_deref(),
+                    signature_verified,
+                    at,
+                },
+            );
             connection.execute(
                 "INSERT INTO plugin_package_verifications (
                      plugin_id, plugin_version, package_sha256, publisher,
-                     public_key_fingerprint, signature_verified, at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     public_key_fingerprint, signature_verified, at, chain_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     plugin_id,
                     plugin_version,
@@ -65,10 +88,11 @@ impl VerificationStore {
                     publisher,
                     fingerprint,
                     signature_verified as i64,
-                    at
+                    at,
+                    chain
                 ],
             )?;
-            Ok(connection.last_insert_rowid())
+            Ok((connection.last_insert_rowid(), chain))
         })?;
         Ok(PackageVerification {
             id,
@@ -79,6 +103,7 @@ impl VerificationStore {
             public_key_fingerprint: fingerprint,
             signature_verified,
             at,
+            chain_hash: Some(chain_hash),
         })
     }
 
@@ -94,7 +119,7 @@ impl VerificationStore {
                 Some(plugin_id) => {
                     let mut statement = connection.prepare(
                         "SELECT id, plugin_id, plugin_version, package_sha256, publisher,
-                                public_key_fingerprint, signature_verified, at
+                                public_key_fingerprint, signature_verified, at, chain_hash
                          FROM plugin_package_verifications WHERE plugin_id = ?1
                          ORDER BY id DESC LIMIT ?2",
                     )?;
@@ -107,7 +132,7 @@ impl VerificationStore {
                 None => {
                     let mut statement = connection.prepare(
                         "SELECT id, plugin_id, plugin_version, package_sha256, publisher,
-                                public_key_fingerprint, signature_verified, at
+                                public_key_fingerprint, signature_verified, at, chain_hash
                          FROM plugin_package_verifications ORDER BY id DESC LIMIT ?1",
                     )?;
                     let mapped = statement.query_map(params![limit], row_to_verification)?;
@@ -132,7 +157,94 @@ fn row_to_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageVerif
         public_key_fingerprint: row.get(5)?,
         signature_verified: verified != 0,
         at: row.get(7)?,
+        chain_hash: row.get(8)?,
     })
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VerificationChain {
+    pub checked: u64,
+    pub valid: bool,
+    pub broken_at: Option<i64>,
+}
+
+impl VerificationStore {
+    /// Recompute the chain in insertion order. `chain_hash` is null only on
+    /// legacy rows written before the chain existed; those are skipped.
+    pub fn verify_chain(&self) -> Result<VerificationChain> {
+        self.db.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, plugin_id, plugin_version, package_sha256, publisher,
+                        public_key_fingerprint, signature_verified, at, chain_hash
+                 FROM plugin_package_verifications
+                 WHERE chain_hash IS NOT NULL ORDER BY id ASC",
+            )?;
+            let mapped = statement.query_map([], row_to_verification)?;
+            let mut previous: Option<String> = None;
+            let mut checked = 0u64;
+            for row in mapped {
+                let row = row?;
+                let expected = chain_hash(
+                    previous.as_deref(),
+                    &ChainInput {
+                        plugin_id: &row.plugin_id,
+                        plugin_version: &row.plugin_version,
+                        package_sha256: &row.package_sha256,
+                        publisher: row.publisher.as_deref(),
+                        public_key_fingerprint: row.public_key_fingerprint.as_deref(),
+                        signature_verified: row.signature_verified,
+                        at: row.at,
+                    },
+                );
+                if row.chain_hash.as_deref() != Some(expected.as_str()) {
+                    return Ok(VerificationChain {
+                        checked,
+                        valid: false,
+                        broken_at: Some(row.id),
+                    });
+                }
+                previous = Some(expected);
+                checked += 1;
+            }
+            Ok(VerificationChain {
+                checked,
+                valid: true,
+                broken_at: None,
+            })
+        })
+    }
+}
+
+fn chain_hash(previous: Option<&str>, row: &ChainInput<'_>) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        previous.unwrap_or("genesis"),
+        row.plugin_id,
+        row.plugin_version,
+        row.package_sha256,
+        row.publisher.unwrap_or(""),
+        row.public_key_fingerprint.unwrap_or(""),
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update([row.signature_verified as u8]);
+    hasher.update(row.at.to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct ChainInput<'a> {
+    plugin_id: &'a str,
+    plugin_version: &'a str,
+    package_sha256: &'a str,
+    publisher: Option<&'a str>,
+    public_key_fingerprint: Option<&'a str>,
+    signature_verified: bool,
+    at: i64,
 }
 
 /// Stable identifier for a public key without storing the key itself.
@@ -184,6 +296,34 @@ mod tests {
         assert_eq!(first, key_fingerprint("aaaa"));
         assert_ne!(first, key_fingerprint("bbbb"));
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn chain_detects_tampering_and_reordering() {
+        let (_dir, store) = store();
+        store
+            .record("demo", "0.1.0", &"a".repeat(64), Some("acme"), None, true)
+            .unwrap();
+        store
+            .record("demo", "0.2.0", &"b".repeat(64), Some("acme"), None, true)
+            .unwrap();
+        assert!(store.verify_chain().unwrap().valid);
+
+        store
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE plugin_package_verifications SET publisher = 'mallory'
+                     WHERE plugin_version = '0.2.0'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let chain = store.verify_chain().unwrap();
+        assert!(!chain.valid);
+        assert_eq!(chain.checked, 1);
+        assert!(chain.broken_at.is_some());
     }
 
     #[test]

@@ -423,8 +423,10 @@ GET /api/v1/plugins/verifications?plugin=collector&limit=50
 
 Each row carries plugin id/version, package SHA-256, publisher, a key
 fingerprint (SHA-256 of the public key text) and whether the signature verified.
-The supervisor writes it before extraction; restarts append another row. It is
-an operator audit trail, not a public log.
+The supervisor writes it before extraction; restarts append another row. Rows
+also form a SHA-256 hash chain over the previous row and their fields, so a
+deleted or edited row breaks the chain; `GET /api/v1/plugins/verifications/verify`
+recomputes it. This is an operator audit trail, not a public log.
 
 ## Resource ceilings (phase 3.3)
 

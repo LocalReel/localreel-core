@@ -107,6 +107,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
+            "/api/v1/plugins/verifications/verify",
+            get(plugin_verification_chain),
+        )
+        .route(
             "/api/v1/plugins/:id/capabilities",
             get(plugin_capabilities).post(grant_plugin_capability),
         )
@@ -698,6 +702,20 @@ async fn plugin_verifications(
         .transpose()?
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+/// Recompute the local verification hash chain.
+async fn plugin_verification_chain(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<localreel_plugin::verification::VerificationChain>, ApiError> {
+    let store = state.plugins.verifications().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the verification store is not available",
+        )
+    })?;
+    Ok(Json(store.verify_chain()?))
 }
 
 /// What a plugin asks for, what it was granted, and the host's own risk text.
@@ -3231,6 +3249,46 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    #[tokio::test]
+    async fn verification_chain_reports_valid_after_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let store = state.plugins.verifications().unwrap();
+        store
+            .record(
+                "collector",
+                "0.1.0",
+                &"a".repeat(64),
+                Some("acme"),
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .record(
+                "collector",
+                "0.2.0",
+                &"b".repeat(64),
+                Some("acme"),
+                None,
+                true,
+            )
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/verifications/verify", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checked"], 2);
     }
 
     #[tokio::test]
