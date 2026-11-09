@@ -17,6 +17,48 @@ use crate::manifest::{
     MAX_PACKAGE_ENTRIES,
 };
 
+/// The manifest's icon, read straight out of the package.
+///
+/// Nothing is copied out during install: the package is the source of truth,
+/// and the path was checked when the manifest was parsed. It is checked again
+/// here because this function is public, and an icon is the one plugin asset
+/// that leaves the sandbox.
+pub fn icon(path: &Path) -> Result<Option<(Vec<u8>, &'static str)>, PluginError> {
+    let mut archive = open(path)?;
+    let manifest = read_manifest(&mut archive)?;
+    let Some(name) = manifest.icon.as_deref() else {
+        return Ok(None);
+    };
+    crate::manifest::validate_icon(name)?;
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|_| PluginError::Manifest(format!("icon {name} is missing from the package")))?;
+    if entry.size() > crate::manifest::MAX_ICON_BYTES {
+        return Err(PluginError::Manifest("icon is too large".into()));
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|error| PluginError::Io(format!("cannot read {name}: {error}")))?;
+    Ok(Some((bytes, icon_mime(name))))
+}
+
+/// The content type for an icon path. The extension was already restricted to
+/// these three by the manifest validation.
+fn icon_mime(name: &str) -> &'static str {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        _ => "image/webp",
+    }
+}
+
 /// Read the manifest without extracting anything.
 pub fn inspect(path: &Path) -> Result<Manifest, PluginError> {
     let mut archive = open(path)?;
@@ -480,6 +522,64 @@ mod tests {
         assert_eq!(manifest.id, "demo");
         assert_eq!(manifest.kind, PluginKind::Storage);
         assert!(manifest.entry.program == "bin/plugin");
+    }
+
+    fn package_with_icon(path: &Path, icon: Option<&str>, bytes: &[u8], store: bool) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json("demo")).unwrap();
+        if let Some(icon) = icon {
+            manifest["icon"] = serde_json::json!(icon);
+        }
+        writer
+            .start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(manifest.to_string().as_bytes()).unwrap();
+        writer
+            .start_file("bin/plugin", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"#!/bin/sh\n").unwrap();
+        if let Some(icon) = icon {
+            if store {
+                writer
+                    .start_file(icon, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn reads_the_icon_out_of_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("demo.lrplug");
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        package_with_icon(&archive, Some("assets/icon.svg"), svg, true);
+
+        let (bytes, mime) = icon(&archive).unwrap().expect("an icon was declared");
+        assert_eq!(bytes, svg);
+        assert_eq!(mime, "image/svg+xml");
+    }
+
+    #[test]
+    fn a_package_without_an_icon_answers_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("demo.lrplug");
+        package_with_icon(&archive, None, b"", false);
+        assert!(icon(&archive).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_declared_icon_missing_from_the_archive_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("demo.lrplug");
+        package_with_icon(&archive, Some("assets/missing.png"), b"", false);
+        let error = icon(&archive).unwrap_err();
+        assert!(
+            error.to_string().contains("missing from the package"),
+            "{error}"
+        );
     }
 
     #[test]

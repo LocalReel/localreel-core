@@ -127,6 +127,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
+        .route("/api/v1/plugins/:id/icon", get(plugin_icon))
         .route(
             "/api/v1/plugins/packages/inspect",
             post(inspect_plugin_package),
@@ -438,6 +439,33 @@ async fn shutdown_server(
 #[derive(Debug, Deserialize)]
 struct AdminAuditQuery {
     limit: Option<i64>,
+}
+
+/// The icon a plugin package declares, read out of the package it was installed
+/// from. Signed-in accounts only, like the rest of the plugin surface.
+async fn plugin_icon(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let package = state
+        .plugins
+        .package_of(&id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin {id} is not installed")))?;
+    let Some((bytes, mime)) = localreel_plugin::package::icon(std::path::Path::new(&package))
+        .map_err(|error| ApiError::not_found(error.to_string()))?
+    else {
+        return Err(ApiError::not_found("this plugin has no icon"));
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            // An icon changes only when the package does; the ETag would be the
+            // digest, which the client does not need.
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Recent administrator actions, newest first.

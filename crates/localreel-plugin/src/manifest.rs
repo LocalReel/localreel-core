@@ -17,6 +17,8 @@ use crate::capability::{validate_request, CapabilityRequest};
 pub const API_VERSION: &str = "localreel.plugin/v1";
 
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+/// An icon is decoration; half a megabyte is already generous for one.
+pub const MAX_ICON_BYTES: u64 = 512 * 1024;
 pub const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_ENTRIES: usize = 4096;
