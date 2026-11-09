@@ -105,6 +105,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
+        .route(
+            "/api/v1/plugins/packages/inspect",
+            post(inspect_plugin_package),
+        )
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
@@ -675,6 +679,100 @@ async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 
 async fn plugin_sandbox_status() -> Json<localreel_plugin::runtime::SandboxSupport> {
     Json(localreel_plugin::runtime::sandbox_support())
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectPackageRequest {
+    path: String,
+    publisher: Option<String>,
+    signature: Option<String>,
+}
+
+/// Read a `.lrplug` without installing or extracting it. With a publisher and
+/// signature, verify the digest against the active trusted key.
+async fn inspect_plugin_package(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<InspectPackageRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let canonical = std::fs::canonicalize(&request.path).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_path",
+            format!("cannot resolve {}: {error}", request.path),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_path",
+            format!("{} is not a file", canonical.display()),
+        ));
+    }
+    let manifest = localreel_plugin::package::inspect(&canonical).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package",
+            error.to_string(),
+        )
+    })?;
+    let sha256 = localreel_plugin::package::digest(&canonical).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package",
+            error.to_string(),
+        )
+    })?;
+    let signature_verified = match (request.publisher.as_deref(), request.signature.as_deref()) {
+        (None, None) => false,
+        (Some(publisher), Some(signature)) => {
+            let publisher = state
+                .config
+                .publishers
+                .iter()
+                .find(|entry| entry.id == publisher)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "unknown_publisher",
+                        "the publisher is not configured",
+                    )
+                })?;
+            if !publisher.is_active_at(now_secs()) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "publisher_inactive",
+                    "the publisher key is revoked or expired",
+                ));
+            }
+            localreel_plugin::package::verify_signature(
+                &canonical,
+                signature,
+                &publisher.public_key,
+            )
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_signature",
+                    error.to_string(),
+                )
+            })?;
+            true
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "incomplete_signature",
+                "publisher and signature must be supplied together",
+            ));
+        }
+    };
+    Ok(Json(serde_json::json!({
+        "path": canonical,
+        "sha256": sha256,
+        "manifest": manifest,
+        "signature_verified": signature_verified,
+        "publisher": request.publisher,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3439,6 +3537,69 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    #[tokio::test]
+    async fn package_inspect_reads_a_package_without_installing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::json!({
+                "id": "inspect-demo",
+                "name": "Inspect demo",
+                "version": "0.1.0",
+                "api_version": "localreel.plugin/v1",
+                "kind": "storage",
+                "entry": { "program": "bin/plugin", "args": [] },
+                "permissions": ["storage:read"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(source.join("bin/plugin"), b"#!/bin/sh\n").unwrap();
+        let package = dir.path().join("inspect-demo.lrplug");
+        localreel_plugin::package::pack(&source, &package).unwrap();
+
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/inspect",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": package }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["manifest"]["id"], "inspect-demo");
+        assert_eq!(value["signature_verified"], false);
+        assert_eq!(value["sha256"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn package_inspect_rejects_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/inspect",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": dir.path().join("missing.lrplug") }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -396,6 +396,19 @@ bytes. When `publisher` is present the supervisor verifies the signature against
 the trusted key **before** inspect/extract; a missing key, malformed signature
 or mismatch is a permanent start failure.
 
+Before editing the config, an administrator can preflight a local package:
+
+```text
+POST /api/v1/plugins/packages/inspect
+{ "path": "D:/inbox/demo.lrplug", "publisher": "acme", "signature": "128 hex" }
+```
+
+It reads the manifest and digest without extracting or starting anything, checks
+the publisher key is active, and reports `signature_verified`. `publisher` and
+`signature` must be supplied together; omitting both is allowed and reports
+`false`. This is an inspection API, not an install API: the config remains the
+source of truth.
+
 The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation is supported by listing several
 keys with the same publisher id:
