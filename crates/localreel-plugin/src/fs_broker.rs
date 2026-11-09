@@ -200,9 +200,35 @@ fn open_verified(path: &Path, roots: &[PathBuf]) -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn open_verified(path: &Path, roots: &[PathBuf]) -> Result<std::fs::File> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| KernelError::Storage(format!("open failed: {error}")))?;
+    verify_open_handle(&file, roots)?;
+    Ok(file)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn open_verified(path: &Path, _roots: &[PathBuf]) -> Result<std::fs::File> {
     std::fs::File::open(path).map_err(|error| KernelError::Storage(format!("open failed: {error}")))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_open_handle(file: &std::fs::File, roots: &[PathBuf]) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let link = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let path = std::fs::read_link(&link)
+        .map_err(|error| KernelError::Storage(format!("cannot verify open fd: {error}")))?;
+    let text = path.to_string_lossy();
+    let text = text.strip_suffix(" (deleted)").unwrap_or(&text);
+    if under_any_root(Path::new(text), roots) {
+        Ok(())
+    } else {
+        Err(KernelError::PermissionDenied(
+            "opened file escaped the granted roots".into(),
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -349,7 +375,7 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn handle_final_path_must_stay_under_the_roots() {
         let (dir, outside, _root_uri) = root();

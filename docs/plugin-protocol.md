@@ -525,9 +525,10 @@ the `schedule` JSON-RPC method over the same pipe.
 `op` is `stat`, `list` or `read`; `read` returns `{"body_b64":"..."}` capped at
 8 MiB per call. The host canonicalises the URI and each granted root, refuses a
 target outside all roots, and audits both allow and deny. On Windows, `stat` and
-`read` open first and then check the final path **from the handle**, so a symlink
-swapped after the path check cannot redirect them; `list` and non-Windows calls
-remain path-based. `BrokerClient::fs_stat/fs_list/fs_read` use this endpoint.
+`read` open first and check the final path **from the handle**; on Linux they
+check `/proc/self/fd/<fd>` instead. A symlink swapped after the path check
+cannot redirect those operations; `list` and macOS remain path-based.
+`BrokerClient::fs_stat/fs_list/fs_read` use this endpoint.
 
 The reference storage plugin accepts `"fs_mode": "broker"` in its config: it
 forwards the host's `file://` URIs to this endpoint and never calls `std::fs`.

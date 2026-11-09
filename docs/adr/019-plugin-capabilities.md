@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification)
 - Date: 2026-11-08
 
 ## Context
@@ -116,8 +116,8 @@ The CMS/collector probe made the gap concrete:
     `POST /api/v1/plugin-broker/fs`; the host checks the active `fs.read` grant,
     canonicalises each root and the target, refuses targets outside all roots,
     caps reads at 8 MiB and audits allow/deny. On Windows, `stat` and `read` open
-    first and verify the final path from the handle, closing the symlink-swap
-    TOCTOU for those operations; `list` and non-Windows calls remain path-based.
+    first and verify the final path from the handle; on Linux they verify
+    `/proc/self/fd/<fd>`. `list` and macOS remain path-based.
 21. **Phase 3.11 migrates the reference storage plugin.** `fs_mode =
     "broker"` forwards URIs to the fs broker; the AppContainer storage test
     serves stat/list/read this way. Third-party plugins that omit the mode still
