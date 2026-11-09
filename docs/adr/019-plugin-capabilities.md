@@ -136,9 +136,10 @@ The CMS/collector probe made the gap concrete:
     configured sandbox intent when the server resolves it.
 25. **Phase 3.18 extends the OS boundary to Linux.** `app_container = true`
     runs stdio plugins under `unshare -Urn`, giving them a fresh network
-    namespace with the stdio broker as their only channel. macOS is rejected;
-    the Linux mechanism is validated at the shell level in WSL, not by a Rust
-    test yet.
+    namespace with the stdio broker as their only channel. macOS is rejected.
+    A Rust runtime test in WSL confirms the plugin sees `net: blocked`; other
+    loopback-fixture tests fail in that WSL image due to its networking, not the
+    netns path.
 
 ## Consequences
 

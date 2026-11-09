@@ -237,11 +237,6 @@ fn verify_open_handle(file: &std::fs::File, roots: &[PathBuf]) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
-fn verify_open_handle(_file: &std::fs::File, _roots: &[PathBuf]) -> Result<()> {
-    Ok(())
-}
-
 fn modified(metadata: &std::fs::Metadata) -> Option<i64> {
     metadata
         .modified()

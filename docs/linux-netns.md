@@ -16,16 +16,18 @@ unshare -Urn -- <plugin-program> <args...>
 
 ## Validation status
 
-The mechanism was validated in WSL with BusyBox:
+Validated in WSL (Alpine, Rust 1.88, util-linux `unshare`):
 
-```text
-$ busybox unshare -Urn true
-ok
-```
+- `unshare -Urn true` succeeds.
+- The Rust runtime test
+  `appcontainer_denies_the_plugins_own_socket` passes on Linux: the plugin sees
+  `net: blocked` for `1.1.1.1:80`.
+- `cargo clippy -p localreel-plugin --all-targets -- -D warnings` is clean.
 
-A Rust-level Linux test was not run in this workspace because the WSL image has
-no Rust/C toolchain. The Windows AppContainer path has full runtime tests; the
-Linux command construction is shared and compiled only on Linux targets.
+Other loopback-fixture runtime tests in this WSL image fail with connection
+refused / HTTP health timeouts; that is an environment issue (Docker Desktop WSL
+networking), not the netns path. The Windows AppContainer path has the full
+runtime/full-chain coverage.
 
 ## Limits
 

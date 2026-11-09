@@ -211,6 +211,8 @@ fn isolated_command(
     sandbox: &PluginSandbox,
     profile: &str,
 ) -> Result<Command, PluginError> {
+    #[cfg(not(windows))]
+    let _ = profile;
     #[cfg(windows)]
     {
         windows_appcontainer_command(program, manifest, token, config, sandbox, profile)

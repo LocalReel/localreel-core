@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn every_registered_capability_has_a_tier_and_description() {
-        assert!(!CAPABILITIES.is_empty());
+        assert_ne!(CAPABILITIES.len(), 0);
         for entry in CAPABILITIES {
             assert!(entry.tier <= 3, "{}", entry.name);
             assert!(!entry.title.is_empty(), "{}", entry.name);
