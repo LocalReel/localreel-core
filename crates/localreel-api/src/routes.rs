@@ -109,6 +109,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/plugins/packages/inspect",
             post(inspect_plugin_package),
         )
+        .route("/api/v1/plugins/packages/stage", post(stage_plugin_package))
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
@@ -722,8 +723,29 @@ async fn inspect_plugin_package(
             error.to_string(),
         )
     })?;
-    let signature_verified = match (request.publisher.as_deref(), request.signature.as_deref()) {
-        (None, None) => false,
+    let signature_verified = verify_package_signature(
+        &state,
+        &canonical,
+        request.publisher.as_deref(),
+        request.signature.as_deref(),
+    )?;
+    Ok(Json(serde_json::json!({
+        "path": canonical,
+        "sha256": sha256,
+        "manifest": manifest,
+        "signature_verified": signature_verified,
+        "publisher": request.publisher,
+    })))
+}
+
+fn verify_package_signature(
+    state: &AppState,
+    package: &std::path::Path,
+    publisher: Option<&str>,
+    signature: Option<&str>,
+) -> Result<bool, ApiError> {
+    match (publisher, signature) {
+        (None, None) => Ok(false),
         (Some(publisher), Some(signature)) => {
             let publisher = state
                 .config
@@ -744,34 +766,147 @@ async fn inspect_plugin_package(
                     "the publisher key is revoked or expired",
                 ));
             }
-            localreel_plugin::package::verify_signature(
-                &canonical,
-                signature,
-                &publisher.public_key,
-            )
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_signature",
-                    error.to_string(),
-                )
-            })?;
-            true
+            localreel_plugin::package::verify_signature(package, signature, &publisher.public_key)
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_signature",
+                        error.to_string(),
+                    )
+                })?;
+            Ok(true)
         }
-        _ => {
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "incomplete_signature",
+            "publisher and signature must be supplied together",
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StagePackageRequest {
+    path: String,
+    publisher: Option<String>,
+    signature: Option<String>,
+    sha256: Option<String>,
+}
+
+/// Verify a package and copy it into `data/plugins/packages/<id>/<version>.lrplug`.
+/// This does not edit the configuration or start the plugin.
+async fn stage_plugin_package(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StagePackageRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let canonical = std::fs::canonicalize(&request.path).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_path",
+            format!("cannot resolve {}: {error}", request.path),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_path",
+            format!("{} is not a file", canonical.display()),
+        ));
+    }
+    let manifest = localreel_plugin::package::inspect(&canonical).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package",
+            error.to_string(),
+        )
+    })?;
+    let sha256 = localreel_plugin::package::digest(&canonical).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package",
+            error.to_string(),
+        )
+    })?;
+    if let Some(expected) = request.sha256.as_deref() {
+        if !expected.eq_ignore_ascii_case(&sha256) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "incomplete_signature",
-                "publisher and signature must be supplied together",
+                "digest_mismatch",
+                "the package digest does not match the expected SHA-256",
             ));
         }
-    };
-    Ok(Json(serde_json::json!({
-        "path": canonical,
+    }
+    let signature_verified = verify_package_signature(
+        &state,
+        &canonical,
+        request.publisher.as_deref(),
+        request.signature.as_deref(),
+    )?;
+
+    let directory = state
+        .plugins
+        .install_root()
+        .join("packages")
+        .join(&manifest.id);
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            format!("cannot create {}: {error}", directory.display()),
+        )
+    })?;
+    let destination = directory.join(format!("{}.lrplug", manifest.version));
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        manifest.version,
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::copy(&canonical, &temporary).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            format!("cannot copy the package: {error}"),
+        )
+    })?;
+    if destination.exists() {
+        std::fs::remove_file(&destination).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stage_failed",
+                format!("cannot replace {}: {error}", destination.display()),
+            )
+        })?;
+    }
+    std::fs::rename(&temporary, &destination).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            format!("cannot finalize the package: {error}"),
+        )
+    })?;
+    let metadata = serde_json::json!({
+        "id": manifest.id,
+        "version": manifest.version,
         "sha256": sha256,
-        "manifest": manifest,
-        "signature_verified": signature_verified,
         "publisher": request.publisher,
+        "signature": request.signature,
+        "signature_verified": signature_verified,
+        "staged_at": now_secs(),
+    });
+    let sidecar = directory.join(format!("{}.json", manifest.version));
+    std::fs::write(&sidecar, serde_json::to_vec_pretty(&metadata).unwrap()).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            format!("cannot write {}: {error}", sidecar.display()),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "staged_path": destination,
+        "metadata_path": sidecar,
+        "manifest": manifest,
+        "sha256": sha256,
+        "signature_verified": signature_verified,
     })))
 }
 
@@ -3537,6 +3672,78 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    fn test_package(dir: &std::path::Path, id: &str, version: &str) -> std::path::PathBuf {
+        let source = dir.join(format!("source-{id}-{version}"));
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::json!({
+                "id": id,
+                "name": "Test package",
+                "version": version,
+                "api_version": "localreel.plugin/v1",
+                "kind": "storage",
+                "entry": { "program": "bin/plugin", "args": [] },
+                "permissions": ["storage:read"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(source.join("bin/plugin"), b"#!/bin/sh\n").unwrap();
+        let package = dir.join(format!("{id}-{version}.lrplug"));
+        localreel_plugin::package::pack(&source, &package).unwrap();
+        package
+    }
+
+    #[tokio::test]
+    async fn package_stage_copies_the_verified_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "stage-demo", "0.1.0");
+        let digest = localreel_plugin::package::digest(&package).unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let install_root = state.plugins.install_root().to_path_buf();
+        let app = router(state);
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/stage",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": package, "sha256": digest }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let staged = std::path::PathBuf::from(value["staged_path"].as_str().unwrap());
+        assert_eq!(staged.file_name().unwrap(), "0.1.0.lrplug");
+        assert!(staged.starts_with(install_root.join("packages").join("stage-demo")));
+        assert!(staged.is_file());
+        assert!(staged.with_extension("json").is_file());
+    }
+
+    #[tokio::test]
+    async fn package_stage_rejects_a_digest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "stage-demo", "0.1.0");
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/stage",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": package, "sha256": "0".repeat(64) }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

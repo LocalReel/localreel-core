@@ -519,6 +519,11 @@ impl PluginHost {
         self.shared.verifications.as_ref()
     }
 
+    /// Where generations and staged packages live (`data/plugins`).
+    pub fn install_root(&self) -> &std::path::Path {
+        &self.shared.install_root
+    }
+
     /// Tell newly started plugins where the host's capability broker lives.
     ///
     /// Call this before `start` so the first plugin generation receives the

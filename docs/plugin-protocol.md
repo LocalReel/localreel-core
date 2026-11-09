@@ -409,6 +409,12 @@ the publisher key is active, and reports `signature_verified`. `publisher` and
 `false`. This is an inspection API, not an install API: the config remains the
 source of truth.
 
+`POST /api/v1/plugins/packages/stage` takes the same fields plus an optional
+expected `sha256` and copies the verified package to
+`data/plugins/packages/<id>/<version>.lrplug` with a sibling `.json` metadata
+record. It still does not edit the config or start the plugin, so a bad stage
+can be deleted without touching a running generation.
+
 The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation is supported by listing several
 keys with the same publisher id:
