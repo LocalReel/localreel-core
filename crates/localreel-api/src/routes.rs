@@ -110,6 +110,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(inspect_plugin_package),
         )
         .route("/api/v1/plugins/packages/stage", post(stage_plugin_package))
+        .route("/api/v1/plugins/packages", get(list_staged_packages))
+        .route(
+            "/api/v1/plugins/packages/:id/:version",
+            delete(delete_staged_package),
+        )
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
@@ -907,6 +912,110 @@ async fn stage_plugin_package(
         "manifest": manifest,
         "sha256": sha256,
         "signature_verified": signature_verified,
+    })))
+}
+
+async fn list_staged_packages(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = state.plugins.install_root().join("packages");
+    let mut entries = Vec::new();
+    let Ok(ids) = std::fs::read_dir(&root) else {
+        return Ok(Json(serde_json::json!({ "packages": entries })));
+    };
+    for id in ids.flatten() {
+        let Ok(versions) = std::fs::read_dir(id.path()) else {
+            continue;
+        };
+        for version in versions.flatten() {
+            let path = version.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let package = id.path().join(format!("{stem}.lrplug"));
+            if !package.is_file() {
+                continue;
+            }
+            let metadata: serde_json::Value = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(serde_json::Value::Null);
+            entries.push(serde_json::json!({
+                "id": id.file_name().to_string_lossy(),
+                "version": stem,
+                "path": package.to_string_lossy(),
+                "metadata": metadata,
+            }));
+        }
+    }
+    entries.sort_by(|left, right| {
+        left["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["id"].as_str().unwrap_or_default())
+            .then_with(|| {
+                left["version"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["version"].as_str().unwrap_or_default())
+            })
+    });
+    Ok(Json(serde_json::json!({ "packages": entries })))
+}
+
+fn safe_package_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+async fn delete_staged_package(
+    State(state): State<Arc<AppState>>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !safe_package_segment(&id) || !safe_package_segment(&version) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_name",
+            "the staged package name is not valid",
+        ));
+    }
+    let directory = state.plugins.install_root().join("packages").join(&id);
+    let package = directory.join(format!("{version}.lrplug"));
+    if !package.is_file() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "package_not_staged",
+            "that staged package does not exist",
+        ));
+    }
+    if state.plugins.package_in_use(&package) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "package_in_use",
+            "that package is used by a configured plugin",
+        ));
+    }
+    std::fs::remove_file(&package).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unstage_failed",
+            format!("cannot remove the package: {error}"),
+        )
+    })?;
+    let _ = std::fs::remove_file(directory.join(format!("{version}.json")));
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "id": id,
+        "version": version,
     })))
 }
 
@@ -3729,6 +3838,56 @@ mod tests {
         assert!(staged.starts_with(install_root.join("packages").join("stage-demo")));
         assert!(staged.is_file());
         assert!(staged.with_extension("json").is_file());
+    }
+
+    #[tokio::test]
+    async fn staged_packages_can_be_listed_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "stage-demo", "0.1.0");
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/stage",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": package }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_as("/api/v1/plugins/packages", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["packages"][0]["id"], "stage-demo");
+        assert_eq!(value["packages"][0]["version"], "0.1.0");
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "DELETE",
+                "/api/v1/plugins/packages/stage-demo/0.1.0",
+                &session,
+                &csrf,
+                "{}".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!dir
+            .path()
+            .join("plugins/packages/stage-demo/0.1.0.lrplug")
+            .exists());
     }
 
     #[tokio::test]

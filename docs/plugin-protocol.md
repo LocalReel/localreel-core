@@ -415,6 +415,10 @@ expected `sha256` and copies the verified package to
 record. It still does not edit the config or start the plugin, so a bad stage
 can be deleted without touching a running generation.
 
+`GET /api/v1/plugins/packages` lists staged versions by reading those metadata
+files. `DELETE /api/v1/plugins/packages/<id>/<version>` removes one, but answers
+`409 package_in_use` when a configured plugin's package path resolves to it.
+
 The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation is supported by listing several
 keys with the same publisher id:

@@ -524,6 +524,21 @@ impl PluginHost {
         &self.shared.install_root
     }
 
+    /// Whether a configured plugin currently points at this package file.
+    pub fn package_in_use(&self, package: &std::path::Path) -> bool {
+        let target = package
+            .canonicalize()
+            .unwrap_or_else(|_| package.to_path_buf());
+        self.shared.read().entries.values().any(|entry| {
+            entry.spec.as_ref().is_some_and(|spec| {
+                spec.package
+                    .canonicalize()
+                    .unwrap_or_else(|_| spec.package.clone())
+                    == target
+            })
+        })
+    }
+
     /// Tell newly started plugins where the host's capability broker lives.
     ///
     /// Call this before `start` so the first plugin generation receives the
