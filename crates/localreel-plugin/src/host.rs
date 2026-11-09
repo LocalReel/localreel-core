@@ -433,7 +433,10 @@ impl PluginHost {
         stop_timeout: Duration,
         limits: PluginLimits,
     ) -> Self {
-        let verifications = match install_root.parent() {
+        let verifications = match install_root
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+        {
             Some(dir) => {
                 VerificationStore::with_anchor(db.clone(), &dir.join("plugin-verification.key"))
                     .unwrap_or_else(|_| VerificationStore::new(db.clone()))
