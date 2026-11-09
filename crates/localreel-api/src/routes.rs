@@ -4462,11 +4462,11 @@ mod tests {
             .uri("/api/v1/plugins/packages/upload")
             .header("host", "127.0.0.1:3001")
             .header("cookie", format!("localreel_session={session}"))
-            .header("x-localreel-csrf", csrf)
+            .header("x-localreel-csrf", csrf.clone())
             .header("content-type", "application/octet-stream")
-            .body(Body::from(bytes))
+            .body(Body::from(bytes.clone()))
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4484,6 +4484,24 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+
+        let incomplete = Request::builder()
+            .method("POST")
+            .uri("/api/v1/plugins/packages/upload")
+            .header("host", "127.0.0.1:3001")
+            .header("cookie", format!("localreel_session={session}"))
+            .header("x-localreel-csrf", csrf)
+            .header("x-localreel-publisher", "acme")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap();
+        let response = app.oneshot(incomplete).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "incomplete_signature");
     }
 
     #[tokio::test]
