@@ -1121,6 +1121,8 @@ async fn list_staged_packages(
 struct InstallPackageRequest {
     id: String,
     version: String,
+    #[serde(default)]
+    config: Option<serde_json::Value>,
 }
 
 /// Point the configuration at an already staged version. The new package is not
@@ -1302,7 +1304,20 @@ async fn install_staged_package(
             spec.enabled = true;
             state.plugins.replace(spec).is_ok()
         }
-        None => false,
+        None => {
+            let mut spec = localreel_plugin::PluginSpec::new(
+                package.clone(),
+                manifest,
+                request.config.unwrap_or_else(|| serde_json::json!({})),
+                true,
+            );
+            spec.expected_sha256 = Some(sha256.to_string());
+            spec.publisher = publisher.map(str::to_string);
+            spec.expected_signature = signature.map(str::to_string);
+            spec.publisher_public_keys = publisher_keys;
+            spec.app_container = state.config.plugin_runtime.app_container;
+            state.plugins.replace(spec).is_ok()
+        }
     };
     audit_package_event(
         &state,
