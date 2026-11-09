@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix; 3.28 anchor sidecar file; 3.29 anchor history; 3.30 anchor history rotation; 3.31 package preflight; 3.32 package staging; 3.33 staged package management)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix; 3.28 anchor sidecar file; 3.29 anchor history; 3.30 anchor history rotation; 3.31 package preflight; 3.32 package staging; 3.33 staged package management; 3.34 config install/rollback)
 - Date: 2026-11-08
 
 ## Context
@@ -182,6 +182,13 @@ The CMS/collector probe made the gap concrete:
     package and metadata, returning `409 package_in_use` when a configured
     plugin's package path resolves to it. The filesystem remains the only staged
     state; there is no database table to desync.
+33. **Phase 3.34 installs a staged version by updating the config.**
+    `POST /api/v1/plugins/packages/install` requires verified stage metadata and
+    a matching on-disk digest, then updates the matching `[[plugins]]` entry
+    (matched by the current package path) or appends a new enabled entry. It
+    never hot-swaps the supervisor: the response requires a server restart, so
+    the config stays the single source of truth. Installing an older staged
+    version is the rollback path.
 
 ## Consequences
 

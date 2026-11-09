@@ -880,6 +880,100 @@ impl Config {
     }
 }
 
+/// Point one plugin entry at a new package, or append a new entry when
+/// `old_package` is `None`. Existing `enabled` and `[plugins.config]` values are
+/// preserved; `publisher`/`signature` are removed when the new values are
+/// `None`. Returns `Ok(false)` when `old_package` was given but no entry matches.
+pub fn set_plugin_package(
+    path: &Path,
+    old_package: Option<&str>,
+    package: &str,
+    sha256: &str,
+    publisher: Option<&str>,
+    signature: Option<&str>,
+) -> Result<bool> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| KernelError::Config(format!("cannot read {}: {error}", path.display())))?;
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
+        KernelError::Config(format!("cannot parse {}: {error}", path.display()))
+    })?;
+    let mut found = false;
+    if let Some(old_package) = old_package {
+        let wanted = normalize_package(old_package);
+        if let Some(plugins) = document
+            .get_mut("plugins")
+            .and_then(|item| item.as_array_of_tables_mut())
+        {
+            for entry in plugins.iter_mut() {
+                let Some(value) = entry.get("package").and_then(|item| item.as_str()) else {
+                    continue;
+                };
+                if normalize_package(value) != wanted {
+                    continue;
+                }
+                entry["package"] = toml_edit::value(package);
+                entry["sha256"] = toml_edit::value(sha256);
+                match publisher {
+                    Some(publisher) => {
+                        entry["publisher"] = toml_edit::value(publisher);
+                    }
+                    None => {
+                        entry.remove("publisher");
+                    }
+                }
+                match signature {
+                    Some(signature) => {
+                        entry["signature"] = toml_edit::value(signature);
+                    }
+                    None => {
+                        entry.remove("signature");
+                    }
+                }
+                found = true;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    } else {
+        let plugins = document
+            .entry("plugins")
+            .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+        let plugins = plugins.as_array_of_tables_mut().ok_or_else(|| {
+            KernelError::Config("the plugins key is not an array of tables".into())
+        })?;
+        let mut entry = toml_edit::Table::new();
+        entry["package"] = toml_edit::value(package);
+        entry["enabled"] = toml_edit::value(true);
+        entry["sha256"] = toml_edit::value(sha256);
+        if let Some(publisher) = publisher {
+            entry["publisher"] = toml_edit::value(publisher);
+        }
+        if let Some(signature) = signature {
+            entry["signature"] = toml_edit::value(signature);
+        }
+        plugins.push(entry);
+    }
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "localreel.toml".to_string());
+    let temp = path.with_file_name(format!(".{file_name}.tmp"));
+    std::fs::write(&temp, document.to_string()).map_err(|error| {
+        KernelError::Config(format!("cannot write {}: {error}", temp.display()))
+    })?;
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&temp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        KernelError::Config(format!("cannot replace {}: {error}", path.display()))
+    })?;
+    Ok(true)
+}
+
 /// Turn one `[[plugins]]` entry on or off in the configuration file.
 ///
 /// Rewrites only the `enabled` key of the matching entry and keeps every other
@@ -1300,6 +1394,76 @@ mod tests {
         let mut config = Config::default();
         config.apply_file(file).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn updating_a_plugin_preserves_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(
+            &path,
+            r#"
+# operator notes
+[[plugins]]
+package = "plugins/demo.lrplug"
+enabled = true
+[plugins.config]
+root = "D:/library"
+
+[[plugins]]
+package = "plugins/other.lrplug"
+"#,
+        )
+        .unwrap();
+        let digest = "a".repeat(64);
+        let signature = "b".repeat(128);
+        assert!(set_plugin_package(
+            &path,
+            Some("plugins\\demo.lrplug"),
+            "data/plugins/packages/demo/0.2.0.lrplug",
+            &digest,
+            Some("acme"),
+            Some(&signature),
+        )
+        .unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# operator notes"));
+        let parsed: ConfigFile = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.plugins[0].package,
+            PathBuf::from("data/plugins/packages/demo/0.2.0.lrplug")
+        );
+        assert_eq!(parsed.plugins[0].sha256.as_deref(), Some(digest.as_str()));
+        assert_eq!(parsed.plugins[0].publisher.as_deref(), Some("acme"));
+        assert_eq!(
+            parsed.plugins[0].signature.as_deref(),
+            Some(signature.as_str())
+        );
+        assert_eq!(parsed.plugins[0].config["root"], "D:/library");
+        assert_eq!(
+            parsed.plugins[1].package,
+            PathBuf::from("plugins/other.lrplug")
+        );
+    }
+
+    #[test]
+    fn appending_a_plugin_adds_an_enabled_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localreel.toml");
+        std::fs::write(&path, "# top\n").unwrap();
+        assert!(set_plugin_package(
+            &path,
+            None,
+            "data/plugins/packages/demo/0.1.0.lrplug",
+            &"a".repeat(64),
+            Some("acme"),
+            Some(&"b".repeat(128)),
+        )
+        .unwrap());
+        let parsed: ConfigFile = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.plugins.len(), 1);
+        assert!(parsed.plugins[0].enabled);
+        assert_eq!(parsed.plugins[0].publisher.as_deref(), Some("acme"));
     }
 
     #[test]

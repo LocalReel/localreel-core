@@ -112,6 +112,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/plugins/packages/stage", post(stage_plugin_package))
         .route("/api/v1/plugins/packages", get(list_staged_packages))
         .route(
+            "/api/v1/plugins/packages/install",
+            post(install_staged_package),
+        )
+        .route(
             "/api/v1/plugins/packages/:id/:version",
             delete(delete_staged_package),
         )
@@ -964,6 +968,117 @@ async fn list_staged_packages(
             })
     });
     Ok(Json(serde_json::json!({ "packages": entries })))
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallPackageRequest {
+    id: String,
+    version: String,
+}
+
+/// Point the configuration at an already staged version. The new package is not
+/// started by this call; the caller must restart the server. Repeating this with
+/// an older staged version is the rollback path.
+async fn install_staged_package(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<InstallPackageRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !safe_package_segment(&request.id) || !safe_package_segment(&request.version) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_package_name",
+            "the staged package name is not valid",
+        ));
+    }
+    let directory = state
+        .plugins
+        .install_root()
+        .join("packages")
+        .join(&request.id);
+    let package = directory.join(format!("{}.lrplug", request.version));
+    let metadata_path = directory.join(format!("{}.json", request.version));
+    if !package.is_file() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "package_not_staged",
+            "that staged package does not exist",
+        ));
+    }
+    let metadata: serde_json::Value = std::fs::read(&metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "metadata_missing",
+                "the staged package has no metadata",
+            )
+        })?;
+    if metadata["signature_verified"].as_bool() != Some(true) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "unsigned_package",
+            "only packages with a verified publisher signature can be installed",
+        ));
+    }
+    let sha256 = metadata["sha256"].as_str().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "metadata_missing",
+            "the staged metadata has no sha256",
+        )
+    })?;
+    let actual = localreel_plugin::package::digest(&package).map_err(|error| {
+        ApiError::new(StatusCode::CONFLICT, "invalid_package", error.to_string())
+    })?;
+    if !actual.eq_ignore_ascii_case(sha256) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "digest_mismatch",
+            "the staged package no longer matches its metadata",
+        ));
+    }
+    let publisher = metadata["publisher"].as_str();
+    let signature = metadata["signature"].as_str();
+    let config_path = state.config_source.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "config_unavailable",
+            "there is no configuration file to update",
+        )
+    })?;
+    let previous = state.plugins.package_of(&request.id);
+    let package_text = package.to_string_lossy();
+    let updated = localreel_kernel::config::set_plugin_package(
+        config_path,
+        previous.as_deref(),
+        &package_text,
+        sha256,
+        publisher,
+        signature,
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_write_failed",
+            error.to_string(),
+        )
+    })?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "plugin_not_found",
+            "the running host has no plugin with that id",
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "installed": true,
+        "id": request.id,
+        "version": request.version,
+        "package": package,
+        "config": config_path,
+        "restart_required": true,
+    })))
 }
 
 fn safe_package_segment(value: &str) -> bool {
@@ -3888,6 +4003,43 @@ mod tests {
             .path()
             .join("plugins/packages/stage-demo/0.1.0.lrplug")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn install_rejects_an_unsigned_staged_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "stage-demo", "0.1.0");
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/stage",
+                &session,
+                &csrf,
+                serde_json::json!({ "path": package }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/install",
+                &session,
+                &csrf,
+                serde_json::json!({ "id": "stage-demo", "version": "0.1.0" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "unsigned_package");
     }
 
     #[tokio::test]

@@ -419,6 +419,14 @@ can be deleted without touching a running generation.
 files. `DELETE /api/v1/plugins/packages/<id>/<version>` removes one, but answers
 `409 package_in_use` when a configured plugin's package path resolves to it.
 
+`POST /api/v1/plugins/packages/install` with `{id, version}` points the matching
+`[[plugins]]` entry at the staged file and updates its `sha256`/`publisher`/
+`signature`; a new id appends an enabled entry. It requires
+`signature_verified: true` in the stage metadata and re-checks the digest, but it
+does **not** start the plugin. The response says `restart_required: true`; after
+a server restart the new generation loads and the version is recorded. Installing
+an older staged version for the same id is the rollback path.
+
 The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation is supported by listing several
 keys with the same publisher id:
