@@ -34,6 +34,7 @@ pub struct VerificationStore {
     db: Database,
     anchor: Option<Arc<SigningKey>>,
     anchor_export: Option<PathBuf>,
+    anchor_history: Option<PathBuf>,
 }
 
 impl VerificationStore {
@@ -42,6 +43,7 @@ impl VerificationStore {
             db,
             anchor: None,
             anchor_export: None,
+            anchor_history: None,
         }
     }
 
@@ -52,6 +54,7 @@ impl VerificationStore {
             db,
             anchor: Some(key),
             anchor_export: Some(key_path.with_extension("anchor.json")),
+            anchor_history: Some(key_path.with_extension("anchors.jsonl")),
         })
     }
 
@@ -143,6 +146,14 @@ impl VerificationStore {
                     "audit anchor export: cannot write {}: {error}",
                     path.display()
                 );
+            }
+            if let Some(history) = &self.anchor_history {
+                if let Err(error) = append_anchor(history, &anchor) {
+                    eprintln!(
+                        "audit anchor history: cannot append {}: {error}",
+                        history.display()
+                    );
+                }
             }
         }
         Ok(PackageVerification {
@@ -385,6 +396,23 @@ fn write_anchor(path: &Path, anchor: &VerificationAnchor) -> std::io::Result<()>
     std::fs::rename(&temp, path)
 }
 
+fn append_anchor(path: &Path, anchor: &VerificationAnchor) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut line = serde_json::to_vec(anchor)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&line)
+}
+
 fn load_or_create_key(path: &Path) -> Result<SigningKey> {
     if path.is_file() {
         let text = std::fs::read_to_string(path)
@@ -524,6 +552,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("audit.anchor.json")).unwrap())
                 .unwrap();
         assert_eq!(exported, anchor);
+        let history = std::fs::read_to_string(dir.path().join("audit.anchors.jsonl")).unwrap();
+        let lines: Vec<&str> = history.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let last: VerificationAnchor = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(last, anchor);
     }
 
     #[test]
