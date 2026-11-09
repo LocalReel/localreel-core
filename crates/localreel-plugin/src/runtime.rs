@@ -133,10 +133,24 @@ fn wrapper_path() -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn unshare_available() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("unshare").is_file())
+    use std::sync::OnceLock;
+
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        if !std::env::split_paths(&path).any(|dir| dir.join("unshare").is_file()) {
+            return false;
+        }
+        std::process::Command::new("unshare")
+            .args(["-Urn", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -778,6 +792,14 @@ mod tests {
             command.get_current_dir(),
             Some(std::path::Path::new("data/plugins/example"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_support_probes_unshare() {
+        let support = sandbox_support();
+        assert!(support.app_container);
+        assert!(support.unshare_present, "unshare probe should succeed");
     }
 
     #[cfg(target_os = "linux")]

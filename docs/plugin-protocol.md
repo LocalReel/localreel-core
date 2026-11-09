@@ -596,8 +596,9 @@ so the admin page can show the effective execution mode. Entries that fail
 before startup still carry the configured sandbox intent when the server can
 resolve it. `GET /api/v1/plugins/sandbox-status` reports the build's platform
 and whether AppContainer/netns prerequisites are actually present
-(`wrapper_present`, `unshare_present`), which lets an operator self-check before
-turning the switch on.
+(`wrapper_present`, `unshare_present`). On Linux `unshare_present` is a cached
+probe that really runs `unshare -Urn true`, not a PATH check; an operator can
+self-check before turning the switch on.
 
 | State | Meaning |
 |---|---|
