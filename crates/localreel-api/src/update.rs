@@ -36,7 +36,10 @@ pub fn fetch(feed: &str) -> Result<Release, String> {
     let response = agent
         .get(feed)
         .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", concat!("LocalReel/", env!("CARGO_PKG_VERSION")))
+        .set(
+            "User-Agent",
+            concat!("LocalReel/", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .map_err(|error| format!("release feed: {error}"))?;
     let body = response
@@ -193,7 +196,10 @@ mod tests {
         }"#;
         let release = parse_release(body).unwrap();
         assert_eq!(release.version, "0.5.5");
-        assert_eq!(release.setup_url.as_deref(), Some("https://example.invalid/setup.exe"));
+        assert_eq!(
+            release.setup_url.as_deref(),
+            Some("https://example.invalid/setup.exe")
+        );
         assert!(is_newer(&release.version, "0.5.4"));
     }
 
