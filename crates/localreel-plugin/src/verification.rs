@@ -358,7 +358,32 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
         file.write_all(hex(&seed).as_bytes())
             .map_err(|error| KernelError::Storage(format!("audit key write: {error}")))?;
     }
+    #[cfg(windows)]
+    restrict_key_acl(path);
     Ok(SigningKey::from_bytes(&seed))
+}
+
+#[cfg(windows)]
+fn restrict_key_acl(path: &Path) {
+    let Some(user) = std::env::var_os("USERNAME") else {
+        eprintln!("audit key ACL: USERNAME is unavailable");
+        return;
+    };
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{}:F", user.to_string_lossy()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !status.is_ok_and(|status| status.success()) {
+        eprintln!(
+            "audit key ACL: failed to restrict {} to the current user",
+            path.display()
+        );
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -397,6 +422,22 @@ mod tests {
         migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
         let store = VerificationStore::with_anchor(db, &dir.path().join("audit.key")).unwrap();
         (dir, store)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_key_acl_is_restricted_to_the_current_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.key");
+        load_or_create_key(&path).unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        let user = std::env::var("USERNAME").unwrap();
+        assert!(text.contains(&user), "{text}");
+        assert!(!text.contains("BUILTIN\\Users"), "{text}");
     }
 
     #[test]

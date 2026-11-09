@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL)
 - Date: 2026-11-08
 
 ## Context
@@ -154,8 +154,9 @@ The CMS/collector probe made the gap concrete:
 28. **Phase 3.23 signs the chain head.** The host generates an Ed25519 audit key
     under the data directory, signs each new chain head and stores the anchor.
     `verifications/verify` checks both the chain and the latest anchor signature.
-    The key is local; an attacker who can read the data directory can forge
-    future anchors, so this is not a remote transparency log.
+    The key is `0600` on Unix; Windows removes inherited ACLs and grants the
+    current user. The key is local; an attacker who can read the data directory
+    can forge future anchors, so this is not a remote transparency log.
 
 ## Consequences
 
