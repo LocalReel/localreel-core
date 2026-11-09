@@ -4,7 +4,7 @@
 //! that a signature alone does not: *which* key verified *which* package, and
 //! when. Rows are written by the host before a plugin is extracted.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -12,7 +12,7 @@ use localreel_kernel::db::Database;
 use localreel_kernel::error::{KernelError, Result};
 use localreel_kernel::time::now_secs;
 use rusqlite::{params, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -33,11 +33,16 @@ pub struct PackageVerification {
 pub struct VerificationStore {
     db: Database,
     anchor: Option<Arc<SigningKey>>,
+    anchor_export: Option<PathBuf>,
 }
 
 impl VerificationStore {
     pub fn new(db: Database) -> Self {
-        Self { db, anchor: None }
+        Self {
+            db,
+            anchor: None,
+            anchor_export: None,
+        }
     }
 
     /// Load (or create) the host audit key and sign every new chain head.
@@ -46,6 +51,7 @@ impl VerificationStore {
         Ok(Self {
             db,
             anchor: Some(key),
+            anchor_export: Some(key_path.with_extension("anchor.json")),
         })
     }
 
@@ -124,6 +130,21 @@ impl VerificationStore {
             }
             Ok((connection.last_insert_rowid(), chain))
         })?;
+        if let (Some(key), Some(path)) = (&self.anchor, &self.anchor_export) {
+            let signature = key.sign(chain_hash.as_bytes());
+            let anchor = VerificationAnchor {
+                chain_hash: chain_hash.clone(),
+                signature: hex(signature.to_bytes().as_slice()),
+                public_key: hex(key.verifying_key().as_bytes()),
+                at,
+            };
+            if let Err(error) = write_anchor(path, &anchor) {
+                eprintln!(
+                    "audit anchor export: cannot write {}: {error}",
+                    path.display()
+                );
+            }
+        }
         Ok(PackageVerification {
             id,
             plugin_id: plugin_id.to_string(),
@@ -191,7 +212,7 @@ fn row_to_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageVerif
     })
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationAnchor {
     pub chain_hash: String,
     pub signature: String,
@@ -353,6 +374,17 @@ fn verify_anchor(chain: &str, signature: &str, public_key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn write_anchor(path: &Path, anchor: &VerificationAnchor) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(anchor)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, body)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&temp, path)
+}
+
 fn load_or_create_key(path: &Path) -> Result<SigningKey> {
     if path.is_file() {
         let text = std::fs::read_to_string(path)
@@ -472,7 +504,7 @@ mod tests {
 
     #[test]
     fn anchor_signs_the_chain_head() {
-        let (_dir, store) = anchored_store();
+        let (dir, store) = anchored_store();
         store
             .record("demo", "0.1.0", &"a".repeat(64), Some("acme"), None, true)
             .unwrap();
@@ -487,6 +519,11 @@ mod tests {
         assert_eq!(anchor.chain_hash.len(), 64);
         assert_eq!(anchor.public_key.len(), 64);
         assert_eq!(anchor.signature.len(), 128);
+
+        let exported: VerificationAnchor =
+            serde_json::from_slice(&std::fs::read(dir.path().join("audit.anchor.json")).unwrap())
+                .unwrap();
+        assert_eq!(exported, anchor);
     }
 
     #[test]

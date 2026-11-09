@@ -1,6 +1,6 @@
 # ADR-019: Capabilities are disclosed, granted per version, and attributed
 
-- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix)
+- Status: Accepted (phase 1; phase 2.1–2.5 broker; phase 3.1 pinning; 3.2 signatures; 3.3 resource ceilings; 3.4 stdio transport; 3.5 key rotation; 3.6 verification records; 3.7 AppContainer primitive; 3.8 stdio broker; 3.9 AppContainer runtime; 3.10 fs.read broker; 3.11 reference storage migration; 3.12 handle-based read verification; 3.13 full host/API chain; 3.14 AppContainer full chain; 3.15 execution-mode descriptor; 3.16 handle-based stat; 3.17 failed-entry sandbox intent; 3.18 Linux netns; 3.19 Linux command test; 3.20 verification hash chain; 3.21 sandbox readiness; 3.22 unshare probe; 3.23 signed chain head; 3.24 audit key ACL; 3.25 Linux fd verification; 3.26 anchor export; 3.27 platform support matrix; 3.28 anchor sidecar file)
 - Date: 2026-11-08
 
 ## Context
@@ -159,8 +159,10 @@ The CMS/collector probe made the gap concrete:
     can forge future anchors, so this is not a remote transparency log.
 29. **Phase 3.26 exports the anchor for external publication.**
     `GET /api/v1/plugins/verifications/anchor` returns the latest chain hash,
-    signature, public key and timestamp. Publishing that record elsewhere is an
-    operator action; the host does not push it automatically.
+    signature, public key and timestamp. The same record is atomically written to
+    `plugin-verification.anchor.json` beside the audit key, so a backup or
+    external publisher does not need the API. Publishing that record elsewhere
+    is an operator action; the host does not push it automatically.
 
 ## Consequences
 
