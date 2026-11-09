@@ -112,6 +112,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(plugin_verification_chain),
         )
         .route(
+            "/api/v1/plugins/verifications/anchor",
+            get(plugin_verification_anchor),
+        )
+        .route(
             "/api/v1/plugins/:id/capabilities",
             get(plugin_capabilities).post(grant_plugin_capability),
         )
@@ -721,6 +725,22 @@ async fn plugin_verification_chain(
         )
     })?;
     Ok(Json(store.verify_chain()?))
+}
+
+/// Latest signed chain head, suitable for publishing to an external log.
+async fn plugin_verification_anchor(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.plugins.verifications().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the verification store is not available",
+        )
+    })?;
+    Ok(Json(
+        serde_json::json!({ "anchor": store.latest_anchor()? }),
+    ))
 }
 
 /// What a plugin asks for, what it was granted, and the host's own risk text.
@@ -3439,6 +3459,23 @@ mod tests {
         assert!(value["app_container"].is_boolean());
         assert!(value["wrapper_present"].is_boolean());
         assert!(value["unshare_present"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn verification_anchor_is_null_without_an_audit_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/verifications/anchor", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["anchor"].is_null());
     }
 
     #[tokio::test]

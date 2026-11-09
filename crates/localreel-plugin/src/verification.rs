@@ -192,6 +192,14 @@ fn row_to_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageVerif
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VerificationAnchor {
+    pub chain_hash: String,
+    pub signature: String,
+    pub public_key: String,
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VerificationChain {
     pub checked: u64,
     pub valid: bool,
@@ -263,6 +271,28 @@ impl VerificationStore {
                 anchored,
                 anchor_valid,
             })
+        })
+    }
+
+    /// Latest signed chain head, for publishing to an external log.
+    pub fn latest_anchor(&self) -> Result<Option<VerificationAnchor>> {
+        self.db.with_read(|connection| {
+            connection
+                .query_row(
+                    "SELECT chain_hash, signature, public_key, at
+                     FROM plugin_verification_anchors ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok(VerificationAnchor {
+                            chain_hash: row.get(0)?,
+                            signature: row.get(1)?,
+                            public_key: row.get(2)?,
+                            at: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
         })
     }
 }
@@ -453,6 +483,10 @@ mod tests {
         assert!(chain.valid);
         assert!(chain.anchored);
         assert_eq!(chain.anchor_valid, Some(true));
+        let anchor = store.latest_anchor().unwrap().unwrap();
+        assert_eq!(anchor.chain_hash.len(), 64);
+        assert_eq!(anchor.public_key.len(), 64);
+        assert_eq!(anchor.signature.len(), 128);
     }
 
     #[test]

@@ -61,4 +61,4 @@ pub use schedule::{PluginSchedule, ScheduleStore};
 pub use secrets::{SecretHandle, SecretStore};
 pub use storage::PluginStorage;
 pub use supervisor::ProviderSink;
-pub use verification::{PackageVerification, VerificationStore};
+pub use verification::{PackageVerification, VerificationAnchor, VerificationStore};

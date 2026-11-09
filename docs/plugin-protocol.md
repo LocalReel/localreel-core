@@ -429,9 +429,11 @@ deleted or edited row breaks the chain; `GET /api/v1/plugins/verifications/verif
 recomputes it. The host also signs each chain head with an Ed25519 audit key
 (`data/plugin-verification.key`, generated on first use with `0600` on Unix and
 an inherited-ACL removal plus current-user grant on Windows) and stores the
-anchor; `verify` reports `anchored` and `anchor_valid`. This detects local
-tampering, but the key and database live on the same machine, so it is not a
-public log.
+anchor; `verify` reports `anchored` and `anchor_valid`. The latest anchor is
+available at `GET /api/v1/plugins/verifications/anchor` (chain hash, signature,
+public key, timestamp) so an operator can publish it to an external log. This
+detects local tampering, but the key and database live on the same machine, so
+it is not a public log by itself.
 
 ## Resource ceilings (phase 3.3)
 
