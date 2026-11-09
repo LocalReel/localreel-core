@@ -75,6 +75,9 @@ pub struct Config {
     /// Must be explicitly enabled to bind beyond loopback. The default is
     /// local-only, matching the trust model of the previous LocalReel app.
     pub allow_remote: bool,
+    /// Origins accepted from a remote browser, on top of the one derived from
+    /// its own `Host`. Only meaningful together with `allow_remote`.
+    pub allowed_origins: Vec<String>,
     pub jobs: JobsConfig,
     pub media: MediaConfig,
     pub scan: ScanConfig,
@@ -288,6 +291,7 @@ impl Default for Config {
             log_dir,
             web_dir: None,
             allow_remote: false,
+            allowed_origins: Vec::new(),
             data_dir: data_dir.clone(),
             jobs: JobsConfig {
                 workers: default_worker_count(),
@@ -449,6 +453,9 @@ impl Config {
         }
         if let Some(value) = file.server.allow_remote {
             self.allow_remote = value;
+        }
+        if !file.server.allowed_origins.is_empty() {
+            self.allowed_origins = file.server.allowed_origins;
         }
         if let Some(value) = file.server.web_dir {
             self.web_dir = Some(value);
@@ -1121,6 +1128,10 @@ struct ServerFile {
     port: Option<u16>,
     allow_remote: Option<bool>,
     web_dir: Option<PathBuf>,
+    /// Extra origins accepted when remote access is on, for a reverse proxy
+    /// whose public name differs from the Host header the server sees.
+    #[serde(default)]
+    allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -462,6 +462,7 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "port": config.port,
         "mode": config.mode.as_str(),
         "allow_remote": config.allow_remote,
+        "allowed_origins": config.allowed_origins,
         // Both halves are needed: a LAN address only helps if the loopback
         // guard is told to accept it.
         "lan": !loopback && config.allow_remote,
