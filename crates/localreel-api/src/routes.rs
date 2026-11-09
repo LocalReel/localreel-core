@@ -753,6 +753,7 @@ fn audit_package_event(
     action: &str,
     result: &str,
     detail: &str,
+    user_id: Option<i64>,
 ) {
     if let Some(audit) = state.plugins.audit() {
         let _ = audit.record_event(&AuditEvent {
@@ -767,7 +768,7 @@ fn audit_package_event(
             duration_ms: None,
             request_id: None,
             job_id: None,
-            user_id: None,
+            user_id,
         });
     }
 }
@@ -830,6 +831,7 @@ struct StagePackageRequest {
 /// This does not edit the configuration or start the plugin.
 async fn stage_plugin_package(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Json(request): Json<StagePackageRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let canonical = std::fs::canonicalize(&request.path).map_err(|error| {
@@ -944,6 +946,7 @@ async fn stage_plugin_package(
             "version={} sha256={} signature_verified={signature_verified}",
             manifest.version, sha256
         ),
+        Some(current.user.id),
     );
     Ok(Json(serde_json::json!({
         "staged_path": destination,
@@ -1016,6 +1019,7 @@ struct InstallPackageRequest {
 /// an older staged version is the rollback path.
 async fn install_staged_package(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Json(request): Json<InstallPackageRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !safe_package_segment(&request.id) || !safe_package_segment(&request.version) {
@@ -1056,6 +1060,7 @@ async fn install_staged_package(
             "package.install",
             "rejected",
             &format!("version={} reason=unsigned", request.version),
+            Some(current.user.id),
         );
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1122,6 +1127,7 @@ async fn install_staged_package(
             "version={} signature_verified=true restart_required=true",
             request.version
         ),
+        Some(current.user.id),
     );
     Ok(Json(serde_json::json!({
         "installed": true,
@@ -1146,6 +1152,7 @@ fn safe_package_segment(value: &str) -> bool {
 
 async fn delete_staged_package(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !safe_package_segment(&id) || !safe_package_segment(&version) {
@@ -1185,6 +1192,7 @@ async fn delete_staged_package(
         "package.unstage",
         "deleted",
         &format!("version={version}"),
+        Some(current.user.id),
     );
     Ok(Json(serde_json::json!({
         "deleted": true,
@@ -4153,7 +4161,8 @@ mod tests {
             .unwrap();
         assert!(
             entries.iter().any(|entry| entry.action == "package.install"
-                && entry.result.as_deref() == Some("installed")),
+                && entry.result.as_deref() == Some("installed")
+                && entry.user_id.is_some()),
             "{entries:?}"
         );
     }

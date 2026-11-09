@@ -428,7 +428,7 @@ a server restart the new generation loads and the version is recorded. Installin
 an older staged version for the same id is the rollback path. Stage, install and
 unstage append `package.*` rows to the plugin audit trail (`package.stage`,
 `package.install`, `package.unstage`); rejected unsigned installs are recorded
-with `result = "rejected"`.
+with `result = "rejected"`. Rows carry the authenticated administrator id.
 
 The trust anchor is the configuration file: an attacker who can rewrite it can
 also replace the publisher key. Key rotation is supported by listing several

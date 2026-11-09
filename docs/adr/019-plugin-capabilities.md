@@ -191,8 +191,8 @@ The CMS/collector probe made the gap concrete:
     version is the rollback path.
 34. **Phase 3.35 audits package lifecycle.** Stage, install and unstage append
     `package.*` rows to `plugin_audit` with id, version, result and reason;
-    rejected unsigned installs record `result = "rejected"`. There is no
-    authenticated user id on these rows yet.
+    rejected unsigned installs record `result = "rejected"`. The authenticated
+    administrator id is copied from the request.
 
 ## Consequences
 
