@@ -218,6 +218,7 @@ pub async fn list_users(State(state): State<Arc<AppState>>) -> Result<Json<Vec<U
 
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<User>), ApiError> {
     let role = match body.role.as_deref() {
@@ -233,6 +234,14 @@ pub async fn create_user(
     let user = state
         .accounts
         .create_user(&body.username, &body.password, role)?;
+    // Who exists in a household is exactly what people forget later.
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "user.create",
+        Some(&user.username),
+        Some(user.role.as_str()),
+    );
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -246,12 +255,30 @@ pub async fn update_user(
         return Err(ApiError::bad_request("you cannot disable your own account"));
     }
     let role = body.role.as_deref().map(Role::parse).transpose()?;
+    // The password itself is never recorded; that it was replaced is.
+    let changed = [
+        body.role.as_deref().map(|_| "role"),
+        body.enabled.map(|_| "enabled"),
+        body.password.as_ref().map(|_| "password"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(",");
     let patch = UserPatch {
         role,
         enabled: body.enabled,
         password: body.password,
     };
-    Ok(Json(state.accounts.update_user(id, patch)?))
+    let user = state.accounts.update_user(id, patch)?;
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "user.update",
+        Some(&user.username),
+        Some(&changed),
+    );
+    Ok(Json(user))
 }
 
 pub async fn delete_user(
@@ -263,6 +290,13 @@ pub async fn delete_user(
         return Err(ApiError::bad_request("you cannot delete your own account"));
     }
     state.accounts.delete_user(id)?;
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "user.delete",
+        Some(&id.to_string()),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
