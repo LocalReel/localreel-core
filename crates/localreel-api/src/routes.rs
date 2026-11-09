@@ -747,6 +747,31 @@ async fn inspect_plugin_package(
     })))
 }
 
+fn audit_package_event(
+    state: &AppState,
+    plugin_id: &str,
+    action: &str,
+    result: &str,
+    detail: &str,
+) {
+    if let Some(audit) = state.plugins.audit() {
+        let _ = audit.record_event(&AuditEvent {
+            plugin_id,
+            capability: None,
+            action,
+            result,
+            detail: Some(detail),
+            scope_digest: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            request_id: None,
+            job_id: None,
+            user_id: None,
+        });
+    }
+}
+
 fn verify_package_signature(
     state: &AppState,
     package: &std::path::Path,
@@ -910,6 +935,16 @@ async fn stage_plugin_package(
         )
     })?;
 
+    audit_package_event(
+        &state,
+        &manifest.id,
+        "package.stage",
+        "staged",
+        &format!(
+            "version={} sha256={} signature_verified={signature_verified}",
+            manifest.version, sha256
+        ),
+    );
     Ok(Json(serde_json::json!({
         "staged_path": destination,
         "metadata_path": sidecar,
@@ -1015,6 +1050,13 @@ async fn install_staged_package(
             )
         })?;
     if metadata["signature_verified"].as_bool() != Some(true) {
+        audit_package_event(
+            &state,
+            &request.id,
+            "package.install",
+            "rejected",
+            &format!("version={} reason=unsigned", request.version),
+        );
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "unsigned_package",
@@ -1071,6 +1113,16 @@ async fn install_staged_package(
             "the running host has no plugin with that id",
         ));
     }
+    audit_package_event(
+        &state,
+        &request.id,
+        "package.install",
+        "installed",
+        &format!(
+            "version={} signature_verified=true restart_required=true",
+            request.version
+        ),
+    );
     Ok(Json(serde_json::json!({
         "installed": true,
         "id": request.id,
@@ -1127,6 +1179,13 @@ async fn delete_staged_package(
         )
     })?;
     let _ = std::fs::remove_file(directory.join(format!("{version}.json")));
+    audit_package_event(
+        &state,
+        &id,
+        "package.unstage",
+        "deleted",
+        &format!("version={version}"),
+    );
     Ok(Json(serde_json::json!({
         "deleted": true,
         "id": id,
@@ -4041,6 +4100,7 @@ mod tests {
         let state = state_with_config(dir.path(), Some(config_path.clone()), vec![publisher]);
         state.plugins.record_disabled(&old_package);
         let (session, csrf) = sign_in(&state);
+        let audit = state.clone();
         let app = router(state);
 
         let response = app
@@ -4085,6 +4145,17 @@ mod tests {
         assert!(!text.contains("old.lrplug"), "{text}");
         assert!(text.contains("publisher = "), "{text}");
         assert!(text.contains("signature = "), "{text}");
+        let entries = audit
+            .plugins
+            .audit()
+            .unwrap()
+            .recent(Some("stage-demo"), 10)
+            .unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.action == "package.install"
+                && entry.result.as_deref() == Some("installed")),
+            "{entries:?}"
+        );
     }
 
     #[tokio::test]
