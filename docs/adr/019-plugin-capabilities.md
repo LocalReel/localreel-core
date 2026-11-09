@@ -185,12 +185,12 @@ The CMS/collector probe made the gap concrete:
 33. **Phase 3.34 installs a staged version by updating the config.**
     `POST /api/v1/plugins/packages/install` requires verified stage metadata and
     a matching on-disk digest, then updates the matching `[[plugins]]` entry
-    (matched by the current package path) or appends a new enabled entry. For an
-    id the supervisor already knows, the host replaces the entry in place
-    (`restarted: true`); a first install still reports `restart_required: true`.
-    The config stays the source of truth, so a crash before the restart leaves
-    the next boot on the new version. Installing an older staged version is the
-    rollback path.
+    (matched by the current package path) or appends a new enabled entry. If the
+    supervisor is already running, the host replaces or inserts the entry in
+    place (`restarted: true`), using the optional request `config` for a first
+    install; otherwise it reports `restart_required: true`. The config stays the
+    source of truth, so a crash before the restart leaves the next boot on the
+    new version. Installing an older staged version is the rollback path.
 34. **Phase 3.35 audits package lifecycle.** Stage, install and unstage append
     `package.*` rows to `plugin_audit` with id, version, result and reason;
     rejected unsigned/digest/config/staging failures record

@@ -429,8 +429,9 @@ files. `DELETE /api/v1/plugins/packages/<id>/<version>` removes one, but answers
 `[[plugins]]` entry at the staged file and updates its `sha256`/`publisher`/
 `signature`; a new id appends an enabled entry. It requires
 `signature_verified: true` in the stage metadata and re-checks the digest. When
-the plugin already has a running supervisor entry, the host replaces that entry
-in place and the response reports `restarted: true`; otherwise it reports
+the plugin supervisor is running, the host replaces an existing entry or inserts
+a first one and starts it, using the optional request `config`; the response
+reports `restarted: true`. Without a supervisor it reports
 `restart_required: true` and the config change loads on the next server restart.
 Installing an older staged version for the same id is the rollback path. Stage, install and
 unstage append `package.*` rows to the plugin audit trail (`package.stage`,
