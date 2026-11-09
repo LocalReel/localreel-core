@@ -119,6 +119,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/update/apply", post(update_apply))
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
+        .route("/api/v1/admin/audit", get(admin_audit))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
@@ -414,10 +415,37 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
 /// Ask the process to stop. Administrators only: this is the desktop escape
 /// hatch on platforms without a tray icon, and it uses the same graceful path
 /// as Ctrl+C, so in-flight requests still finish.
-async fn shutdown_server(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn shutdown_server(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "server.shutdown",
+        None,
+        Some("from the console"),
+    );
     // The server logs the shutdown itself; this only raises the signal.
     state.shutdown.notify_one();
     Json(serde_json::json!({ "status": "shutting-down" }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminAuditQuery {
+    limit: Option<i64>,
+}
+
+/// Recent administrator actions, newest first.
+async fn admin_audit(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AdminAuditQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let entries = state.media.admin_audit(query.limit.unwrap_or(50))?;
+    Ok(Json(serde_json::json!({
+        "items": entries,
+        "total": entries.len(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2237,6 +2265,7 @@ async fn delete_source(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(query): Query<DeleteSourceQuery>,
+    Extension(current): Extension<CurrentUser>,
 ) -> Result<Json<DeleteSourceReport>, ApiError> {
     let report = state.media.delete_source(
         id,
@@ -2247,6 +2276,18 @@ async fn delete_source(
     )?;
     if !report.dry_run {
         state.refresh_watchers();
+        // A source disappearing takes its media with it; that is exactly the
+        // kind of action someone asks about a month later.
+        let _ = state.media.record_admin(
+            Some(current.user.id),
+            Some(&current.user.username),
+            "source.delete",
+            Some(&id.to_string()),
+            query
+                .delete_media
+                .unwrap_or(false)
+                .then_some("media removed"),
+        );
     }
     Ok(Json(report))
 }

@@ -43,5 +43,10 @@ pub fn list() -> &'static [Migration] {
             name: "media_share",
             sql: include_str!("../migrations/0008_media_share.sql"),
         },
+        Migration {
+            version: 9,
+            name: "admin_audit",
+            sql: include_str!("../migrations/0009_admin_audit.sql"),
+        },
     ]
 }

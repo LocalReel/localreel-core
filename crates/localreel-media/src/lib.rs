@@ -5,6 +5,7 @@
 //! static file serving or the web UI.
 
 pub mod account;
+pub mod audit;
 pub mod backup;
 pub mod gate;
 pub mod jobs;
@@ -27,6 +28,7 @@ pub mod watch;
 pub use account::{
     session_public_id, AccountService, CurrentUser, Role, Session, SessionInfo, User, UserPatch,
 };
+pub use audit::AdminAuditEntry;
 pub use backup::{
     export_backup, import_backup, parse_backup, read_backup, read_backup_with_limit, Backup,
     BackupImportReport, BackupState, BackupUser, BACKUP_VERSION, MAX_BACKUP_BYTES,
