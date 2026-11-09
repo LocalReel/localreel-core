@@ -396,8 +396,26 @@ fn write_anchor(path: &Path, anchor: &VerificationAnchor) -> std::io::Result<()>
     std::fs::rename(&temp, path)
 }
 
+const ANCHOR_HISTORY_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 fn append_anchor(path: &Path, anchor: &VerificationAnchor) -> std::io::Result<()> {
+    append_anchor_with_limit(path, anchor, ANCHOR_HISTORY_MAX_BYTES)
+}
+
+fn append_anchor_with_limit(
+    path: &Path,
+    anchor: &VerificationAnchor,
+    max_bytes: u64,
+) -> std::io::Result<()> {
     use std::io::Write;
+
+    if matches!(std::fs::metadata(path), Ok(meta) if meta.len() >= max_bytes) {
+        let previous = path.with_extension("jsonl.1");
+        if previous.exists() {
+            std::fs::remove_file(&previous)?;
+        }
+        std::fs::rename(path, &previous)?;
+    }
 
     let mut line = serde_json::to_vec(anchor)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -512,6 +530,28 @@ mod tests {
         migrations::apply(&db, "plugin", crate::audit::migrations()).unwrap();
         let store = VerificationStore::with_anchor(db, &dir.path().join("audit.key")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn anchor_history_rotates_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.anchors.jsonl");
+        let anchor = VerificationAnchor {
+            chain_hash: "a".repeat(64),
+            signature: "b".repeat(128),
+            public_key: "c".repeat(64),
+            at: 7,
+        };
+        append_anchor_with_limit(&path, &anchor, 1).unwrap();
+        append_anchor_with_limit(&path, &anchor, 1).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("audit.anchors.jsonl.1"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 
     #[cfg(windows)]
