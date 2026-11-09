@@ -120,6 +120,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/shutdown", post(shutdown_server))
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/audit", get(admin_audit))
+        .route("/api/v1/admin/config", get(admin_config))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
@@ -446,6 +447,36 @@ async fn admin_audit(
         "items": entries,
         "total": entries.len(),
     })))
+}
+
+/// The configuration the process is actually running with.
+///
+/// Read-only and never a secret: hosts, ports, directories and two feature
+/// switches. Editing is a file-and-restart operation, so the console explains
+/// rather than pretends.
+async fn admin_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let config = &state.config;
+    let loopback = matches!(config.host.as_str(), "127.0.0.1" | "::1" | "localhost");
+    Json(serde_json::json!({
+        "host": config.host,
+        "port": config.port,
+        "mode": config.mode.as_str(),
+        "allow_remote": config.allow_remote,
+        // Both halves are needed: a LAN address only helps if the loopback
+        // guard is told to accept it.
+        "lan": !loopback && config.allow_remote,
+        "loopback_only": loopback || !config.allow_remote,
+        "dirs": {
+            "data": config.data_dir.to_string_lossy(),
+            "database": config.db_path.to_string_lossy(),
+            "logs": config.log_dir.to_string_lossy(),
+            "web": config.web_dir.as_ref().map(|dir| dir.to_string_lossy()),
+            "thumbnails": config.media.thumbnail_dir.to_string_lossy(),
+            "transcodes": config.media.transcode_dir.to_string_lossy(),
+        },
+        "scan_watch": config.scan.watch,
+        "update_check": config.update.check,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
