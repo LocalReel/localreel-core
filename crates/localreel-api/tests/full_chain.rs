@@ -1,6 +1,7 @@
 //! Full chain: a real `PluginHost`, real API router, a real `fs.read` grant and
 //! a stdio storage plugin whose stat/list/read go through the broker.
 
+#[cfg(any(windows, target_os = "linux"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ impl ProviderSink for Sink {
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn sandbox_program() -> PathBuf {
     let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -61,7 +63,21 @@ fn sandbox_program() -> PathBuf {
     target
 }
 
+#[cfg(target_os = "linux")]
+fn sandbox_is_available() -> bool {
+    localreel_plugin::runtime::sandbox_support().unshare_present
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_is_available() -> bool {
+    true
+}
+
 async fn full_chain(app_container: bool) {
+    if app_container && !sandbox_is_available() {
+        eprintln!("skipping: OS isolation is unavailable");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("library");
     std::fs::create_dir_all(&library).unwrap();
@@ -192,6 +208,7 @@ async fn storage_plugin_uses_real_grant_and_api() {
     full_chain(false).await;
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn appcontainer_storage_uses_real_grant_and_api() {
     full_chain(true).await;

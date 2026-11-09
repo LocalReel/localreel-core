@@ -269,8 +269,23 @@ fn stdio_broker_calls_travel_over_pipes() {
     assert!(request.contains("https://example.com/data"), "{request}");
 }
 
+#[cfg(target_os = "linux")]
+fn sandbox_is_available() -> bool {
+    localreel_plugin::runtime::sandbox_support().unshare_present
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_is_available() -> bool {
+    true
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn appcontainer_plugin_uses_the_stdio_broker() {
+    if !sandbox_is_available() {
+        eprintln!("skipping: OS isolation is unavailable");
+        return;
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
@@ -348,8 +363,13 @@ fn appcontainer_plugin_uses_the_stdio_broker() {
     assert!(request.contains("https://example.com/data"), "{request}");
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn appcontainer_denies_the_plugins_own_socket() {
+    if !sandbox_is_available() {
+        eprintln!("skipping: OS isolation is unavailable");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let program = format!("bin/plugin-net-demo{}", std::env::consts::EXE_SUFFIX);
     let package = dir.path().join("net-demo.lrplug");
@@ -497,7 +517,12 @@ fn storage_plugin_uses_fs_broker_over_stdio() {
     storage_plugin_serves_from_fs_broker(false);
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn appcontainer_storage_plugin_uses_fs_broker() {
+    if !sandbox_is_available() {
+        eprintln!("skipping: OS isolation is unavailable");
+        return;
+    }
     storage_plugin_serves_from_fs_broker(true);
 }
