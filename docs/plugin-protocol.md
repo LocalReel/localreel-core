@@ -594,7 +594,10 @@ down. The entry stays in `GET /api/v1/plugins` with a state; each row also
 reports its `transport` (`http`/`stdio`) and `sandbox` (`none`/`appcontainer`)
 so the admin page can show the effective execution mode. Entries that fail
 before startup still carry the configured sandbox intent when the server can
-resolve it.
+resolve it. `GET /api/v1/plugins/sandbox-status` reports the build's platform
+and whether AppContainer/netns prerequisites are actually present
+(`wrapper_present`, `unshare_present`), which lets an operator self-check before
+turning the switch on.
 
 | State | Meaning |
 |---|---|

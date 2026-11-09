@@ -101,6 +101,49 @@ pub struct PluginSandbox {
     pub sandbox_program: Option<std::path::PathBuf>,
 }
 
+/// What this build can actually isolate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SandboxSupport {
+    pub platform: &'static str,
+    pub app_container: bool,
+    pub wrapper_present: bool,
+    pub unshare_present: bool,
+}
+
+pub fn sandbox_support() -> SandboxSupport {
+    SandboxSupport {
+        platform: std::env::consts::OS,
+        app_container: cfg!(windows) || cfg!(target_os = "linux"),
+        wrapper_present: wrapper_path().is_some_and(|path| path.is_file()),
+        unshare_present: unshare_available(),
+    }
+}
+
+fn wrapper_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("LOCALREEL_PLUGIN_SANDBOX") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("plugin-sandbox.exe")))
+}
+
+#[cfg(target_os = "linux")]
+fn unshare_available() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join("unshare").is_file())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unshare_available() -> bool {
+    false
+}
+
 /// Sweep AppContainer profiles left behind by a crash. `root` is normally
 /// `%LOCALAPPDATA%\Packages`; profiles whose wrapper PID is still alive are kept.
 pub fn sweep_stale_appcontainers(root: &Path) {

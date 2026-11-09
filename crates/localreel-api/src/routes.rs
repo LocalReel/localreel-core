@@ -104,6 +104,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/cache", get(cache_stats))
         .route("/api/v1/admin/cache/gc", post(run_cache_gc))
         .route("/api/v1/plugins", get(list_plugins))
+        .route("/api/v1/plugins/sandbox-status", get(plugin_sandbox_status))
         .route("/api/v1/plugins/audit", get(plugin_audit))
         .route("/api/v1/plugins/verifications", get(plugin_verifications))
         .route(
@@ -666,6 +667,10 @@ async fn list_plugin_blobs(
 /// Installed plugins with the permissions that actually apply to them.
 async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "plugins": state.plugins.summaries() }))
+}
+
+async fn plugin_sandbox_status() -> Json<localreel_plugin::runtime::SandboxSupport> {
+    Json(localreel_plugin::runtime::sandbox_support())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3249,6 +3254,26 @@ mod tests {
         assert_eq!(value["count"], 1);
         assert_eq!(value["drafts"][0]["remote_id"], "1001");
         assert_eq!(value["drafts"][0]["title"]["name"], "示例影片");
+    }
+
+    #[tokio::test]
+    async fn sandbox_status_reports_the_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _csrf) = signed_in(dir.path());
+        let app = router(state);
+        let response = app
+            .oneshot(request_as("/api/v1/plugins/sandbox-status", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!value["platform"].as_str().unwrap_or_default().is_empty());
+        assert!(value["app_container"].is_boolean());
+        assert!(value["wrapper_present"].is_boolean());
+        assert!(value["unshare_present"].is_boolean());
     }
 
     #[tokio::test]
