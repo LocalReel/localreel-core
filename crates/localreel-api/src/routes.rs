@@ -2901,6 +2901,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn state(dir: &std::path::Path) -> Arc<AppState> {
+        state_with_config(dir, None, Vec::new())
+    }
+
+    fn state_with_config(
+        dir: &std::path::Path,
+        config_source: Option<std::path::PathBuf>,
+        publishers: Vec<localreel_kernel::config::PluginPublisherConfig>,
+    ) -> Arc<AppState> {
         let db = Database::open(dir.join("api.db").to_str().unwrap(), 1).unwrap();
         migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
         migrations::apply(&db, "media", localreel_media::migrations::list()).unwrap();
@@ -2911,6 +2919,7 @@ mod tests {
         // touch the operator's real cache.
         let mut config = Config::default();
         config.set_data_dir(dir.to_path_buf());
+        config.publishers = publishers;
         let media = MediaService::new(db.clone());
         let accounts = localreel_media::AccountService::new(db.clone());
         let transcodes = Arc::new(localreel_media::TranscodeGate::new(
@@ -2931,7 +2940,7 @@ mod tests {
             accounts,
             transcodes,
             plugins,
-            config_source: None,
+            config_source,
             metadata_provider: None,
             ffmpeg_capability: localreel_kernel::media_ops::FfmpegCapability::Missing,
             hwaccel: localreel_kernel::media_ops::HwAccel::None,
@@ -4003,6 +4012,79 @@ mod tests {
             .path()
             .join("plugins/packages/stage-demo/0.1.0.lrplug")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn install_updates_the_config_for_a_signed_staged_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = test_package(dir.path(), "stage-demo", "0.1.0");
+        let seed = "11".repeat(32);
+        let (public_key, signature) =
+            localreel_plugin::package::sign_package(&package, &seed).unwrap();
+        let publisher = localreel_kernel::config::PluginPublisherConfig {
+            id: "acme".into(),
+            public_key,
+            not_after: None,
+            revoked: false,
+        };
+        let old_package = dir.path().join("old.lrplug");
+        std::fs::copy(&package, &old_package).unwrap();
+        let config_path = dir.path().join("localreel.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[plugins]]\npackage = \"{}\"\nenabled = true\n",
+                old_package.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let state = state_with_config(dir.path(), Some(config_path.clone()), vec![publisher]);
+        state.plugins.record_disabled(&old_package);
+        let (session, csrf) = sign_in(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/stage",
+                &session,
+                &csrf,
+                serde_json::json!({
+                    "path": package,
+                    "publisher": "acme",
+                    "signature": signature,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request_json(
+                "POST",
+                "/api/v1/plugins/packages/install",
+                &session,
+                &csrf,
+                serde_json::json!({ "id": "stage-demo", "version": "0.1.0" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["restart_required"], true);
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(text.matches("[[plugins]]").count(), 1, "{text}");
+        assert!(text.contains("stage-demo"), "{text}");
+        assert!(text.contains("0.1.0.lrplug"), "{text}");
+        assert!(!text.contains("old.lrplug"), "{text}");
+        assert!(text.contains("publisher = "), "{text}");
+        assert!(text.contains("signature = "), "{text}");
     }
 
     #[tokio::test]
