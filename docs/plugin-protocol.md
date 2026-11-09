@@ -453,8 +453,10 @@ app_container = true
 
 `app_container = true` is the OS network boundary: Windows uses AppContainer,
 Linux uses `unshare -Urn` (network namespace) for stdio plugins; macOS is
-rejected. A `[[plugins]]` entry may override the global switch with its own
-`app_container = true/false`; when absent it inherits `[plugin_runtime]`.
+rejected. See [platform-support.md](platform-support.md) for what each platform
+does and does not enforce. A `[[plugins]]` entry may override the global switch
+with its own `app_container = true/false`; when absent it inherits
+`[plugin_runtime]`.
 
 - only `transport = "stdio"` is accepted;
 - Windows: native binaries only (scripts are rejected because the interpreter
