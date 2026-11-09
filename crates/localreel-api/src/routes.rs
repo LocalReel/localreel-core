@@ -2693,7 +2693,11 @@ mod tests {
             2,
             std::time::Duration::from_secs(900),
         ));
-        let plugins = Arc::new(localreel_plugin::PluginHost::new(db.clone()));
+        let plugins = Arc::new(localreel_plugin::PluginHost::with_options(
+            db.clone(),
+            dir.join("plugins"),
+            std::time::Duration::from_secs(5),
+        ));
         AppState::new(crate::state::AppStateParts {
             config,
             db,
