@@ -216,6 +216,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(user_api)
         .merge(admin_api)
         .layer(axum::middleware::from_fn(detail_scope))
+        // Inside the authentication layer, so the actor is already known.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::audit_guard::audit_fallback,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

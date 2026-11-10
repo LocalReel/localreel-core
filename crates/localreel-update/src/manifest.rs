@@ -51,6 +51,16 @@ pub enum ManifestError {
     InsecureUrl(String),
 }
 
+/// What is installed: the server alone, or the server plus the desktop shell.
+///
+/// The two are different downloads and must stay different upgrades; the
+/// edition is read from the install directory, not from the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edition {
+    Server,
+    Desktop,
+}
+
 /// The platforms a release can carry a build for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -111,7 +121,13 @@ impl fmt::Display for Platform {
 #[serde(rename_all = "kebab-case")]
 pub enum AssetKind {
     Setup,
+    /// The installer that also carries the desktop shell. Kept apart from
+    /// `Setup` so a server-only installation is never handed 300 MB of
+    /// Chromium it did not ask for.
+    SetupDesktop,
     Msi,
+    /// The desktop edition as an MSI, for administrators who deploy by policy.
+    MsiDesktop,
     Zip,
     Tarball,
     Deb,
@@ -125,10 +141,12 @@ impl AssetKind {
     fn preference(self) -> u8 {
         match self {
             AssetKind::Setup => 0,
-            AssetKind::Msi => 1,
-            AssetKind::Zip => 2,
-            AssetKind::Tarball => 3,
-            _ => 4,
+            AssetKind::SetupDesktop => 1,
+            AssetKind::Msi => 2,
+            AssetKind::MsiDesktop => 3,
+            AssetKind::Zip => 4,
+            AssetKind::Tarball => 5,
+            _ => 6,
         }
     }
 
@@ -136,7 +154,9 @@ impl AssetKind {
     pub fn slug(self) -> &'static str {
         match self {
             AssetKind::Setup => "setup",
+            AssetKind::SetupDesktop => "setup-desktop",
             AssetKind::Msi => "msi",
+            AssetKind::MsiDesktop => "msi-desktop",
             AssetKind::Zip => "zip",
             AssetKind::Tarball => "tarball",
             AssetKind::Deb => "deb",
@@ -221,6 +241,35 @@ impl Manifest {
 
     pub fn asset_for_current(&self) -> Option<&Asset> {
         self.asset_for(Platform::current())
+    }
+
+    /// The installer for one edition.
+    ///
+    /// A desktop installation must not be updated with the thin installer (the
+    /// shell would vanish) and a server installation must not be updated with
+    /// the desktop one (300 MB nobody asked for), so the two kinds are looked
+    /// up separately. `Setup` remains the fallback for a desktop installation
+    /// only when no desktop build exists for this release.
+    pub fn asset_for_edition(&self, platform: Platform, edition: Edition) -> Option<&Asset> {
+        let preferred = match edition {
+            Edition::Desktop => [AssetKind::SetupDesktop, AssetKind::Setup],
+            Edition::Server => [AssetKind::Setup, AssetKind::SetupDesktop],
+        };
+        preferred.iter().find_map(|kind| {
+            self.assets
+                .iter()
+                .find(|asset| asset.platform == platform && asset.kind == *kind)
+        })
+    }
+
+    /// Which edition is installed in `install_dir`: the shell sits beside the
+    /// server, so its presence is the answer.
+    pub fn edition_of(install_dir: &std::path::Path) -> Edition {
+        if install_dir.join("desktop").join("LocalReel.exe").is_file() {
+            Edition::Desktop
+        } else {
+            Edition::Server
+        }
     }
 
     /// Refuse a release that would be a downgrade, or one this installation is
@@ -329,6 +378,55 @@ mod tests {
         assert_eq!(manifest.version, "0.5.7");
         assert_eq!(manifest.channel, "stable");
         assert_eq!(manifest.assets.len(), 3);
+    }
+
+    const TWO_EDITIONS: &str = r#"{
+        "version": "0.5.7",
+        "channel": "stable",
+        "min_version": "0.5.0",
+        "notes_url": "https://example.invalid/notes",
+        "assets": [
+            { "platform": "windows-x64", "kind": "setup", "url": "https://example.invalid/thin-setup.exe",
+              "size": 10, "sha256": "00" },
+            { "platform": "windows-x64", "kind": "setup-desktop", "url": "https://example.invalid/desktop-setup.exe",
+              "size": 20, "sha256": "11" }
+        ]
+    }"#;
+
+    #[test]
+    fn each_edition_updates_with_its_own_installer() {
+        let manifest = Manifest::parse(TWO_EDITIONS.as_bytes()).unwrap();
+        let server = manifest
+            .asset_for_edition(Platform::WindowsX64, Edition::Server)
+            .unwrap();
+        assert_eq!(server.kind, AssetKind::Setup);
+        let desktop = manifest
+            .asset_for_edition(Platform::WindowsX64, Edition::Desktop)
+            .unwrap();
+        assert_eq!(desktop.kind, AssetKind::SetupDesktop);
+    }
+
+    #[test]
+    fn a_missing_edition_asset_falls_back_rather_than_failing() {
+        let manifest = Manifest::parse(BODY.as_bytes()).unwrap();
+        // BODY only has the thin setup: a desktop installation still updates,
+        // it just comes back without a shell until the next release.
+        assert_eq!(
+            manifest
+                .asset_for_edition(Platform::WindowsX64, Edition::Desktop)
+                .unwrap()
+                .kind,
+            AssetKind::Setup
+        );
+    }
+
+    #[test]
+    fn the_installed_edition_is_read_from_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Manifest::edition_of(dir.path()), Edition::Server);
+        std::fs::create_dir(dir.path().join("desktop")).unwrap();
+        std::fs::write(dir.path().join("desktop").join("LocalReel.exe"), b"stub").unwrap();
+        assert_eq!(Manifest::edition_of(dir.path()), Edition::Desktop);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! requests, calls the domain service, and maps errors to a stable JSON
 //! envelope. No SQL, no ffmpeg and no domain policy live here.
 
+pub mod audit_guard;
 pub mod auth;
 pub mod error;
 pub mod guard;

@@ -4,12 +4,25 @@
 //! note. It is not an event log and it never stores request bodies, so a
 //! password reset records *that* it happened, not the password.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use localreel_kernel::error::Result;
 use localreel_kernel::time::now_secs;
 use rusqlite::{params, Row};
 use serde::Serialize;
 
 use crate::service::MediaService;
+
+/// How many rows have been recorded since the process started.
+///
+/// The API's audit middleware watches this to tell whether a handler recorded
+/// its own action; a request that changes the machine without moving this
+/// counter gets a fallback row.
+static RECORDED: AtomicU64 = AtomicU64::new(0);
+
+pub fn recorded_count() -> u64 {
+    RECORDED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminAuditEntry {
@@ -56,7 +69,9 @@ impl MediaService {
                 params![at, user_id, username, action, target, detail],
             )?;
             Ok(())
-        })
+        })?;
+        RECORDED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Newest first, capped by the caller.
@@ -124,5 +139,15 @@ mod tests {
         assert_eq!(service.admin_audit(0).unwrap().len(), 1);
         assert_eq!(service.admin_audit(3).unwrap().len(), 3);
         assert_eq!(service.admin_audit(500).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn recording_moves_the_counter_the_middleware_watches() {
+        let (_dir, service) = setup();
+        let before = recorded_count();
+        service
+            .record_admin(Some(1), Some("owner"), "user.delete", Some("2"), None)
+            .unwrap();
+        assert_eq!(recorded_count(), before + 1);
     }
 }

@@ -211,10 +211,14 @@ impl Runtime {
             .check_against(localreel_kernel::VERSION)
             .map_err(|error| error.to_string())?;
 
+        let edition = localreel_update::Manifest::edition_of(self.inner.install.install_dir());
         let asset = manifest
-            .asset_for(Platform::current())
+            .asset_for_edition(Platform::current(), edition)
             .ok_or_else(|| format!("this release has no build for {}", Platform::current()))?;
-        if !matches!(asset.kind, localreel_update::AssetKind::Setup) {
+        if !matches!(
+            asset.kind,
+            localreel_update::AssetKind::Setup | localreel_update::AssetKind::SetupDesktop
+        ) {
             return Err(format!(
                 "this release carries a {} for {}, not an installer; update it by hand",
                 asset.kind.slug(),
@@ -242,6 +246,24 @@ impl Runtime {
     /// before it touches the install directory, which is the only way Windows
     /// lets the running executable be replaced.
     pub fn apply(&self) -> Result<(), String> {
+        self.apply_with(|plan| {
+            std::process::Command::new(&plan.program)
+                .args(&plan.args)
+                .spawn()
+                .map(|_| ())
+        })
+    }
+
+    /// Same sequence, with the process launch injected.
+    ///
+    /// The interesting parts — refusing to run when nothing is verified, running
+    /// the installer the plan describes, and moving to `Installing` so the caller
+    /// knows to stop the server — are testable without actually starting an
+    /// installer, which on a real release replaces the running files.
+    pub fn apply_with(
+        &self,
+        spawn: impl FnOnce(&localreel_update::ApplyPlan) -> std::io::Result<()>,
+    ) -> Result<(), String> {
         if !self.inner.install.can_apply() {
             return Err("this installation cannot update itself".to_string());
         }
@@ -259,9 +281,7 @@ impl Runtime {
             .ok_or_else(|| "the installer file is missing".to_string())?;
         let plan = install::plan(&self.inner.install, &payload, true)
             .ok_or_else(|| "this installation has no installer to run".to_string())?;
-        std::process::Command::new(&plan.program)
-            .args(&plan.args)
-            .spawn()
+        spawn(&plan)
             .map_err(|error| format!("cannot start {}: {error}", plan.program.display()))?;
         state.phase = Phase::Installing;
         Ok(())
@@ -317,5 +337,78 @@ mod tests {
         assert_eq!(json["kind"], "system_msi");
         assert_eq!(json["can_apply"], false);
         assert_eq!(json["reason"], "system_msi");
+    }
+
+    /// End to end for the hand-off: a verified payload, then exactly one launch
+    /// of the installer the plan describes, then `Installing` so the caller
+    /// knows to stop the server.
+    #[test]
+    fn applying_runs_the_installer_and_moves_to_installing() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("LocalReel");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        let setup = install_dir.join("localreel-setup.exe");
+        std::fs::write(&setup, b"stub").unwrap();
+        let payload = dir.path().join("downloaded-setup.exe");
+        std::fs::write(&payload, b"stub payload").unwrap();
+
+        let runtime = Runtime::with_install(install::InstallKind::PerUserSetup {
+            install_dir: install_dir.clone(),
+        });
+        {
+            // Reach the state `start` would have left behind after a verified
+            // download, without making a network request in a unit test.
+            let mut state = runtime.inner.state.lock().unwrap();
+            state.phase = Phase::Ready;
+            state.payload = Some(payload.clone());
+        }
+
+        let mut launched: Option<(std::path::PathBuf, Vec<String>)> = None;
+        runtime
+            .apply_with(|plan| {
+                launched = Some((plan.program.clone(), plan.args.clone()));
+                Ok(())
+            })
+            .unwrap();
+
+        let (program, args) = launched.expect("the installer must be launched once");
+        // The plan runs the downloaded installer, not the one already on disk:
+        // that is the whole point of downloading it first.
+        assert_eq!(program, payload, "the launched program must be the payload");
+        assert!(
+            args.iter().any(|arg| arg == "/S"),
+            "silent install: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "/wait"),
+            "it waits for us: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg.starts_with("--dir=")),
+            "the installer is told where: {args:?}"
+        );
+        assert_eq!(runtime.download_json()["phase"], "installing");
+    }
+
+    #[test]
+    fn a_failed_launch_does_not_claim_the_update_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("LocalReel");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(install_dir.join("localreel-setup.exe"), b"stub").unwrap();
+        let payload = dir.path().join("downloaded-setup.exe");
+        std::fs::write(&payload, b"stub payload").unwrap();
+
+        let runtime = Runtime::with_install(install::InstallKind::PerUserSetup { install_dir });
+        {
+            let mut state = runtime.inner.state.lock().unwrap();
+            state.phase = Phase::Ready;
+            state.payload = Some(payload);
+        }
+        let error = runtime
+            .apply_with(|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no")))
+            .unwrap_err();
+        assert!(error.contains("cannot start"), "{error}");
+        assert_eq!(runtime.download_json()["phase"], "ready");
     }
 }

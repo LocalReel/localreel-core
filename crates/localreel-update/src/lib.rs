@@ -19,7 +19,9 @@ pub mod version;
 
 pub use download::{download, download_with_progress, DownloadError, MAX_ASSET_BYTES};
 pub use install::{detect, plan, ApplyPlan, InstallKind};
-pub use manifest::{verify_signature, Asset, AssetKind, Manifest, ManifestError, Platform};
+pub use manifest::{
+    verify_signature, Asset, AssetKind, Edition, Manifest, ManifestError, Platform,
+};
 pub use version::{compare, is_newer, normalize};
 
 /// Public half of the release signing key, hex.
