@@ -1505,6 +1505,19 @@ async fn install_staged_package(
         ),
         Some(current.user.id),
     );
+    // The plugin audit tracks the package; the admin audit is the one list
+    // somebody scrolls when they ask "what changed on this machine".
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "plugin.install",
+        Some(&format!("{}@{}", request.id, request.version)),
+        Some(if restarted {
+            "restarted"
+        } else {
+            "restart required"
+        }),
+    );
     Ok(Json(serde_json::json!({
         "installed": true,
         "id": request.id,
@@ -1586,6 +1599,13 @@ async fn delete_staged_package(
         "deleted",
         &format!("version={version}"),
         Some(current.user.id),
+    );
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "plugin.uninstall",
+        Some(&format!("{id}@{version}")),
+        None,
     );
     Ok(Json(serde_json::json!({
         "deleted": true,
@@ -2186,6 +2206,7 @@ async fn upload_backup(
 
 async fn enqueue_restore(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup = localreel_media::parse_backup(&body)?;
@@ -2194,11 +2215,20 @@ async fn enqueue_restore(
         state
             .jobs
             .enqueue("restore_backup", &payload, Some("restore_backup:manual"), 1)?;
+    // A restore replaces library state wholesale; it belongs in the list.
+    let _ = state.media.record_admin(
+        Some(current.user.id),
+        Some(&current.user.username),
+        "backup.restore",
+        Some(&job_id.to_string()),
+        None,
+    );
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
 async fn upload_restore_file(
     State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
     body: Body,
 ) -> Result<Response, ApiError> {
     let upload_dir = state.config.data_dir.join("backup-uploads");
@@ -2256,11 +2286,20 @@ async fn upload_restore_file(
         Some("restore_backup:manual"),
         1,
     ) {
-        Ok(job_id) => Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "job_id": job_id })),
-        )
-            .into_response()),
+        Ok(job_id) => {
+            let _ = state.media.record_admin(
+                Some(current.user.id),
+                Some(&current.user.username),
+                "backup.restore",
+                Some(&job_id.to_string()),
+                Some("uploaded file"),
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "job_id": job_id })),
+            )
+                .into_response())
+        }
         Err(error) => {
             let _ = tokio::fs::remove_file(&path).await;
             Err(error.into())
