@@ -1,7 +1,6 @@
 //! Full chain: a real `PluginHost`, real API router, a real `fs.read` grant and
 //! a stdio storage plugin whose stat/list/read go through the broker.
 
-#[cfg(any(windows, target_os = "linux"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
