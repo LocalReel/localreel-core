@@ -40,7 +40,10 @@ crates/localreel-format/   versioned backup/artifact schema (no I/O)
 crates/localreel-kernel/   generic capabilities: config, db, jobs, events,
                            storage, media-ops (typed ffmpeg)
 crates/localreel-media/    media domain: sources, scan, metadata, state,
-                           search, playback policy, variants
+                           search, playback policy, variants, shares, audit
+crates/localreel-plugin/   plugin host: signed packages, capabilities, sandbox
+crates/localreel-update/   signed update manifest, verified download, installer
+                           hand-off (two editions)
 crates/localreel-api/      HTTP /api/v1, SSE events, static assets, loopback guard
 crates/localreel-server/   the `localreel` binary: wiring, migrations, serve
 docs/adr/                  architecture decision records
