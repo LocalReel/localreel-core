@@ -130,19 +130,28 @@ pub fn configure(command: &mut Command, limits: PluginLimits) {
         // Address-space ceiling before exec. `RLIMIT_NPROC` is per-user, not
         // per-tree, so process-count enforcement stays a Windows Job Object
         // property for now; the Unix side at least stops memory blow-ups.
-        let max = limits.max_memory_bytes as libc::rlim_t;
-        unsafe {
-            command.pre_exec(move || {
-                let limit = libc::rlimit {
-                    rlim_cur: max,
-                    rlim_max: max,
-                };
-                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        //
+        // macOS does not implement `RLIMIT_AS` and rejects it with EINVAL, and a
+        // failing `pre_exec` aborts the spawn itself — so the ceiling is applied
+        // only where the kernel honours it.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let max = limits.max_memory_bytes as libc::rlim_t;
+            unsafe {
+                command.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: max,
+                        rlim_max: max,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
+        #[cfg(target_os = "macos")]
+        let _ = limits;
     }
     #[cfg(not(unix))]
     {
