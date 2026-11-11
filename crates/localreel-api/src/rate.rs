@@ -18,6 +18,7 @@ pub struct MinuteLimiter {
     limit: u32,
     window: Duration,
     entries: Mutex<HashMap<String, Entry>>,
+    next_sweep: Mutex<Instant>,
 }
 
 impl MinuteLimiter {
@@ -26,6 +27,7 @@ impl MinuteLimiter {
             limit,
             window,
             entries: Mutex::new(HashMap::new()),
+            next_sweep: Mutex::new(Instant::now() + window),
         }
     }
 
@@ -41,8 +43,21 @@ impl MinuteLimiter {
         // Bound the map: a share link's key is its token, and stale tokens are
         // dropped as soon as their window closes, so this only grows with the
         // number of links used inside one window.
-        if entries.len() > 1024 {
-            entries.retain(|_, entry| now.duration_since(entry.started) < self.window);
+        const MAX_KEYS: usize = 1024;
+        if entries.len() >= MAX_KEYS && !entries.contains_key(key) {
+            // Only scan when the table is full. Reject rather than evict active
+            // budgets (eviction would let a caller reset another key's limit).
+            let mut next_sweep = match self.next_sweep.lock() {
+                Ok(next_sweep) => next_sweep,
+                Err(_) => return false,
+            };
+            if now >= *next_sweep {
+                entries.retain(|_, entry| now.duration_since(entry.started) < self.window);
+                *next_sweep = now + self.window;
+            }
+            if entries.len() >= MAX_KEYS {
+                return false;
+            }
         }
         let entry = entries.entry(key.to_string()).or_insert(Entry {
             started: now,
@@ -52,7 +67,7 @@ impl MinuteLimiter {
             entry.started = now;
             entry.hits = 0;
         }
-        entry.hits += 1;
+        entry.hits = entry.hits.saturating_add(1);
         entry.hits <= self.limit
     }
 
@@ -84,6 +99,17 @@ mod tests {
         assert!(!limiter.check("t"));
         std::thread::sleep(Duration::from_millis(40));
         assert!(limiter.check("t"));
+    }
+
+    #[test]
+    fn distinct_keys_cannot_exceed_capacity() {
+        let limiter = MinuteLimiter::new(3, Duration::from_secs(60));
+        for index in 0..1024 {
+            assert!(limiter.check(&index.to_string()));
+        }
+        assert!(!limiter.check("overflow"));
+        assert_eq!(limiter.entries.lock().unwrap().len(), 1024);
+        assert!(limiter.check("0"));
     }
 
     #[test]

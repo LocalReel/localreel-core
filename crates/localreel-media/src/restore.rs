@@ -128,7 +128,7 @@ pub fn restore_backup(
                         / source_count as f32),
                 "probing media",
             );
-            let Some(media) = service.get_media(media_id)? else {
+            let Some(mut media) = service.get_media(media_id)? else {
                 continue;
             };
             let Some(path) = MediaUri::parse(&media.uri)?
@@ -146,15 +146,25 @@ pub fn restore_backup(
 
             if media.duration.is_none() || media.video_codec.is_none() {
                 match media_ops.probe(&MediaInput::path(&path), cancel) {
-                    Ok(probe) => {
-                        if let Err(error) = service.update_probe(media.id, &probe) {
+                    Ok(probe) => match service.apply_probe_for_media(&media, &probe) {
+                        Ok(true) => {
+                            media.duration = probe.duration;
+                            report.probed += 1;
+                        }
+                        Ok(false) => {
+                            report.warnings.push(format!(
+                                "media {} changed during probing; skipped",
+                                media.id
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
                             report
                                 .warnings
                                 .push(format!("media {} probe update failed: {error}", media.id));
-                        } else {
-                            report.probed += 1;
+                            continue;
                         }
-                    }
+                    },
                     Err(error) => report
                         .warnings
                         .push(format!("media {} probe failed: {error}", media.id)),
@@ -162,24 +172,28 @@ pub fn restore_backup(
             }
 
             if media.thumbnail_path.is_none() {
-                let filename = format!("thumb_{}.jpg", media.uid);
+                let filename = format!(
+                    "thumb_{}_{}_{}.jpg",
+                    media.uid, media.file_size, media.modified_at
+                );
                 let output = thumbnail_dir.join(&filename);
                 let seek = media
                     .duration
-                    .map(|duration| (duration * 0.1).clamp(1.0, 10.0))
-                    .unwrap_or(3.0);
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    .map(|duration| (duration * 0.1).min(10.0))
+                    .unwrap_or(0.0);
                 match media_ops.thumbnail(&MediaInput::path(&path), &output, seek, 480, cancel) {
                     Ok(()) => {
                         let size = std::fs::metadata(&output)
                             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
                             .unwrap_or(0);
-                        if let Err(error) = service.set_thumbnail(media.id, &filename) {
+                        if let Err(error) = service.set_thumbnail_for_media(&media, &filename) {
                             report.warnings.push(format!(
                                 "media {} thumbnail path update failed: {error}",
                                 media.id
                             ));
-                        } else if let Err(error) = service.record_variant(
-                            media.id,
+                        } else if let Err(error) = service.record_variant_for_media(
+                            &media,
                             "thumbnail",
                             "default",
                             &filename,

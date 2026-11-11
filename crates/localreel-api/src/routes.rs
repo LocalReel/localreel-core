@@ -2231,6 +2231,77 @@ async fn enqueue_restore(
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
+/// Owns exactly one uncommitted upload. Cleanup waits for Tokio's pending file
+/// operation before closing the Windows handle and removing the path. Runtime
+/// shutdown or a process crash can still interrupt best-effort cleanup.
+struct UploadFile {
+    path: std::path::PathBuf,
+    file: Option<tokio::fs::File>,
+    armed: bool,
+}
+
+impl UploadFile {
+    async fn create(path: std::path::PathBuf) -> Result<Self, ApiError> {
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            Ok::<_, std::io::Error>(Self {
+                path,
+                file: Some(tokio::fs::File::from_std(file)),
+                armed: true,
+            })
+        })
+        .await
+        .map_err(|_| ApiError::internal("upload creation task failed"))?
+        .map_err(|_| ApiError::internal("cannot create upload"))
+    }
+
+    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        let path = self.path.clone();
+        let file = self.file.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => Some(runtime.spawn(async move {
+                if let Some(file) = file {
+                    drop(file.into_std().await);
+                }
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%error, "failed to clean uncommitted backup upload");
+                    }
+                }
+            })),
+            Err(_) => {
+                drop(file);
+                tracing::warn!("runtime unavailable; backup upload cleanup is best effort");
+                if let Err(error) = std::fs::remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%error, "failed to clean backup upload without runtime");
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    async fn cleanup(&mut self) {
+        if let Some(task) = self.start_cleanup() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for UploadFile {
+    fn drop(&mut self) {
+        drop(self.start_cleanup());
+    }
+}
+
 async fn upload_restore_file(
     State(state): State<Arc<AppState>>,
     Extension(current): Extension<CurrentUser>,
@@ -2241,9 +2312,7 @@ async fn upload_restore_file(
         .await
         .map_err(|error| ApiError::internal(format!("cannot create upload dir: {error}")))?;
     let path = upload_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&path)
-        .await
-        .map_err(|error| ApiError::internal(format!("cannot create upload: {error}")))?;
+    let mut upload = UploadFile::create(path.clone()).await?;
     let mut stream = body.into_data_stream();
     let mut total = 0_u64;
 
@@ -2251,7 +2320,7 @@ async fn upload_restore_file(
         let chunk = match futures_util::StreamExt::next(&mut stream).await {
             Some(Ok(chunk)) => chunk,
             Some(Err(error)) => {
-                let _ = tokio::fs::remove_file(&path).await;
+                upload.cleanup().await;
                 return Err(ApiError::bad_request(format!(
                     "upload read failed: {error}"
                 )));
@@ -2260,27 +2329,37 @@ async fn upload_restore_file(
         };
         total = total.saturating_add(chunk.len() as u64);
         if total > localreel_media::MAX_BACKUP_RESTORE_BYTES {
-            drop(file);
-            let _ = tokio::fs::remove_file(&path).await;
+            upload.cleanup().await;
             return Err(ApiError::payload_too_large(format!(
                 "backup upload exceeds {} bytes",
                 localreel_media::MAX_BACKUP_RESTORE_BYTES
             )));
         }
-        if let Err(error) = file.write_all(&chunk).await {
-            drop(file);
-            let _ = tokio::fs::remove_file(&path).await;
+        if let Err(error) = upload
+            .file
+            .as_mut()
+            .expect("upload file is open")
+            .write_all(&chunk)
+            .await
+        {
+            upload.cleanup().await;
             return Err(ApiError::internal(format!("cannot write upload: {error}")));
         }
     }
-    if let Err(error) = file.flush().await {
-        drop(file);
-        let _ = tokio::fs::remove_file(&path).await;
+    if let Err(error) = upload
+        .file
+        .as_mut()
+        .expect("upload file is open")
+        .flush()
+        .await
+    {
+        upload.cleanup().await;
         return Err(ApiError::internal(format!("cannot flush upload: {error}")));
     }
-    drop(file);
+    // flush completed pending writes; release the handle before a worker opens it.
+    drop(upload.file.take());
     if total == 0 {
-        let _ = tokio::fs::remove_file(&path).await;
+        upload.cleanup().await;
         return Err(ApiError::bad_request("empty backup upload"));
     }
 
@@ -2292,6 +2371,18 @@ async fn upload_restore_file(
         1,
     ) {
         Ok(job_id) => {
+            // enqueue can return an existing job without consuming this upload.
+            let owns_upload = state
+                .jobs
+                .get(&job_id)?
+                .is_some_and(|job| job.payload == payload);
+            if !owns_upload {
+                upload.cleanup().await;
+                return Err(ApiError::conflict(
+                    "a backup restore is already queued or running",
+                ));
+            }
+            upload.armed = false;
             let _ = state.media.record_admin(
                 Some(current.user.id),
                 Some(&current.user.username),
@@ -2306,7 +2397,7 @@ async fn upload_restore_file(
                 .into_response())
         }
         Err(error) => {
-            let _ = tokio::fs::remove_file(&path).await;
+            upload.cleanup().await;
             Err(error.into())
         }
     }
@@ -2362,9 +2453,27 @@ async fn events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let receiver = state.events.subscribe();
+    // Events are invalidation hints, never a diagnostic transport. Even admins
+    // fetch diagnostics through the separately authorised detail endpoints.
     let stream = BroadcastStream::new(receiver).filter_map(|message| match message {
-        Ok(event) => SseEvent::default().json_data(&event).ok().map(Ok),
+        Ok(mut event) => {
+            match &mut event {
+                localreel_kernel::events::Event::JobFailed { error, .. } => {
+                    *error = "job failed".into();
+                }
+                localreel_kernel::events::Event::PluginStateChanged { error, .. } => {
+                    *error = error.as_ref().map(|_| "plugin failed".into());
+                }
+                localreel_kernel::events::Event::JobProgress { message, .. } => *message = None,
+                _ => {}
+            }
+            SseEvent::default().json_data(&event).ok().map(Ok)
+        }
         Err(_) => None,
+    });
+    let mut draining = state.draining.subscribe();
+    let stream = futures_util::StreamExt::take_until(stream, async move {
+        let _ = draining.wait_for(|stopping| *stopping).await;
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -2520,9 +2629,24 @@ struct ListQuery {
     include_archived: Option<bool>,
 }
 
+/// HTTP view: storage addresses never belong in a library response.
+#[derive(Debug)]
+struct PublicMedia(Media);
+
+impl Serialize for PublicMedia {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("uri");
+            object.remove("canonical_path");
+        }
+        value.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct MediaPage {
-    items: Vec<Media>,
+    items: Vec<PublicMedia>,
     total: i64,
     next_cursor: Option<i64>,
 }
@@ -2571,7 +2695,7 @@ async fn list_media(
         None
     };
     Ok(Json(MediaPage {
-        items,
+        items: items.into_iter().map(PublicMedia).collect(),
         total,
         next_cursor,
     }))
@@ -2604,7 +2728,7 @@ async fn list_series(
 #[derive(Debug, Serialize)]
 struct SeriesDetail {
     series: SeriesSummary,
-    episodes: Vec<Media>,
+    episodes: Vec<PublicMedia>,
 }
 
 /// One show plus its episodes in episode order.
@@ -2617,7 +2741,10 @@ async fn series_detail(
         .media
         .series_detail(current.user.id, &id)?
         .ok_or_else(|| ApiError::not_found(format!("series {id} not found")))?;
-    Ok(Json(SeriesDetail { series, episodes }))
+    Ok(Json(SeriesDetail {
+        series,
+        episodes: episodes.into_iter().map(PublicMedia).collect(),
+    }))
 }
 
 /// One media item plus whatever external metadata matched it.
@@ -2627,7 +2754,7 @@ async fn series_detail(
 #[derive(Debug, Serialize)]
 struct MediaDetail {
     #[serde(flatten)]
-    media: Media,
+    media: PublicMedia,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<localreel_media::MediaMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2648,7 +2775,7 @@ async fn get_media(
         .and_then(|metadata| metadata.poster_path.as_ref())
         .map(|path| format!("/posters/{path}"));
     Ok(Json(MediaDetail {
-        media,
+        media: PublicMedia(media),
         metadata,
         poster_url,
     }))
@@ -2907,9 +3034,16 @@ fn failed_attempt(
     if job.status != "failed" || job.finished_at.unwrap_or(0) < media.updated_at {
         return Ok(None);
     }
-    Ok(Some(job.error.unwrap_or_else(|| {
-        "this file could not be prepared".to_string()
-    })))
+    // Playback is a public-to-viewers status response. Raw worker diagnostics
+    // remain in the administrator-only job endpoint, never in this message.
+    Ok(Some("this file could not be prepared".to_string()))
+}
+
+fn playback_job_key(kind: &str, media: &Media, variant: &str) -> String {
+    format!(
+        "{kind}:{}:{}:{}:{variant}",
+        media.id, media.file_size, media.modified_at
+    )
 }
 
 async fn prepare_playback(
@@ -3014,7 +3148,7 @@ async fn prepare_playback(
         "audio_stream": audio_stream,
     })
     .to_string();
-    let transcode_key = format!("transcode:{}:{variant_key}", media.id);
+    let transcode_key = playback_job_key("transcode", &media, &variant_key);
     if let Some(reason) = failed_attempt(&state, "transcode", &transcode_key, &media)? {
         return Ok(Json(PlaybackResponse {
             mode: "failed",
@@ -3056,6 +3190,7 @@ fn prepare_hls_playback(
     if let Some(variant) = state.media.find_variant(media.id, "hls", "default")? {
         let path = state.config.media.hls_dir.join(&variant.path);
         if path.is_file() {
+            state.media.touch_hls_variant(media.id)?;
             return Ok(Json(PlaybackResponse {
                 mode: "ready",
                 url: Some(format!("/hls/{}", variant.path)),
@@ -3066,7 +3201,7 @@ fn prepare_hls_playback(
         }
     }
 
-    let hls_key = format!("hls:{}", media.id);
+    let hls_key = playback_job_key("hls", media, "default");
     if let Some(reason) = failed_attempt(&state, "hls_package", &hls_key, media)? {
         return Ok(Json(PlaybackResponse {
             mode: "failed",
@@ -3122,9 +3257,12 @@ async fn serve_hls(
     if let Some(uid) = path.split('/').next() {
         if let Ok(Some(media)) = state.media.get_media_by_uid(uid) {
             state.transcodes.touch(media.id);
+            state.media.touch_hls_variant(media.id)?;
         }
     }
-    let bytes = std::fs::read(&file).map_err(|_| ApiError::not_found("hls file not found"))?;
+    let bytes = tokio::fs::read(&file)
+        .await
+        .map_err(|_| ApiError::not_found("hls file not found"))?;
     let mime = match file.extension().and_then(|extension| extension.to_str()) {
         Some("m3u8") => "application/vnd.apple.mpegurl",
         Some("ts") => "video/mp2t",
@@ -3182,12 +3320,17 @@ async fn resolve_media(state: &AppState, id: i64) -> Result<ResolvedMedia, ApiEr
             format!("no storage provider for this source: {error}"),
         )
     })?;
-    let stat = storage.stat(&uri).map_err(|error| match error {
-        localreel_kernel::error::KernelError::NotFound(_) => {
-            ApiError::not_found("media file is missing")
-        }
-        _ => ApiError::internal(format!("failed to stat media: {error}")),
-    })?;
+    let stat_storage = storage.clone();
+    let stat_uri = uri.clone();
+    let stat = tokio::task::spawn_blocking(move || stat_storage.stat(&stat_uri))
+        .await
+        .map_err(|_| ApiError::internal("storage task failed"))?
+        .map_err(|error| match error {
+            localreel_kernel::error::KernelError::NotFound(_) => {
+                ApiError::not_found("media file is missing")
+            }
+            _ => ApiError::internal(format!("failed to stat media: {error}")),
+        })?;
     if stat.is_dir {
         return Err(ApiError::bad_request("media path is not a file"));
     }
@@ -3213,6 +3356,17 @@ pub(crate) async fn serve_media(
     headers: HeaderMap,
     head_only: bool,
 ) -> Result<Response, ApiError> {
+    let permit = state
+        .stream_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "too many active media streams",
+            )
+        })?;
     let media = resolve_media(&state, id).await?;
 
     // Streaming is the strongest "still watching" signal there is.
@@ -3307,6 +3461,7 @@ pub(crate) async fn serve_media(
                 })?;
         let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 match Read::read(&mut *reader, &mut buffer) {
@@ -3466,6 +3621,232 @@ mod tests {
     use localreel_kernel::migrations;
     use localreel_media::MediaService;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn sse_redacts_diagnostics_and_stops_on_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let response = events(State(state.clone())).await.into_response();
+        let mut stream = response.into_body().into_data_stream();
+        state
+            .events
+            .publish(localreel_kernel::events::Event::JobFailed {
+                job_id: "1".into(),
+                kind: "probe".into(),
+                error: "secret-path stderr".into(),
+            });
+        let chunk = futures_util::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(!text.contains("secret-path"));
+        assert!(text.contains("job failed"));
+        state.draining.send_replace(true);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream)
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_share_ttls_are_bad_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state);
+        for hours in [0, -1, 8761, i64::MAX] {
+            let response = app
+                .clone()
+                .oneshot(request_json(
+                    "POST",
+                    "/api/v1/media/1/share",
+                    &session,
+                    &csrf,
+                    serde_json::json!({"ttl_hours": hours}).to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_restore_upload_cleans_only_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _) = signed_in(dir.path());
+        let current = state.accounts.session(&session).unwrap().unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let task = tokio::spawn(upload_restore_file(
+            State(state.clone()),
+            Extension(current),
+            body,
+        ));
+        sender
+            .send(Ok(Bytes::from(vec![b'x'; 1024 * 1024])))
+            .await
+            .unwrap();
+        let uploads = dir.path().join("backup-uploads");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&uploads) {
+                    if entries
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                        && sender.capacity() == 1
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = uploads.join("unrelated.json");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_dir(&uploads).unwrap().count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn password_mutations_share_budget_and_keep_async_audit_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let permit = state
+            .auth_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let response = auth::setup(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(auth::Credentials {
+                username: "owner".into(),
+                password: "correct horse".into(),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(state.accounts.setup_required().unwrap());
+        drop(permit);
+        let (session, _) = sign_in(&state);
+        let current = state.accounts.session(&session).unwrap().unwrap();
+        let permit = state
+            .auth_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let response = auth::create_user(
+            State(state.clone()),
+            Extension(current.clone()),
+            Json(auth::CreateUserRequest {
+                username: "guest".into(),
+                password: "guest password".into(),
+                role: None,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = auth::update_user(
+            State(state.clone()),
+            Path(current.user.id),
+            Extension(current.clone()),
+            Json(auth::UpdateUserRequest {
+                role: None,
+                enabled: None,
+                password: Some("changed password".into()),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state.accounts.list_users().unwrap().len(), 1);
+        assert!(state
+            .accounts
+            .authenticate("owner", "correct horse")
+            .unwrap()
+            .is_some());
+        drop(permit);
+        let (result, count) = localreel_media::audit::with_audit_scope(auth::create_user(
+            State(state.clone()),
+            Extension(current.clone()),
+            Json(auth::CreateUserRequest {
+                username: "guest".into(),
+                password: "guest password".into(),
+                role: None,
+            }),
+        ))
+        .await;
+        let (_, Json(guest)) = result.unwrap();
+        assert_eq!(count, 1);
+        let (result, count) = localreel_media::audit::with_audit_scope(auth::update_user(
+            State(state.clone()),
+            Path(guest.id),
+            Extension(current),
+            Json(auth::UpdateUserRequest {
+                role: None,
+                enabled: None,
+                password: Some("changed password".into()),
+            }),
+        ))
+        .await;
+        let _ = result.unwrap();
+        assert_eq!(count, 1);
+        assert!(state
+            .accounts
+            .authenticate("guest", "changed password")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_restore_upload_is_removed_and_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, csrf) = signed_in(dir.path());
+        let app = router(state.clone());
+        for expected in [StatusCode::ACCEPTED, StatusCode::CONFLICT] {
+            let response = app
+                .clone()
+                .oneshot(request_json(
+                    "POST",
+                    "/api/v1/backup/restore/upload",
+                    &session,
+                    &csrf,
+                    "{}".into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("backup-uploads"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 
     fn state(dir: &std::path::Path) -> Arc<AppState> {
         state_with_config(dir, None, Vec::new())
@@ -5113,7 +5494,9 @@ mod tests {
             .await
             .unwrap();
         let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Flattened: the media fields stay at the top level.
+        // Flattened: public media fields stay at the top level.
+        assert!(detail.get("uri").is_none());
+        assert!(detail.get("canonical_path").is_none());
         assert_eq!(detail["id"], media_id);
         assert_eq!(detail["metadata"]["title"], "The Matrix");
         assert_eq!(detail["metadata"]["provider"], "tmdb");
@@ -5227,10 +5610,49 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn playback_jobs_are_isolated_by_source_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let (media_id, _, _) = seed_playable(&state, dir.path());
+        let original = state.media.get_media(media_id).unwrap().unwrap();
+        for (kind, prefix) in [("transcode", "transcode"), ("hls_package", "hls")] {
+            let key = playback_job_key(prefix, &original, "default");
+            let first = state.jobs.enqueue(kind, "{}", Some(&key), 1).unwrap();
+            state.jobs.claim("worker", 60).unwrap().unwrap();
+            let mut changed = original.clone();
+            changed.file_size += 1;
+            let new_key = playback_job_key(prefix, &changed, "default");
+            assert_ne!(key, new_key);
+            let second = state.jobs.enqueue(kind, "{}", Some(&new_key), 1).unwrap();
+            assert_ne!(
+                first, second,
+                "changed input must not join an old running job"
+            );
+            state.jobs.fail(&first, "private diagnostic").unwrap();
+            assert_eq!(
+                failed_attempt(&state, kind, &key, &original)
+                    .unwrap()
+                    .as_deref(),
+                Some("this file could not be prepared")
+            );
+            assert!(failed_attempt(&state, kind, &new_key, &changed)
+                .unwrap()
+                .is_none());
+            changed = original.clone();
+            changed.modified_at += 1;
+            assert_ne!(key, playback_job_key(prefix, &changed, "default"));
+            // Clear the second queued job before exercising the other kind.
+            let claimed = state.jobs.claim("worker", 60).unwrap().unwrap();
+            assert_eq!(claimed.id, second);
+            state.jobs.fail(&second, "private diagnostic").unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_transcode_is_reported_instead_of_requeued() {
         let dir = tempfile::tempdir().unwrap();
-        let (state, session, csrf) = signed_in(dir.path());
+        let (state, _session, _csrf) = signed_in(dir.path());
         let (media_id, _, _) = seed_playable(&state, dir.path());
         // A file the browser cannot play directly, so the request reaches the
         // transcode path instead of answering "direct".
@@ -5249,7 +5671,7 @@ mod tests {
         let media = state.media.get_media(media_id).unwrap().unwrap();
         let preset = preferred_preset(&media);
         let variant = localreel_media::transcode_variant_key(preset, None);
-        let dedupe = format!("transcode:{media_id}:{variant}");
+        let dedupe = playback_job_key("transcode", &media, &variant);
         let payload = serde_json::json!({
             "media_id": media_id,
             "preset": preset,
@@ -5263,6 +5685,14 @@ mod tests {
         let claimed = state.jobs.claim("worker", 60).unwrap().unwrap();
         assert_eq!(claimed.id, job_id);
         state.jobs.fail(&job_id, "ffmpeg exploded").unwrap();
+        // A viewer, not an admin, polls playback failures.
+        let guest = state
+            .accounts
+            .create_user("viewer", "viewer password", localreel_media::Role::User)
+            .unwrap();
+        let viewer_session = state.accounts.create_session(guest.id).unwrap();
+        let session = viewer_session.id;
+        let csrf = viewer_session.csrf;
 
         let app = router(state);
         let response = app
@@ -5283,13 +5713,8 @@ mod tests {
             .unwrap();
         let playback: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(playback["mode"], "failed");
-        assert!(
-            playback["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ffmpeg exploded"),
-            "the reason must reach the player: {playback:?}"
-        );
+        assert_eq!(playback["message"], "this file could not be prepared");
+        assert!(!playback.to_string().contains("ffmpeg exploded"));
     }
 
     /// The admin health endpoint drives the "watching / not watching" badge.

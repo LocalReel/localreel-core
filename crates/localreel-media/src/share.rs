@@ -65,7 +65,10 @@ impl MediaService {
     ) -> Result<Share> {
         let now = now_secs();
         let expires_at = match ttl_secs {
-            Some(seconds) if seconds > 0 => Some(now + seconds),
+            Some(seconds) if seconds > 0 => Some(
+                now.checked_add(seconds)
+                    .ok_or_else(|| KernelError::InvalidInput("expiry is too large".into()))?,
+            ),
             Some(_) => {
                 return Err(KernelError::InvalidInput(
                     "the expiry must be positive".into(),
@@ -117,6 +120,31 @@ impl MediaService {
                 .query_map([media_id], row_to_share)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(shares)
+        })
+    }
+
+    /// Only the creator or an administrator can manage a link.
+    pub fn list_shares_for_user(
+        &self,
+        media_id: i64,
+        user_id: i64,
+        admin: bool,
+    ) -> Result<Vec<Share>> {
+        self.database().with_read(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {COLUMNS} FROM media_share WHERE media_id = ?1 AND (?3 OR created_by = ?2) ORDER BY id DESC"
+            ))?;
+            let shares = statement.query_map(params![media_id, user_id, admin], row_to_share)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(shares)
+        })
+    }
+
+    pub fn revoke_share_for_user(&self, token: &str, user_id: i64, admin: bool) -> Result<bool> {
+        self.database().with_write(|connection| {
+            Ok(connection.execute(
+                "UPDATE media_share SET revoked_at = ?2 WHERE token = ?1 AND revoked_at IS NULL AND (?4 OR created_by = ?3)",
+                params![token, now_secs(), user_id, admin],
+            )? > 0)
         })
     }
 
@@ -187,6 +215,41 @@ mod tests {
         let found = service.share_by_token(&share.token).unwrap().unwrap();
         assert_eq!(found, share);
         assert_eq!(service.list_shares(media_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn share_management_requires_creator_or_admin() {
+        let (_dir, service, media_id) = setup();
+        let share = service
+            .create_share(media_id, Some(1), None, false)
+            .unwrap();
+        assert!(service
+            .list_shares_for_user(media_id, 2, false)
+            .unwrap()
+            .is_empty());
+        assert!(!service
+            .revoke_share_for_user(&share.token, 2, false)
+            .unwrap());
+        assert_eq!(
+            service
+                .list_shares_for_user(media_id, 1, false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .list_shares_for_user(media_id, 2, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(service
+            .revoke_share_for_user(&share.token, 2, true)
+            .unwrap());
+        assert!(service
+            .create_share(media_id, None, Some(i64::MAX), false)
+            .is_err());
     }
 
     #[test]

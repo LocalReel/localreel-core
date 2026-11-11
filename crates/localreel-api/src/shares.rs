@@ -53,7 +53,15 @@ fn share_json(share: &localreel_media::Share) -> serde_json::Value {
 fn active_share(state: &AppState, token: &str) -> Result<localreel_media::Share, ApiError> {
     // One answer for "no such link", "expired" and "revoked": an outsider must
     // not learn which of the three applies.
-    if !limiter().check(token) {
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::not_found("share link"));
+    }
+    static GLOBAL: OnceLock<MinuteLimiter> = OnceLock::new();
+    if !GLOBAL
+        .get_or_init(|| MinuteLimiter::new(1200, Duration::from_secs(60)))
+        .check("share")
+        || !limiter().check(token)
+    {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -74,7 +82,19 @@ pub async fn create(
     Path(media_id): Path<i64>,
     Json(body): Json<CreateShare>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let ttl_secs = body.ttl_hours.map(|hours| hours.max(1) * 3600);
+    let ttl_secs = body
+        .ttl_hours
+        .map(|hours| {
+            if !(1..=24 * 365).contains(&hours) {
+                return Err(ApiError::bad_request(
+                    "ttl_hours must be between 1 and 8760",
+                ));
+            }
+            hours
+                .checked_mul(3600)
+                .ok_or_else(|| ApiError::bad_request("expiry is too large"))
+        })
+        .transpose()?;
     let share = state.media.create_share(
         media_id,
         Some(current.user.id),
@@ -87,8 +107,13 @@ pub async fn create(
 pub async fn list(
     State(state): State<Arc<AppState>>,
     Path(media_id): Path<i64>,
+    Extension(current): Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let shares = state.media.list_shares(media_id)?;
+    let shares = state.media.list_shares_for_user(
+        media_id,
+        current.user.id,
+        current.user.role == localreel_media::Role::Admin,
+    )?;
     Ok(Json(serde_json::json!({
         "items": shares.iter().map(share_json).collect::<Vec<_>>(),
         "total": shares.len(),
@@ -98,8 +123,13 @@ pub async fn list(
 pub async fn revoke(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    Extension(current): Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.media.revoke_share(&token)? {
+    if !state.media.revoke_share_for_user(
+        &token,
+        current.user.id,
+        current.user.role == localreel_media::Role::Admin,
+    )? {
         return Err(ApiError::not_found("share link"));
     }
     Ok(Json(serde_json::json!({ "revoked": true })))

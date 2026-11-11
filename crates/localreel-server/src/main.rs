@@ -1144,7 +1144,9 @@ async fn serve(
         }
     };
     // Connect info carries the peer address to the login rate limiter.
-    axum::serve(
+    let draining = state.draining.clone();
+    let mut drain_started = state.draining.subscribe();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
@@ -1160,8 +1162,15 @@ async fn serve(
             }
         }
         shutdown_signal.store(true, Ordering::SeqCst);
-    })
-    .await?;
+        draining.send_replace(true);
+    });
+    tokio::select! {
+        result = std::future::IntoFuture::into_future(server) => result?,
+        _ = async {
+            let _ = drain_started.wait_for(|stopping| *stopping).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } => tracing::warn!("HTTP drain deadline reached; proceeding with shutdown"),
+    }
 
     // Stop the sidecars after the HTTP server stops accepting work, so their
     // in-flight reads are drained rather than cut off mid-stream.

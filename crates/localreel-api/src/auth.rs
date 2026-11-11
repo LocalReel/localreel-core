@@ -127,6 +127,32 @@ pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     .into_response()
 }
 
+/// Hold the shared CPU budget inside the blocking task, even if its request
+/// is cancelled. Audit writes deliberately remain in the calling async task.
+async fn account_work<T, F>(state: &AppState, work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(localreel_media::AccountService) -> localreel_kernel::error::Result<T>
+        + Send
+        + 'static,
+{
+    let permit = state.auth_slots.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+            "too many account operations in progress",
+        )
+    })?;
+    let accounts = state.accounts.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work(accounts)
+    })
+    .await
+    .map_err(|_| ApiError::internal("account task failed"))?
+    .map_err(ApiError::from)
+}
+
 pub async fn setup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -137,7 +163,10 @@ pub async fn setup(
             "the owner account is already configured",
         ));
     }
-    let user = state.accounts.setup_owner(&body.username, &body.password)?;
+    let user = account_work(&state, move |accounts| {
+        accounts.setup_owner(&body.username, &body.password)
+    })
+    .await?;
     let session = state
         .accounts
         .create_session_with_agent(user.id, agent(&headers))?;
@@ -156,10 +185,14 @@ pub async fn login(
     Json(body): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     state.login_limiter.check(peer.ip())?;
-    match state
-        .accounts
-        .authenticate(&body.username, &body.password)?
-    {
+    if body.username.len() > 256 || body.password.len() > 4096 {
+        return Err(ApiError::bad_request("credentials are too long"));
+    }
+    let authenticated = account_work(&state, move |accounts| {
+        accounts.authenticate(&body.username, &body.password)
+    })
+    .await?;
+    match authenticated {
         Some(user) => {
             state.login_limiter.clear(peer.ip());
             let session = state
@@ -231,9 +264,10 @@ pub async fn create_user(
             )))
         }
     };
-    let user = state
-        .accounts
-        .create_user(&body.username, &body.password, role)?;
+    let user = account_work(&state, move |accounts| {
+        accounts.create_user(&body.username, &body.password, role)
+    })
+    .await?;
     // Who exists in a household is exactly what people forget later.
     let _ = state.media.record_admin(
         Some(current.user.id),
@@ -270,7 +304,7 @@ pub async fn update_user(
         enabled: body.enabled,
         password: body.password,
     };
-    let user = state.accounts.update_user(id, patch)?;
+    let user = account_work(&state, move |accounts| accounts.update_user(id, patch)).await?;
     let _ = state.media.record_admin(
         Some(current.user.id),
         Some(&current.user.username),

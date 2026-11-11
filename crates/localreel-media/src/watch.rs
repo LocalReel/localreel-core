@@ -243,18 +243,38 @@ async fn debounce_loop(
     debounce: Duration,
 ) {
     while events.recv().await.is_some() {
-        let settle = tokio::time::Instant::now() + debounce;
+        let mut settle = tokio::time::Instant::now() + debounce;
         loop {
             tokio::select! {
                 next = events.recv() => {
                     if next.is_none() {
                         return;
                     }
+                    settle = tokio::time::Instant::now() + debounce;
                 }
                 _ = tokio::time::sleep_until(settle) => break,
             }
         }
-        enqueue_scan(&jobs, source_id);
+        // An event observed while discovery is running may concern a directory
+        // already visited. Wait for that run to finish, then enqueue a fresh run.
+        loop {
+            match jobs.latest_for_dedupe("scan_source", &format!("scan:{source_id}")) {
+                Ok(Some(job)) if job.status == "running" => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ => {
+                    enqueue_scan(&jobs, source_id);
+                    // A worker can claim between the check and enqueue. If
+                    // deduplication returned a running job, conservatively
+                    // retain the event until one fresh queued run is visible.
+                    if matches!(jobs.latest_for_dedupe("scan_source", &format!("scan:{source_id}")), Ok(Some(job)) if job.status == "running")
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -363,6 +383,34 @@ mod tests {
         let source = media.add_source(library.to_str().unwrap()).unwrap();
         let jobs = JobQueue::new(db, EventBus::new(16));
         (media, jobs, source)
+    }
+
+    #[tokio::test]
+    async fn changes_during_running_scan_schedule_a_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let (_, jobs, source) = fixture(dir.path(), library.path());
+        enqueue_scan(&jobs, source.id);
+        let running = jobs.claim("test", 30).unwrap().unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(debounce_loop(
+            receiver,
+            jobs.clone(),
+            source.id,
+            Duration::from_millis(10),
+        ));
+        sender.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(jobs.list_recent(10).unwrap().len(), 1);
+        jobs.complete(&running.id, "{}").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while jobs.list_recent(10).unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
     }
 
     #[test]

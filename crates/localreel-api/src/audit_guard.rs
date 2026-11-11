@@ -7,8 +7,8 @@
 //!
 //! This middleware watches the mutations under `/api/v1/admin/`: if the request
 //! succeeded and nothing was recorded meanwhile, it records the route itself.
-//! The "meanwhile" is an explicit counter bumped by `record_admin`, so a handler
-//! that did its job produces no duplicate row.
+//! A request-local counter is bumped by `record_admin`, so concurrent requests
+//! cannot suppress each other's fallback and a handler produces no duplicate row.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use localreel_media::audit::recorded_count;
+use localreel_media::audit::with_audit_scope;
 use localreel_media::CurrentUser;
 
 use crate::state::AppState;
@@ -53,19 +53,19 @@ pub async fn audit_fallback(
         .map(|current| (current.user.id, current.user.username.clone()));
     let path = request.uri().path().to_string();
     let method = request.method().clone();
-    let before = recorded_count();
+    let (response, recorded) = with_audit_scope(next.run(request)).await;
 
-    let response = next.run(request).await;
-
-    if watched && needs_fallback(before, recorded_count(), response.status().as_u16()) {
+    if watched && needs_fallback(0, recorded, response.status().as_u16()) {
         let (user_id, username) = actor.unwrap_or((0, String::new()));
-        let _ = state.media.record_admin(
+        if let Err(error) = state.media.record_admin(
             (user_id != 0).then_some(user_id),
             (!username.is_empty()).then_some(username.as_str()),
             "admin.api",
             Some(&format!("{} {}", method.as_str(), path)),
             Some("no handler-level audit entry"),
-        );
+        ) {
+            tracing::error!(%error, "failed to persist administrator audit entry");
+        }
     }
     response
 }

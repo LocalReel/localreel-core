@@ -20,6 +20,20 @@ use crate::service::MediaService;
 /// counter gets a fallback row.
 static RECORDED: AtomicU64 = AtomicU64::new(0);
 
+tokio::task_local! {
+    static REQUEST_RECORDED: std::cell::Cell<u64>;
+}
+
+/// Isolate handler audit writes from concurrent requests.
+pub async fn with_audit_scope<F: std::future::Future>(future: F) -> (F::Output, u64) {
+    REQUEST_RECORDED
+        .scope(std::cell::Cell::new(0), async {
+            let output = future.await;
+            (output, REQUEST_RECORDED.with(|count| count.get()))
+        })
+        .await
+}
+
 pub fn recorded_count() -> u64 {
     RECORDED.load(Ordering::Relaxed)
 }
@@ -71,6 +85,7 @@ impl MediaService {
             Ok(())
         })?;
         RECORDED.fetch_add(1, Ordering::Relaxed);
+        let _ = REQUEST_RECORDED.try_with(|count| count.set(count.get() + 1));
         Ok(())
     }
 
@@ -102,6 +117,23 @@ mod tests {
         migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
         migrations::apply(&db, "media", crate::migrations::list()).unwrap();
         (dir, MediaService::new(db))
+    }
+
+    #[tokio::test]
+    async fn request_counts_are_isolated() {
+        let (_dir, service) = setup();
+        let (((), inner), outer) = with_audit_scope(async {
+            with_audit_scope(async {
+                service
+                    .record_admin(None, None, "test", None, None)
+                    .unwrap();
+                tokio::task::yield_now().await;
+            })
+            .await
+        })
+        .await;
+        assert_eq!(inner, 1);
+        assert_eq!(outer, 0);
     }
 
     #[test]
@@ -141,13 +173,29 @@ mod tests {
         assert_eq!(service.admin_audit(500).unwrap().len(), 5);
     }
 
-    #[test]
-    fn recording_moves_the_counter_the_middleware_watches() {
+    #[tokio::test]
+    async fn middleware_counts_only_its_own_concurrent_request() {
         let (_dir, service) = setup();
         let before = recorded_count();
-        service
-            .record_admin(Some(1), Some("owner"), "user.delete", Some("2"), None)
-            .unwrap();
-        assert_eq!(recorded_count(), before + 1);
+        let first = with_audit_scope(async {
+            service
+                .record_admin(Some(1), Some("owner"), "user.delete", Some("2"), None)
+                .unwrap();
+            tokio::task::yield_now().await;
+        });
+        let second = with_audit_scope(async {
+            service
+                .record_admin(None, None, "other.request", None, None)
+                .unwrap();
+            tokio::task::yield_now().await;
+            service
+                .record_admin(None, None, "other.request", None, None)
+                .unwrap();
+        });
+        let (((), first_count), ((), second_count)) = tokio::join!(first, second);
+        assert_eq!(first_count, 1);
+        assert_eq!(second_count, 2);
+        // This process-wide telemetry may also include independent tests.
+        assert!(recorded_count() >= before + 3);
     }
 }

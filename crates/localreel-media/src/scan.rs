@@ -204,7 +204,9 @@ pub fn discover_source_with_storage(
                 continue;
             }
         };
-        seen.insert(entry.uri.clone());
+        if !seen.insert(entry.uri.clone()) {
+            continue;
+        }
         candidates.push(Candidate {
             uri: entry.uri,
             canonical_path,
@@ -272,6 +274,8 @@ pub fn discover_source_with_storage(
                     let changed = existing.file_size != candidate.file_size
                         || existing.modified_at != candidate.modified_at;
                     if changed {
+                        transaction.execute("DELETE FROM media_variants WHERE media_id = ?1", [existing.id])?;
+                        transaction.execute("DELETE FROM media_tracks WHERE media_id = ?1 AND source = 'embedded'", [existing.id])?;
                         transaction.execute(
                             "UPDATE media SET
                                  canonical_path = ?1, filename = ?2,
@@ -279,6 +283,8 @@ pub fn discover_source_with_storage(
                                  series_key = ?5, series_title = ?6,
                                  episode = ?7, is_extra = ?8, series_rev = ?9,
                                  thumbnail_path = NULL, missing_at = NULL,
+                                 duration = NULL, width = NULL, height = NULL,
+                                 video_codec = NULL, audio_codec = NULL, bitrate = NULL,
                                  updated_at = ?10
                              WHERE id = ?11",
                             params![
@@ -630,6 +636,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(names, vec!["episode-01.mp4", "episode-02.mkv"]);
+    }
+
+    #[test]
+    fn duplicate_candidates_are_deduplicated_and_changes_invalidate_variants() {
+        let (dir, db, service) = setup();
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = service.add_source(root.to_str().unwrap()).unwrap();
+        let mut entry = localreel_kernel::storage::StorageEntry {
+            uri: "http://example.test/movie.mp4".into(),
+            name: "movie.mp4".into(),
+            is_dir: false,
+            size: 10,
+            modified: Some(1),
+        };
+        let mock = MockStorage {
+            entries: vec![entry.clone(), entry.clone()],
+        };
+        let result =
+            discover_source_with_storage(&db, &source, &mock, &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.added, 1);
+        let id: i64 = db
+            .with_read(|conn| Ok(conn.query_row("SELECT id FROM media", [], |row| row.get(0))?))
+            .unwrap();
+        service
+            .record_variant(id, "transcode", "default", "old.mp4", 10)
+            .unwrap();
+        entry.size = 20;
+        discover_source_with_storage(
+            &db,
+            &source,
+            &MockStorage {
+                entries: vec![entry],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(service
+            .find_variant(id, "transcode", "default")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

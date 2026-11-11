@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.8 — Unreleased
+
+### Fixed
+
+- Fence job completion by lease ownership and isolate media-derived jobs by source fingerprint.
+- Invalidate stale variants and atomically reject superseded probe metadata and embedded tracks.
+- Schedule follow-up scans for changes arriving during an active scan; preserve active HLS caches.
+- Stop SSE streams during shutdown and redact internal diagnostics and storage addresses from public responses.
+- Enforce share ownership, bounded token budgets and checked expiry values; isolate audit counts per request.
+- Bound password hashing and media read concurrency; clean duplicate and cancelled backup uploads.
+- Pin broker connections to vetted DNS addresses on each redirect while retaining TLS hostname verification.
+
+### Verification notes
+
+- Release preparation only: no tag or published artifact has been produced for this version.
+- Source identity still uses size and modification time; crash-orphan cache cleanup and provider I/O cancellation remain bounded limitations.
+
 ## 0.4.0 — 2026-11-04
 
 The scroll feed becomes real: series-aware, server-ranked, with an endpoint the

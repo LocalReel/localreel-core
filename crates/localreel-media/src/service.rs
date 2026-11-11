@@ -655,6 +655,37 @@ impl MediaService {
         })
     }
 
+    /// Atomically publish probe metadata and tracks only for the input version
+    /// that was actually probed. Size + mtime is deliberately a weak fingerprint.
+    pub fn apply_probe_for_media(&self, media: &Media, probe: &ProbeResult) -> Result<bool> {
+        self.db.with_write(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "UPDATE media SET duration = ?1, width = ?2, height = ?3,
+                     video_codec = ?4, audio_codec = ?5, bitrate = ?6, updated_at = ?7
+                 WHERE id = ?8 AND file_size = ?9 AND modified_at = ?10 AND missing_at IS NULL",
+                params![
+                    probe.duration,
+                    probe.width,
+                    probe.height,
+                    probe.video_codec,
+                    probe.audio_codec,
+                    probe.bitrate,
+                    now_secs(),
+                    media.id,
+                    media.file_size,
+                    media.modified_at
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            Self::replace_probe_tracks_in(&transaction, media.id, probe)?;
+            transaction.commit()?;
+            Ok(true)
+        })
+    }
+
     /// Update the metadata fields produced by `ffprobe`.
     pub fn update_probe(&self, media_id: i64, probe: &ProbeResult) -> Result<()> {
         self.db.with_write(|connection| {
@@ -674,6 +705,13 @@ impl MediaService {
                     media_id
                 ],
             )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_thumbnail_for_media(&self, media: &Media, thumbnail_path: &str) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute("UPDATE media SET thumbnail_path = ?1 WHERE id = ?2 AND file_size = ?3 AND modified_at = ?4", params![thumbnail_path, media.id, media.file_size, media.modified_at])?;
             Ok(())
         })
     }
@@ -740,6 +778,27 @@ impl MediaService {
         })
     }
 
+    /// Publish a derived artifact only if the input fingerprint is still current.
+    pub fn record_variant_for_media(
+        &self,
+        media: &Media,
+        kind: &str,
+        preset: &str,
+        path: &str,
+        size: i64,
+    ) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute(
+                "INSERT INTO media_variants (media_id, kind, preset, path, size, created_at, last_used_at)
+                 SELECT id, ?2, ?3, ?4, ?5, ?6, ?6 FROM media
+                 WHERE id = ?1 AND file_size = ?7 AND modified_at = ?8
+                 ON CONFLICT(media_id, kind, preset, path) DO UPDATE SET size = excluded.size, last_used_at = excluded.last_used_at",
+                params![media.id, kind, preset, path, size, now_secs(), media.file_size, media.modified_at],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn touch_variant(&self, media_id: i64, preset: &str) -> Result<()> {
         self.db.with_write(|connection| {
             connection.execute(
@@ -789,44 +848,49 @@ impl MediaService {
         })
     }
 
+    pub fn touch_hls_variant(&self, media_id: i64) -> Result<()> {
+        self.db.with_write(|connection| {
+            connection.execute(
+                "UPDATE media_variants SET last_used_at = ?1 WHERE media_id = ?2 AND kind = 'hls'",
+                params![now_secs(), media_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Remove HLS package directories older than `max_age_secs` and drop their
     /// variant rows. Returns `(directories_removed, bytes_freed)`.
     pub fn gc_hls_cache(&self, hls_dir: &Path, max_age_secs: i64) -> Result<(i64, i64)> {
-        let now = now_secs();
-        let mut removed = 0i64;
-        let mut freed = 0i64;
-        if let Ok(entries) = std::fs::read_dir(hls_dir) {
-            for entry in entries.flatten() {
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                if !metadata.is_dir() {
-                    continue;
-                }
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|value| value.as_secs() as i64)
-                    .unwrap_or(0);
-                if now.saturating_sub(modified) < max_age_secs {
-                    continue;
-                }
-                let size = directory_size(&entry.path());
-                if std::fs::remove_dir_all(entry.path()).is_ok() {
-                    removed += 1;
-                    freed = freed.saturating_add(i64::try_from(size).unwrap_or(i64::MAX));
-                }
-            }
+        if max_age_secs <= 0 {
+            return Ok((0, 0));
         }
+        // Serialize the last-use check with touches. Never infer activity from
+        // directory mtime: reading segments does not update it.
         self.db.with_write(|connection| {
-            connection.execute(
-                "DELETE FROM media_variants WHERE kind = 'hls' AND last_used_at < ?1",
-                [now.saturating_sub(max_age_secs)],
-            )?;
-            Ok(())
-        })?;
-        Ok((removed, freed))
+            let mut statement = connection.prepare("SELECT id, path FROM media_variants WHERE kind = 'hls' AND COALESCE(last_used_at, created_at) < ?1")?;
+            let rows = statement.query_map([now_secs().saturating_sub(max_age_secs.max(3600))], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+            let mut candidates = Vec::new();
+            for row in rows { candidates.push(row?); }
+            drop(statement);
+            let mut removed = 0;
+            let mut freed = 0i64;
+            for (id, path) in candidates {
+                let relative = Path::new(&path);
+                if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) { continue; }
+                let Some(parent) = relative.parent().filter(|parent| !parent.as_os_str().is_empty()) else { continue; };
+                let directory = hls_dir.join(parent);
+                let size = directory_size(&directory);
+                match std::fs::remove_dir_all(&directory) {
+                    Ok(()) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(_) => continue,
+                }
+                connection.execute("DELETE FROM media_variants WHERE id = ?1", [id])?;
+                removed += 1;
+                freed = freed.saturating_add(i64::try_from(size).unwrap_or(i64::MAX));
+            }
+            Ok((removed, freed))
+        })
     }
 
     /// Reclaim transcode variants by age and then by total size.
@@ -1050,6 +1114,19 @@ impl MediaService {
     /// that no longer exists cannot linger in the player's menu. Returns how
     /// many tracks were written.
     pub fn replace_probe_tracks(&self, media_id: i64, probe: &ProbeResult) -> Result<usize> {
+        self.db.with_write(|connection| {
+            let transaction = connection.transaction()?;
+            let written = Self::replace_probe_tracks_in(&transaction, media_id, probe)?;
+            transaction.commit()?;
+            Ok(written)
+        })
+    }
+
+    fn replace_probe_tracks_in(
+        transaction: &rusqlite::Transaction<'_>,
+        media_id: i64,
+        probe: &ProbeResult,
+    ) -> Result<usize> {
         let now = now_secs();
         let tracks: Vec<&localreel_kernel::media_ops::ProbeStream> = probe
             .streams
@@ -1065,37 +1142,33 @@ impl MediaService {
             tracks.first().map(|stream| stream.index)
         };
 
-        self.db.with_write(|connection| {
-            let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM media_tracks WHERE media_id = ?1 AND source = 'embedded'",
+            [media_id],
+        )?;
+        let mut written = 0usize;
+        for stream in &tracks {
+            let is_default = stream.is_default || Some(stream.index) == fallback_default;
             transaction.execute(
-                "DELETE FROM media_tracks WHERE media_id = ?1 AND source = 'embedded'",
-                [media_id],
-            )?;
-            let mut written = 0usize;
-            for stream in &tracks {
-                let is_default = stream.is_default || Some(stream.index) == fallback_default;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO media_tracks (
+                "INSERT OR IGNORE INTO media_tracks (
                          media_id, kind, source, stream_index, path, format, language,
                          title, channels, is_default, is_forced, created_at
                      ) VALUES (?1, 'audio', 'embedded', ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        media_id,
-                        stream.index,
-                        stream.codec_name,
-                        stream.language.as_deref().and_then(normalize_language),
-                        stream.title,
-                        stream.channels.map(i64::from),
-                        i64::from(is_default),
-                        i64::from(stream.is_forced),
-                        now,
-                    ],
-                )?;
-                written += 1;
-            }
-            transaction.commit()?;
-            Ok(written)
-        })
+                params![
+                    media_id,
+                    stream.index,
+                    stream.codec_name,
+                    stream.language.as_deref().and_then(normalize_language),
+                    stream.title,
+                    stream.channels.map(i64::from),
+                    i64::from(is_default),
+                    i64::from(stream.is_forced),
+                    now,
+                ],
+            )?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     /// Tracks of one media item, video streams excluded.
@@ -1928,6 +2001,43 @@ mod tests {
     }
 
     #[test]
+    fn superseded_probe_cannot_replace_metadata_or_tracks() {
+        use localreel_kernel::media_ops::{ProbeResult, ProbeStream};
+        let (dir, service) = setup();
+        let source = service.add_source(dir.path().to_str().unwrap()).unwrap();
+        let id = insert_media(&service, source.id, "probe-version");
+        let old = service.get_media(id).unwrap().unwrap();
+        service
+            .db
+            .with_write(|conn| {
+                conn.execute(
+                    "UPDATE media SET file_size = file_size + 1 WHERE id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let current = service.get_media(id).unwrap().unwrap();
+        let probe = ProbeResult {
+            duration: Some(42.0),
+            streams: vec![ProbeStream {
+                index: 2,
+                codec_type: "audio".into(),
+                language: Some("eng".into()),
+                ..ProbeStream::default()
+            }],
+            ..ProbeResult::default()
+        };
+        assert!(service.apply_probe_for_media(&current, &probe).unwrap());
+        assert!(!service
+            .apply_probe_for_media(&old, &ProbeResult::default())
+            .unwrap());
+        assert_eq!(service.get_media(id).unwrap().unwrap().duration, Some(42.0));
+        assert_eq!(service.list_tracks(id).unwrap().len(), 1);
+        assert_eq!(service.list_tracks(id).unwrap()[0].stream_index, Some(2));
+    }
+
+    #[test]
     fn probe_tracks_are_replaced_wholesale() {
         use localreel_kernel::media_ops::{ProbeResult, ProbeStream};
 
@@ -2119,6 +2229,50 @@ mod tests {
         assert_eq!(report.remaining_bytes, 100);
         assert_eq!(service.cache_stats().unwrap().transcode_count, 1);
         assert_eq!(std::fs::read_dir(&transcode_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stale_encode_cannot_publish_and_hls_gc_respects_touches() {
+        let (dir, service) = setup();
+        let source = service.add_source(dir.path().to_str().unwrap()).unwrap();
+        let id = insert_media(&service, source.id, "fingerprint");
+        let old = service.get_media(id).unwrap().unwrap();
+        service
+            .db
+            .with_write(|conn| {
+                conn.execute(
+                    "UPDATE media SET file_size = file_size + 1 WHERE id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        service
+            .record_variant_for_media(&old, "transcode", "default", "stale.mp4", 1)
+            .unwrap();
+        assert!(service
+            .find_variant(id, "transcode", "default")
+            .unwrap()
+            .is_none());
+        let hls = dir.path().join("hls");
+        std::fs::create_dir_all(hls.join("test/v1")).unwrap();
+        std::fs::write(hls.join("test/v1/index.m3u8"), b"playlist").unwrap();
+        service
+            .record_variant(id, "hls", "default", "test/v1/index.m3u8", 8)
+            .unwrap();
+        service
+            .db
+            .with_write(|conn| {
+                conn.execute(
+                    "UPDATE media_variants SET last_used_at = 1 WHERE media_id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        service.touch_hls_variant(id).unwrap();
+        assert_eq!(service.gc_hls_cache(&hls, 1).unwrap().0, 0);
+        assert!(hls.join("test/v1/index.m3u8").exists());
     }
 
     #[test]

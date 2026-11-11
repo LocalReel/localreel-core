@@ -163,17 +163,18 @@ fn fetch_inner(
     }
 
     let mut url = parse_url(&request.url)?;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(scope.timeout_secs))
-        .build();
-
     let mut redirects = 0u8;
     loop {
         ensure_host_allowed(&url, &scope.hosts)?;
-        if !allow_private {
-            ensure_public_destination(&url)?;
-        }
+        // Resolve once per hop, then give the HTTP client only those vetted
+        // addresses. Keep the original URL for Host and TLS/SNI verification.
+        let addresses = resolve_destination(&url, allow_private)?;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .resolver(move |_: &str| Ok(addresses.clone()))
+            .timeout(Duration::from_secs(scope.timeout_secs))
+            .build();
 
         let mut call = match method.as_str() {
             "HEAD" => agent.head(url.as_str()),
@@ -294,7 +295,10 @@ pub(crate) fn host_matches(host: &str, patterns: &[String]) -> bool {
     })
 }
 
-fn ensure_public_destination(url: &Url) -> Result<(), BrokerError> {
+fn resolve_destination(
+    url: &Url,
+    allow_private: bool,
+) -> Result<Vec<std::net::SocketAddr>, BrokerError> {
     let host = url
         .host_str()
         .ok_or_else(|| BrokerError::Invalid("URL has no host".to_string()))?;
@@ -302,9 +306,9 @@ fn ensure_public_destination(url: &Url) -> Result<(), BrokerError> {
         .port_or_known_default()
         .ok_or_else(|| BrokerError::Invalid("URL has no port".to_string()))?;
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_public_ip(ip) {
-            Ok(())
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return if allow_private || is_public_ip(ip) {
+            Ok(vec![std::net::SocketAddr::new(ip, port)])
         } else {
             Err(BrokerError::Denied(format!(
                 "destination {ip} is not a public address"
@@ -322,14 +326,14 @@ fn ensure_public_destination(url: &Url) -> Result<(), BrokerError> {
         )));
     }
     for address in &addresses {
-        if !is_public_ip(address.ip()) {
+        if !allow_private && !is_public_ip(address.ip()) {
             return Err(BrokerError::Denied(format!(
                 "destination {} is not a public address",
                 address.ip()
             )));
         }
     }
-    Ok(())
+    Ok(addresses)
 }
 
 /// Reject loopback, private, link-local, multicast, documentation, CGNAT and
@@ -403,6 +407,50 @@ mod tests {
             let _ = stream.flush();
         });
         (address, handle)
+    }
+
+    #[test]
+    fn private_destinations_are_rejected_before_connecting() {
+        for raw in ["http://127.0.0.1/", "http://[::1]/", "http://10.0.0.1/"] {
+            assert!(resolve_destination(&Url::parse(raw).unwrap(), false).is_err());
+        }
+        assert_eq!(
+            resolve_destination(&Url::parse("https://8.8.8.8/").unwrap(), false).unwrap(),
+            vec!["8.8.8.8:443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn redirects_recheck_destination_allowlist_before_connecting() {
+        let (address, server) = spawn_server(b"HTTP/1.1 302 Found\r\nLocation: http://unapproved.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
+        let mut scope = loopback_scope(address, 1024);
+        scope.redirects = 1;
+        let result =
+            fetch_loopback_for_test(&scope, &BrokerRequest::get(format!("http://{address}/")));
+        assert!(matches!(result, Err(BrokerError::Denied(_))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pinned_resolver_connects_without_resolving_url_hostname() {
+        let (address, server) = spawn_server(http_response("200 OK", b"pinned"));
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .resolver(move |_: &str| Ok(vec![address]))
+            .timeout(Duration::from_secs(2))
+            .build();
+        // .invalid cannot resolve through normal DNS. The URL remains intact
+        // while the connector uses only the supplied validated address.
+        assert_eq!(
+            agent
+                .get("http://unresolvable.invalid/")
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap(),
+            "pinned"
+        );
+        server.join().unwrap();
     }
 
     fn http_response(status: &str, body: &[u8]) -> Vec<u8> {

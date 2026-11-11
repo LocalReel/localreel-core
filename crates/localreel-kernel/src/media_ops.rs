@@ -497,6 +497,10 @@ impl MediaOps {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Never let an old image make a zero-frame ffmpeg run look successful.
+        if output.exists() {
+            std::fs::remove_file(output)?;
+        }
         let mut command = binary_command(&self.ffmpeg);
         command
             .args(["-y", "-v", "error", "-ss"])
@@ -509,7 +513,15 @@ impl MediaOps {
             .arg(output);
         let result = run_capture(&mut command, self.thumbnail_timeout, cancel);
         match result {
-            Ok(output) if output.status_success => Ok(()),
+            Ok(captured) if captured.status_success => {
+                if std::fs::metadata(output).is_ok_and(|meta| meta.len() > 0) {
+                    Ok(())
+                } else {
+                    Err(KernelError::Media(
+                        "ffmpeg generated no thumbnail frame".into(),
+                    ))
+                }
+            }
             Ok(output) => Err(KernelError::media_detail(
                 "ffmpeg could not generate a thumbnail",
                 format!(

@@ -232,7 +232,18 @@ impl JobQueue {
         })?;
 
         if let Some(job) = &job {
-            self.cancel_flag(&job.id);
+            // A previous, expired execution must not share cancellation with
+            // its successor. Cancel its flag before installing the new one.
+            let mut flags = self
+                .cancel_flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(old) = flags.insert(
+                job.id.clone(),
+                Arc::new(AtomicBool::new(job.cancel_requested)),
+            ) {
+                old.store(true, Ordering::Relaxed);
+            }
         }
         Ok(job)
     }
@@ -286,12 +297,29 @@ impl JobQueue {
 
     /// Update progress (0..1) for a running job and publish an event.
     pub fn update_progress(&self, id: &str, progress: f64, message: Option<&str>) -> Result<()> {
+        self.progress_claim(id, progress, message, None)
+    }
+
+    fn progress_claim(
+        &self,
+        id: &str,
+        progress: f64,
+        message: Option<&str>,
+        claim: Option<&JobRecord>,
+    ) -> Result<()> {
         let progress = progress.clamp(0.0, 1.0);
         let updated = self.db.with_write(|connection| {
             Ok(connection.execute(
                 "UPDATE sys_jobs SET progress = ?1, message = ?2
-                 WHERE id = ?3 AND status = 'running'",
-                params![progress, message, id],
+                 WHERE id = ?3 AND status = 'running'
+                    AND (?4 IS NULL OR (lease_owner = ?4 AND attempts = ?5))",
+                params![
+                    progress,
+                    message,
+                    id,
+                    claim.and_then(|job| job.lease_owner.as_deref()),
+                    claim.map(|job| job.attempts)
+                ],
             )?)
         })?;
         if updated > 0 {
@@ -306,6 +334,10 @@ impl JobQueue {
 
     /// Mark a running job succeeded. No-op when the job is no longer running.
     pub fn complete(&self, id: &str, result: &str) -> Result<()> {
+        self.complete_claim(id, result, None)
+    }
+
+    fn complete_claim(&self, id: &str, result: &str, claim: Option<&JobRecord>) -> Result<()> {
         let kind = self.kind_of(id)?;
         let now = now_secs();
         let updated = self.db.with_write(|connection| {
@@ -313,8 +345,15 @@ impl JobQueue {
                 "UPDATE sys_jobs
                  SET status = 'succeeded', progress = 1.0, result = ?1,
                      finished_at = ?2, lease_owner = NULL, lease_expires_at = NULL
-                 WHERE id = ?3 AND status = 'running'",
-                params![result, now, id],
+                 WHERE id = ?3 AND status = 'running'
+                    AND (?4 IS NULL OR (lease_owner = ?4 AND attempts = ?5))",
+                params![
+                    result,
+                    now,
+                    id,
+                    claim.and_then(|job| job.lease_owner.as_deref()),
+                    claim.map(|job| job.attempts)
+                ],
             )?)
         })?;
         if updated > 0 {
@@ -329,14 +368,23 @@ impl JobQueue {
 
     /// Mark a running job failed, retrying with backoff while attempts remain.
     pub fn fail(&self, id: &str, error: &str) -> Result<()> {
+        self.fail_claim(id, error, None)
+    }
+
+    fn fail_claim(&self, id: &str, error: &str, claim: Option<&JobRecord>) -> Result<()> {
         let now = now_secs();
         let (kind, retry) = self.db.with_write(|connection| {
             let transaction = connection.transaction()?;
             let record: Option<(String, i64, i64)> = transaction
                 .query_row(
                     "SELECT kind, attempts, max_attempts FROM sys_jobs
-                     WHERE id = ?1 AND status = 'running'",
-                    [id],
+                     WHERE id = ?1 AND status = 'running'
+                       AND (?2 IS NULL OR (lease_owner = ?2 AND attempts = ?3))",
+                    params![
+                        id,
+                        claim.and_then(|job| job.lease_owner.as_deref()),
+                        claim.map(|job| job.attempts)
+                    ],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
@@ -386,6 +434,10 @@ impl JobQueue {
 
     /// Mark a running job canceled (used by the worker after a handler returns).
     pub fn mark_canceled(&self, id: &str) -> Result<()> {
+        self.cancel_claim(id, None)
+    }
+
+    fn cancel_claim(&self, id: &str, claim: Option<&JobRecord>) -> Result<()> {
         let kind = self.kind_of(id)?;
         let now = now_secs();
         let updated = self.db.with_write(|connection| {
@@ -393,8 +445,14 @@ impl JobQueue {
                 "UPDATE sys_jobs
                  SET status = 'canceled', finished_at = ?1,
                      lease_owner = NULL, lease_expires_at = NULL
-                 WHERE id = ?2 AND status = 'running'",
-                params![now, id],
+                 WHERE id = ?2 AND status = 'running'
+                    AND (?3 IS NULL OR (lease_owner = ?3 AND attempts = ?4))",
+                params![
+                    now,
+                    id,
+                    claim.and_then(|job| job.lease_owner.as_deref()),
+                    claim.map(|job| job.attempts)
+                ],
             )?)
         })?;
         if updated > 0 {
@@ -402,8 +460,8 @@ impl JobQueue {
                 job_id: id.to_string(),
                 kind,
             });
+            self.forget_cancel_flag(id);
         }
-        self.forget_cancel_flag(id);
         Ok(())
     }
 
@@ -756,7 +814,10 @@ impl JobContext {
     }
 
     pub fn report_progress(&self, progress: f64, message: Option<&str>) {
-        if let Err(error) = self.queue.update_progress(&self.job.id, progress, message) {
+        if let Err(error) =
+            self.queue
+                .progress_claim(&self.job.id, progress, message, Some(&self.job))
+        {
             warn!(job_id = %self.job.id, "failed to update job progress: {error}");
         }
     }
@@ -921,13 +982,16 @@ impl JobWorker {
                 blocked = saturated;
             }
 
+            // A fresh owner token fences even release/defer followed by a
+            // reclaim on the same worker (those paths refund attempts).
+            let claim_owner = format!("{}:{}", self.worker_id, uuid::Uuid::new_v4());
             match self
                 .queue
-                .claim_skipping(&self.worker_id, self.lease.as_secs() as i64, &blocked)
+                .claim_skipping(&claim_owner, self.lease.as_secs() as i64, &blocked)
             {
                 Ok(Some(job)) => {
                     if shutdown.load(Ordering::Relaxed) {
-                        let _ = self.queue.release(&job.id, &self.worker_id);
+                        let _ = self.queue.release(&job.id, &claim_owner);
                         break;
                     }
                     // Taking the slot after the claim keeps the job `queued`
@@ -940,9 +1004,9 @@ impl JobWorker {
                         None => None,
                         Some(Some(admission)) => Some(admission),
                         Some(None) => {
-                            let _ =
-                                self.queue
-                                    .defer(&job.id, &self.worker_id, Some(WAITING_FOR_SLOT));
+                            let _ = self
+                                .queue
+                                .defer(&job.id, &claim_owner, Some(WAITING_FOR_SLOT));
                             tokio::time::sleep(self.poll).await;
                             continue;
                         }
@@ -974,7 +1038,7 @@ impl JobWorker {
 
         // A cancel that arrived between claim and execution must not be lost.
         if context.is_cancelled() {
-            if let Err(error) = self.queue.mark_canceled(&job.id) {
+            if let Err(error) = self.queue.cancel_claim(&job.id, Some(&job)) {
                 error!(job_id = %job.id, "failed to mark canceled job: {error}");
             }
             return;
@@ -990,17 +1054,22 @@ impl JobWorker {
         let heartbeat = {
             let queue = self.queue.clone();
             let job_id = job.id.clone();
-            let worker_id = self.worker_id.clone();
+            let worker_id = job.lease_owner.clone().expect("claimed job has an owner");
             let lease = self.lease;
+            let cancel = context.cancel.clone();
             tokio::spawn(async move {
                 let interval = Duration::from_secs((lease.as_secs() / 2).max(1));
                 loop {
                     tokio::time::sleep(interval).await;
                     match queue.renew_lease(&job_id, &worker_id, lease.as_secs() as i64) {
                         Ok(true) => {}
-                        Ok(false) => break,
+                        Ok(false) => {
+                            cancel.store(true, Ordering::Relaxed);
+                            break;
+                        }
                         Err(error) => {
                             warn!(job_id = %job_id, "lease renewal failed: {error}");
+                            cancel.store(true, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -1029,7 +1098,7 @@ impl JobWorker {
         if context.is_cancelled()
             || matches!(result, Err(KernelError::Media(ref message)) if message == "transcode canceled")
         {
-            let _ = self.queue.mark_canceled(&job.id);
+            let _ = self.queue.cancel_claim(&job.id, Some(&job));
             return;
         }
 
@@ -1037,12 +1106,15 @@ impl JobWorker {
             Ok(outcome) => {
                 let result_json =
                     serde_json::to_string(&outcome.result).unwrap_or_else(|_| "null".into());
-                if let Err(error) = self.queue.complete(&job.id, &result_json) {
+                if let Err(error) = self.queue.complete_claim(&job.id, &result_json, Some(&job)) {
                     error!(job_id = %job.id, "failed to complete job: {error}");
                 }
             }
             Err(error) => {
-                if let Err(update_error) = self.queue.fail(&job.id, &error.to_string()) {
+                if let Err(update_error) =
+                    self.queue
+                        .fail_claim(&job.id, &error.to_string(), Some(&job))
+                {
                     error!(job_id = %job.id, "failed to record job failure: {update_error}");
                 }
             }
@@ -1096,6 +1168,35 @@ mod tests {
         migrations::apply(&db, "kernel", migrations()).unwrap();
         let queue = JobQueue::new(db, EventBus::new(64));
         (dir, queue)
+    }
+
+    #[test]
+    fn stale_claim_cannot_complete_fail_or_cancel_new_owner() {
+        let (_dir, queue) = setup();
+        let id = queue.enqueue("test", "{}", None, 3).unwrap();
+        let old = queue.claim("old", 30).unwrap().unwrap();
+        queue
+            .db
+            .with_write(|connection| {
+                connection.execute(
+                    "UPDATE sys_jobs SET lease_expires_at = 0 WHERE id = ?1",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        queue.reclaim_expired().unwrap();
+        let current = queue.claim("new", 30).unwrap().unwrap();
+        queue.complete_claim(&id, "{}", Some(&old)).unwrap();
+        assert!(queue.fail_claim(&id, "old failure", Some(&old)).is_err());
+        queue.cancel_claim(&id, Some(&old)).unwrap();
+        queue.progress_claim(&id, 0.9, None, Some(&old)).unwrap();
+        let record = queue.get(&id).unwrap().unwrap();
+        assert_eq!(record.status, "running");
+        assert_eq!(record.lease_owner.as_deref(), Some("new"));
+        assert_eq!(record.progress, 0.0);
+        queue.complete_claim(&id, "{}", Some(&current)).unwrap();
+        assert_eq!(queue.get(&id).unwrap().unwrap().status, "succeeded");
     }
 
     #[test]

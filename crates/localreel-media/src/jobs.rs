@@ -257,6 +257,28 @@ struct ProbePayload {
     media_id: i64,
 }
 
+fn enqueue_probe_version(
+    queue: &localreel_kernel::jobs::JobQueue,
+    media: &crate::model::Media,
+) -> Result<String> {
+    queue.enqueue(
+        "probe_media",
+        &serde_json::json!({ "media_id": media.id }).to_string(),
+        Some(&format!(
+            "probe:{}:{}:{}",
+            media.id, media.file_size, media.modified_at
+        )),
+        3,
+    )
+}
+
+fn derived_job_key(kind: &str, media: &crate::model::Media) -> String {
+    format!(
+        "{kind}:{}:{}:{}",
+        media.id, media.file_size, media.modified_at
+    )
+}
+
 struct ProbeMediaHandler(Arc<Shared>);
 
 impl JobHandler for ProbeMediaHandler {
@@ -283,11 +305,15 @@ impl JobHandler for ProbeMediaHandler {
 
         context.report_progress(0.1, Some("ffprobe"));
         let probe = self.0.media_ops.probe(&input, &context.cancel_flag())?;
-        service.update_probe(media.id, &probe)?;
-        // The track list is derived state: a re-probe replaces it wholesale, so
-        // a stream that disappeared from the container disappears from the UI.
-        if let Err(error) = service.replace_probe_tracks(media.id, &probe) {
-            tracing::warn!(media_id = media.id, "failed to record tracks: {error}");
+        if !service.apply_probe_for_media(&media, &probe)? {
+            if let Some(current) = service
+                .get_media(media.id)?
+                .filter(|item| item.missing_at.is_none())
+            {
+                // Versioned key never deduplicates to this superseded execution.
+                enqueue_probe_version(context.queue(), &current)?;
+            }
+            return JobOutcome::json(serde_json::json!({ "superseded": true }));
         }
         context.report_progress(0.9, Some("metadata updated"));
 
@@ -299,7 +325,7 @@ impl JobHandler for ProbeMediaHandler {
             if let Err(error) = context.queue().enqueue_with_priority(
                 "thumbnail",
                 &payload,
-                Some(&format!("thumbnail:{}", media.id)),
+                Some(&derived_job_key("thumbnail", &media)),
                 3,
                 THUMBNAIL_PRIORITY,
             ) {
@@ -321,7 +347,7 @@ impl JobHandler for ProbeMediaHandler {
             if let Err(error) = context.queue().enqueue_with_priority(
                 "preview_sprite",
                 &payload,
-                Some(&format!("sprite:{}", media.id)),
+                Some(&derived_job_key("sprite", &media)),
                 2,
                 THUMBNAIL_PRIORITY - 5,
             ) {
@@ -385,12 +411,16 @@ impl JobHandler for ThumbnailHandler {
             }
         }
 
-        let filename = format!("thumb_{}.jpg", media.uid);
+        let filename = format!(
+            "thumb_{}_{}_{}.jpg",
+            media.uid, media.file_size, media.modified_at
+        );
         let output = self.0.thumbnail_dir.join(&filename);
         let seek = media
             .duration
-            .map(|duration| (duration * 0.1).clamp(1.0, 10.0))
-            .unwrap_or(3.0);
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .map(|duration| (duration * 0.1).min(10.0))
+            .unwrap_or(0.0);
 
         context.report_progress(0.1, Some("ffmpeg thumbnail"));
         self.0
@@ -400,8 +430,8 @@ impl JobHandler for ThumbnailHandler {
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        service.set_thumbnail(media.id, &filename)?;
-        service.record_variant(media.id, "thumbnail", "default", &filename, size)?;
+        service.set_thumbnail_for_media(&media, &filename)?;
+        service.record_variant_for_media(&media, "thumbnail", "default", &filename, size)?;
         context.report_progress(1.0, Some("thumbnail ready"));
         Ok(JobOutcome::empty())
     }
@@ -437,13 +467,18 @@ impl JobHandler for PreviewSpriteHandler {
             return JobOutcome::json(serde_json::json!({ "skipped": "too short" }));
         }
 
-        let filename = format!("{}.jpg", sanitize_component(&media.uid, 64));
+        let filename = format!(
+            "{}_{}_{}.jpg",
+            sanitize_component(&media.uid, 64),
+            media.file_size,
+            media.modified_at
+        );
         let output = self.0.preview_dir.join(&filename);
         if output.is_file() {
             let size = std::fs::metadata(&output)
                 .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
                 .unwrap_or(0);
-            service.record_variant(media.id, "sprite", "default", &filename, size)?;
+            service.record_variant_for_media(&media, "sprite", "default", &filename, size)?;
             return JobOutcome::json(serde_json::json!({
                 "file": filename,
                 "exists": true,
@@ -469,7 +504,7 @@ impl JobHandler for PreviewSpriteHandler {
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        service.record_variant(media.id, "sprite", "default", &filename, size)?;
+        service.record_variant_for_media(&media, "sprite", "default", &filename, size)?;
         context.report_progress(1.0, Some("preview sprites ready"));
         JobOutcome::json(serde_json::json!({
             "file": filename,
@@ -587,7 +622,7 @@ impl JobHandler for TranscodeHandler {
         let size = std::fs::metadata(&output)
             .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        service.record_variant(media.id, "transcode", &variant_key, &filename, size)?;
+        service.record_variant_for_media(&media, "transcode", &variant_key, &filename, size)?;
         context.report_progress(
             1.0,
             Some(if fallback {
@@ -654,14 +689,15 @@ impl JobHandler for HlsPackageHandler {
             }
         }
 
-        let variant_path = format!("{}/index.m3u8", media.uid);
-        let final_dir = self.0.hls_dir.join(&media.uid);
+        let version = format!("{}_{}", media.file_size, media.modified_at);
+        let variant_path = format!("{}/{}/index.m3u8", media.uid, version);
+        let final_dir = self.0.hls_dir.join(&media.uid).join(&version);
         let playlist = final_dir.join("index.m3u8");
         if playlist.is_file() {
             let size = std::fs::metadata(&playlist)
                 .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX))
                 .unwrap_or(0);
-            service.record_variant(media.id, "hls", "default", &variant_path, size)?;
+            service.record_variant_for_media(&media, "hls", "default", &variant_path, size)?;
             return JobOutcome::json(serde_json::json!({
                 "playlist": variant_path,
                 "exists": true,
@@ -669,7 +705,12 @@ impl JobHandler for HlsPackageHandler {
         }
 
         let segment_secs = payload.segment_secs.unwrap_or(4).clamp(1, 30);
-        let temp_dir = self.0.hls_dir.join(format!("{}.tmp", media.uid));
+        std::fs::create_dir_all(self.0.hls_dir.join(&media.uid))?;
+        let temp_dir = self
+            .0
+            .hls_dir
+            .join(&media.uid)
+            .join(format!("{version}.tmp"));
         if temp_dir.exists() {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
@@ -700,7 +741,7 @@ impl JobHandler for HlsPackageHandler {
         })?;
 
         let size = i64::try_from(directory_size(&final_dir)).unwrap_or(i64::MAX);
-        service.record_variant(media.id, "hls", "default", &variant_path, size)?;
+        service.record_variant_for_media(&media, "hls", "default", &variant_path, size)?;
         context.report_progress(1.0, Some("hls ready"));
         JobOutcome::json(serde_json::json!({
             "playlist": variant_path,
@@ -1209,6 +1250,52 @@ exit 0
         assert_eq!(audio, "aac");
         assert!(thumbnails.join(&thumbnail).is_file());
     }
+    #[test]
+    fn derived_jobs_do_not_dedupe_to_a_running_old_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("derived.db").to_str().unwrap(), 1).unwrap();
+        kernel_migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
+        let queue = JobQueue::new(db, EventBus::new(16));
+        let old_media = test_media("http://example.test/movie.mp4");
+        let mut current = old_media.clone();
+        current.modified_at += 1;
+        for (kind, prefix) in [("thumbnail", "thumbnail"), ("preview_sprite", "sprite")] {
+            let old = queue
+                .enqueue(kind, "{}", Some(&derived_job_key(prefix, &old_media)), 3)
+                .unwrap();
+            let claimed = queue.claim("worker", 30).unwrap().unwrap();
+            assert_eq!(claimed.id, old);
+            let new = queue
+                .enqueue(kind, "{}", Some(&derived_job_key(prefix, &current)), 3)
+                .unwrap();
+            assert_ne!(old, new);
+            assert_eq!(queue.get(&new).unwrap().unwrap().status, "queued");
+            queue.cancel(&new).unwrap();
+            queue.complete(&old, "{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn superseded_probe_gets_a_fresh_retry_budget_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("probe.db").to_str().unwrap(), 1).unwrap();
+        kernel_migrations::apply(&db, "kernel", localreel_kernel::jobs::migrations()).unwrap();
+        let queue = JobQueue::new(db, EventBus::new(16));
+        let old = queue
+            .enqueue("probe_media", "{\"media_id\":7}", Some("probe:7"), 1)
+            .unwrap();
+        queue.claim("old", 30).unwrap().unwrap();
+        let current = test_media("http://example.test/movie.mp4");
+        let fresh = enqueue_probe_version(&queue, &current).unwrap();
+        assert_ne!(old, fresh);
+        let job = queue.get(&fresh).unwrap().unwrap();
+        assert_eq!(job.max_attempts, 3);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.status, "queued");
+        queue.complete(&old, "{\"superseded\":true}").unwrap();
+        assert_eq!(queue.get(&fresh).unwrap().unwrap().status, "queued");
+    }
+
     #[test]
     fn local_media_reads_from_its_path() {
         let media = test_media("file:///D:/Videos/x.mp4");

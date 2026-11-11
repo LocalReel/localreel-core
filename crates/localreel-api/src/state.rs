@@ -41,6 +41,10 @@ pub struct AppState {
     /// Signalled by the admin shutdown endpoint and the tray icon; the server
     /// selects on it together with Ctrl+C.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// Persistent shutdown state for response bodies, including late subscribers.
+    pub draining: tokio::sync::watch::Sender<bool>,
+    pub stream_slots: Arc<tokio::sync::Semaphore>,
+    pub auth_slots: Arc<tokio::sync::Semaphore>,
     /// Last successful remote release check, and when it ran.
     pub update_cache: std::sync::Mutex<Option<crate::update::CachedCheck>>,
     /// The one-at-a-time self-update: install kind, download progress and the
@@ -105,6 +109,9 @@ impl AppState {
             hwaccel,
             started_at: now_secs(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            draining: tokio::sync::watch::channel(false).0,
+            stream_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            auth_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             update_cache: std::sync::Mutex::new(None),
             update: crate::update_runtime::Runtime::new(),
         })
