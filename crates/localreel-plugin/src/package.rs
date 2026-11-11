@@ -134,17 +134,21 @@ pub fn verify_signature(
 
 fn decode_hex<const N: usize>(text: &str, what: &str) -> Result<[u8; N], PluginError> {
     let text = text.trim();
-    if text.len() != N * 2 {
+    let raw = text.as_bytes();
+    if raw.len() != N * 2 {
         return Err(PluginError::Signature(format!(
             "{what} must be {} hexadecimal characters",
             N * 2
         )));
     }
     let mut bytes = [0u8; N];
-    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
-        let pair = std::str::from_utf8(chunk)
+    // Two bytes at a time, indexed explicitly: `chunks_exact(2)` now trips a
+    // Clippy lint that wants `as_chunks`, and that helper would raise the
+    // minimum supported Rust version for no behavioural gain.
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(&raw[index * 2..index * 2 + 2])
             .map_err(|_| PluginError::Signature(format!("{what} is not hex")))?;
-        bytes[index] = u8::from_str_radix(pair, 16)
+        *byte = u8::from_str_radix(pair, 16)
             .map_err(|_| PluginError::Signature(format!("{what} is not hex")))?;
     }
     Ok(bytes)
