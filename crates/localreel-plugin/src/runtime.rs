@@ -800,7 +800,21 @@ mod tests {
     fn sandbox_support_probes_unshare() {
         let support = sandbox_support();
         assert!(support.app_container);
-        assert!(support.unshare_present, "unshare probe should succeed");
+        // Whether an unprivileged user namespace is allowed is host policy, not
+        // a property of this crate: CI containers commonly refuse `unshare -Urn`
+        // while a desktop distribution permits it. Assert the probe matches a
+        // direct attempt instead of asserting this particular host allows it.
+        let direct = std::process::Command::new("unshare")
+            .args(["-Urn", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert_eq!(
+            support.unshare_present, direct,
+            "the reported sandbox support must match an actual unshare attempt"
+        );
     }
 
     #[cfg(target_os = "linux")]

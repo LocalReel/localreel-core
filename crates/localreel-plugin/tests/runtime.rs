@@ -13,6 +13,9 @@ use zip::write::SimpleFileOptions;
 
 const DEMO: &str = env!("CARGO_BIN_EXE_plugin-demo");
 const BROKER_DEMO: &str = env!("CARGO_BIN_EXE_plugin-broker-demo");
+// Only the sandbox tests read this binary, and those do not exist on macOS;
+// without the gate the constant is dead code there and `-D warnings` fails.
+#[cfg(any(windows, target_os = "linux"))]
 const NET_DEMO: &str = env!("CARGO_BIN_EXE_plugin-net-demo");
 
 fn build_package(path: &Path, program: &str, manifest: &serde_json::Value) {
@@ -274,7 +277,7 @@ fn sandbox_is_available() -> bool {
     localreel_plugin::runtime::sandbox_support().unshare_present
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 fn sandbox_is_available() -> bool {
     true
 }
