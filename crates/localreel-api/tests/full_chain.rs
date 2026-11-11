@@ -44,7 +44,11 @@ impl ProviderSink for Sink {
     }
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+/// Build (once) and locate the isolation wrapper.
+///
+/// Defined on every platform: `full_chain` references it in shared code and only
+/// passes it when the caller asks for OS isolation, so gating the helper to the
+/// platforms that use it would not compile on macOS.
 fn sandbox_program() -> PathBuf {
     let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

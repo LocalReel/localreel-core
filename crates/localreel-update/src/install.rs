@@ -172,6 +172,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // The path is a Windows one, and only Windows has a "Program Files" that
+    // marks a machine-wide MSI install; on Unix the same literal is a single
+    // file name and detection correctly says "portable".
+    #[cfg(windows)]
     #[test]
     fn program_files_is_treated_as_an_msi() {
         let kind = detect(Path::new(r"C:\Program Files\LocalReel\localreel.exe"));
