@@ -76,8 +76,9 @@ pub fn backend(platform: Platform, exe: &Path, home: &Path) -> Backend {
         Platform::Windows => {
             let launcher = exe.with_file_name("localreel-desktop.exe");
             let command = if launcher.is_file() {
-                // No console at all: nothing flashes at login.
-                format!("\"{}\"", launcher.display())
+                // No console at all, and no browser either: a login starts the
+                // tray, the window stays closed until the user asks for it.
+                format!("\"{}\" --no-open", launcher.display())
             } else {
                 // Portable installs without the launcher still get the tray and
                 // keep the browser for themselves.
@@ -272,8 +273,9 @@ mod tests {
         match backend(Platform::Windows, &exe, dir.path()) {
             Backend::RunKey { name, command } => {
                 assert_eq!(name, RUN_VALUE);
-                // The launcher is a GUI program: no console window at login.
-                assert!(command.ends_with("localreel-desktop.exe\""));
+                // The launcher is a GUI program: no console window at login, and
+                // `--no-open` keeps the browser to the user's own launches.
+                assert!(command.ends_with("localreel-desktop.exe\" --no-open"));
                 assert!(!command.contains("serve"));
             }
             other => panic!("unexpected backend: {other:?}"),

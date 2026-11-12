@@ -40,12 +40,17 @@ fn main() {
 
     // Desktop persona, tray, browser. The server hides nothing here because it
     // has no console to hide.
+    //
+    // Extra flags are forwarded: the login entry passes `--no-open` so a login
+    // leaves the browser alone, and a shortcut can ask for whatever the server
+    // understands without a second launcher.
     let mut child = Command::new(&exe);
     child
         .arg("serve")
         .arg("--mode")
         .arg("desktop")
         .arg("--tray")
+        .args(std::env::args().skip(1))
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
